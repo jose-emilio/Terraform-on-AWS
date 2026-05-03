@@ -34,12 +34,12 @@ variable "bucket_name" {
 
 variable "db_config" {
   type = object({
-    engine            = string
-    engine_version    = string
-    instance_class    = string
-    allocated_storage = number
-    port              = optional(number, 3306)
-    multi_az          = optional(bool, false)
+    engine                = string
+    engine_version        = string
+    instance_class        = string
+    allocated_storage     = number
+    port                  = optional(number, 3306)
+    multi_az              = optional(bool, false)
     backup_retention_days = optional(number, 7)
   })
 

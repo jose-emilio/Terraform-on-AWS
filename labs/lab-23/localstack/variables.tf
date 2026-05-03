@@ -1,3 +1,9 @@
+variable "region" {
+  type        = string
+  description = "Región declarada al provider AWS. En LocalStack es informativa (todos los servicios responden bajo el mismo endpoint local), pero se respeta para mantener paridad con la versión aws/."
+  default     = "us-east-1"
+}
+
 variable "project_name" {
   type        = string
   description = "Nombre del proyecto, usado en tags y nombres de recursos"
@@ -28,12 +34,12 @@ variable "bucket_name" {
 
 variable "db_config" {
   type = object({
-    engine            = string
-    engine_version    = string
-    instance_class    = string
-    allocated_storage = number
-    port              = optional(number, 3306)
-    multi_az          = optional(bool, false)
+    engine                = string
+    engine_version        = string
+    instance_class        = string
+    allocated_storage     = number
+    port                  = optional(number, 3306)
+    multi_az              = optional(bool, false)
     backup_retention_days = optional(number, 7)
   })
 

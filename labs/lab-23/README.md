@@ -8,7 +8,7 @@
 
 ## Visión general
 
-Crear **módulos** que validen los datos antes de intentar crear infraestructura en AWS. Aplicar cuatro técnicas de diseño defensivo dentro de módulos reutilizables: validación con regex para nombres de bucket, tipos complejos (`object`) para configuración de base de datos, variables sensibles para contraseñas, y postcondiciones que verifican el estado real del recurso creado.
+Crear módulos que validen los datos antes de intentar crear infraestructura en AWS. Aplicar cuatro técnicas de diseño defensivo dentro de módulos reutilizables: validación con regex para nombres de bucket, tipos complejos (`object`) para configuración de base de datos, variables sensibles para contraseñas, y postcondiciones que verifican el estado real del recurso creado.
 
 ## Conceptos clave
 
@@ -33,9 +33,9 @@ Crear **módulos** que validen los datos antes de intentar crear infraestructura
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado
+- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
-- Terraform >= 1.5
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -46,7 +46,7 @@ echo "Bucket: $BUCKET"
 ## Estructura del proyecto
 
 ```
-lab23/
+lab-23/
 ├── README.md                                <- Esta guía
 ├── aws/
 │   ├── providers.tf                         <- Backend S3 parcial
@@ -115,20 +115,21 @@ variable "bucket_name" {
   description = "Nombre del bucket S3. Debe comenzar con el prefijo corporativo 'empresa-'"
 
   validation {
-    condition     = can(regex("^empresa-[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.bucket_name))
-    error_message = "El nombre del bucket debe comenzar con 'empresa-', contener solo minúsculas, números, puntos y guiones, y tener entre 7 y 63 caracteres."
+    condition     = can(regex("^empresa-[a-z0-9][a-z0-9.-]{1,53}[a-z0-9]$", var.bucket_name))
+    error_message = "El nombre del bucket debe comenzar con 'empresa-', contener solo minúsculas, números, puntos y guiones, y tener entre 11 y 63 caracteres en total."
   }
 }
 ```
 
-Desglose de la regex `^empresa-[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`:
+Desglose de la regex `^empresa-[a-z0-9][a-z0-9.-]{1,53}[a-z0-9]$`:
 
-| Parte | Significado |
-|---|---|
-| `^empresa-` | Debe empezar con el prefijo corporativo `empresa-` |
-| `[a-z0-9]` | Siguiente carácter: letra minúscula o número (no punto ni guión al inicio) |
-| `[a-z0-9.-]{1,61}` | De 1 a 61 caracteres: letras, números, puntos o guiones |
-| `[a-z0-9]$` | Último carácter: letra minúscula o número (no punto ni guión al final) |
+| Parte | Caracteres | Significado |
+|---|---:|---|
+| `^empresa-` | 8 | Debe empezar con el prefijo corporativo `empresa-` |
+| `[a-z0-9]` | 1 | Primer carácter del sufijo: letra minúscula o número (no punto ni guión al inicio) |
+| `[a-z0-9.-]{1,53}` | 1–53 | Cuerpo: letras, números, puntos o guiones |
+| `[a-z0-9]$` | 1 | Último carácter: letra minúscula o número (no punto ni guión al final) |
+| **Total** | **11–63** | Ajustado al límite de naming de S3 (3–63 chars). |
 
 La función `can()` envuelve `regex()` para que devuelva `true`/`false` en vez de lanzar un error si la regex no coincide. Sin `can()`, una regex que no coincide haría fallar Terraform con un error críptico en lugar del `error_message` personalizado.
 
@@ -138,7 +139,8 @@ La función `can()` envuelve `regex()` para que devuelva `true`/`false` en vez d
 terraform apply -var='bucket_name=MiBucket' -var='db_password=MiPassword123Seguro'
 # Error: Invalid value for variable
 #   El nombre del bucket debe comenzar con 'empresa-', contener solo
-#   minúsculas, números, puntos y guiones, y tener entre 7 y 63 caracteres.
+#   minúsculas, números, puntos y guiones, y tener entre 11 y 63 caracteres
+#   en total.
 ```
 
 Terraform rechaza el valor **antes** de contactar con AWS. No se crea ningún recurso, no se gasta dinero, no hay estado inconsistente.
@@ -217,15 +219,23 @@ variable "db_password" {
   }
 
   validation {
-    condition = (
-      can(regex("[A-Z]", var.db_password)) &&
-      can(regex("[a-z]", var.db_password)) &&
-      can(regex("[0-9]", var.db_password))
-    )
-    error_message = "La contraseña debe contener al menos una mayúscula, una minúscula y un número."
+    condition     = can(regex("[A-Z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra mayúscula (A-Z)."
+  }
+
+  validation {
+    condition     = can(regex("[a-z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra minúscula (a-z)."
+  }
+
+  validation {
+    condition     = can(regex("[0-9]", var.db_password))
+    error_message = "La contraseña debe contener al menos un dígito (0-9)."
   }
 }
 ```
+
+> **Por qué cuatro `validation` separadas y no una compuesta:** Terraform evalúa **todos** los bloques `validation` y reporta cada error que falla. Si fusionáramos las cuatro reglas en una sola condición (`length(...) >= 12 && can(regex(...))[A-Z] && ...`), un fallo solo daría un mensaje genérico ("la contraseña no cumple los requisitos") y el alumno tendría que adivinar **qué** falta. Con bloques separados, el output dice exactamente "falta una letra mayúscula" o "es demasiado corta" — y si fallan varias reglas a la vez, las muestra todas.
 
 **¿Qué hace `sensitive = true`?**
 
@@ -234,7 +244,7 @@ variable "db_password" {
 | `terraform plan` | Muestra el valor en texto plano | Muestra `(sensitive value)` |
 | `terraform apply` | Muestra el valor en texto plano | Muestra `(sensitive value)` |
 | `terraform output` | Muestra el valor | Error: requiere `-json` o `-raw` |
-| Archivo de estado | Almacena en texto plano | **Almacena en texto plano** |
+| Archivo de estado | Texto plano | **Texto plano (idéntico — `sensitive` NO cifra)** |
 | Logs de CI/CD | Visible | Oculto |
 
 > **Advertencia crítica:** `sensitive = true` oculta el valor de la **interfaz**, pero **no lo cifra** en el archivo de estado (`terraform.tfstate`). Por eso el backend S3 debe tener `encrypt = true` y el acceso al bucket debe estar restringido con IAM.
@@ -353,7 +363,7 @@ El Root Module es limpio y declarativo: define **qué** quiere (una red segura, 
 ## 2. Despliegue
 
 ```bash
-cd labs/lab23/aws
+cd labs/lab-23/aws
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
@@ -364,11 +374,15 @@ El `apply` requiere dos valores sin default: `bucket_name` y `db_password`:
 
 ```bash
 terraform apply \
-  -var="bucket_name=lab23-data-${ACCOUNT_ID}" \
+  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
   -var='db_password=MiPassword123Seguro'
 ```
 
-Terraform creará ~10 recursos: VPC, 2 subredes, bucket S3, bloqueo público, secreto, versión del secreto, y 5 parámetros SSM.
+> **Importante — el prefijo `empresa-`:** el módulo `validated-bucket` exige que el nombre empiece por `empresa-` (sección 1.2). Si lo pasas sin el prefijo (`lab23-data-${ACCOUNT_ID}`), Terraform aborta el `apply` antes de crear nada con `Error: Invalid value for variable`. Ese fallo es la prueba operativa de que la validación funciona — pero para el despliegue del lab base usa el nombre con prefijo como se muestra arriba.
+
+Terraform creará **12 recursos** en la versión `aws/`: 1 VPC, 2 subredes privadas, 1 bucket S3 + 1 bloqueo público, 1 `aws_secretsmanager_secret` + 1 `aws_secretsmanager_secret_version`, y 5 `aws_ssm_parameter` (engine, engine-version, instance-class, port y un JSON con toda la config).
+
+> **Nota — versión LocalStack:** sustituye Secrets Manager por un `aws_ssm_parameter` SecureString adicional, así que crea **11 recursos** (1 SSM password + 5 SSM config = 6 SSM en total, más VPC, subnets, bucket y public_access_block).
 
 ```bash
 terraform output
@@ -394,7 +408,7 @@ Nota que la contraseña **no aparece** en los outputs gracias a `sensitive = tru
 
 ---
 
-## Verificación final
+## 3. Verificación final
 
 ### 3.1 Probar que las validaciones rechazan valores inválidos
 
@@ -412,11 +426,24 @@ terraform plan \
 # Error: Invalid value for variable
 #   El motor de base de datos debe ser uno de: mysql, postgres, mariadb.
 
-# Contraseña débil → debe fallar
+# Contraseña corta → falla la validación de longitud
 terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=corta'
 # Error: Invalid value for variable
 #   La contraseña debe tener al menos 12 caracteres.
+
+# Contraseña suficientemente larga pero todo minúsculas/numérico → fallan
+# DOS validaciones (mayúscula y otro carácter), cada una con su mensaje:
+terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=todoenlowercase123'
+# Error: Invalid value for variable
+#   La contraseña debe contener al menos una letra mayúscula (A-Z).
+
+# Contraseña sin dígitos → falla solo la regla del dígito
+terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=PasswordSinNumeros'
+# Error: Invalid value for variable
+#   La contraseña debe contener al menos un dígito (0-9).
 ```
+
+Las cuatro reglas (`length`, mayúscula, minúscula, dígito) están en `validation` blocks separados — Terraform reporta **cada** una que falle, así que el alumno ve exactamente qué corregir en lugar de un mensaje genérico.
 
 ### 3.2 Verificar el bucket S3
 
@@ -471,7 +498,7 @@ terraform plan \
   -var="vpc_cidr=52.0.0.0/16"
 ```
 
-> **Nota:** La postcondición se evalúa durante el apply, no durante el plan. En este caso, como el CIDR viene directamente de la variable, Terraform puede detectarlo en el plan. En escenarios con valores computados por AWS, solo se detectaría después del apply.
+> **Nota técnica — cuándo se evalúa una `postcondition`:** las postcondiciones se evalúan **después** de crear o actualizar el recurso (durante el apply). Sin embargo, desde Terraform 1.4+ el motor también las evalúa **al final del plan** cuando todos los valores referenciados (`self.*`) son ya conocidos en ese momento — es lo que ocurre aquí, porque `self.cidr_block` viene literalmente de la variable y no requiere creación previa para conocerse. Por eso este caso falla durante el `plan` y no llega al `apply`. En escenarios donde los atributos son **computados por AWS** (por ejemplo, `self.id` de un recurso recién creado), la postcondición solo puede evaluarse durante el `apply`, después de que AWS responda con el valor real.
 
 ---
 
@@ -505,6 +532,16 @@ La solución está en la [sección 5](#5-solución-del-reto).
 En `modules/db-config/main.tf`:
 
 ```hcl
+locals {
+  # Mapa engine → puerto estandar. Mas legible y escalable que un ternario
+  # encadenado: añadir "oracle" = 1521 es trivial.
+  default_db_ports = {
+    mysql    = 3306
+    mariadb  = 3306
+    postgres = 5432
+  }
+}
+
 resource "aws_ssm_parameter" "db_port" {
   name  = "/${var.project_name}/db/port"
   type  = "String"
@@ -514,15 +551,14 @@ resource "aws_ssm_parameter" "db_port" {
 
   lifecycle {
     precondition {
-      condition = (
-        (contains(["mysql", "mariadb"], var.db_config.engine) && var.db_config.port == 3306) ||
-        (var.db_config.engine == "postgres" && var.db_config.port == 5432)
-      )
-      error_message = "El puerto ${var.db_config.port} no es el estándar para el motor '${var.db_config.engine}'. Usa 3306 para mysql/mariadb o 5432 para postgres."
+      condition     = var.db_config.port == local.default_db_ports[var.db_config.engine]
+      error_message = "El puerto ${var.db_config.port} no es el estándar para el motor '${var.db_config.engine}'. Esperado: ${local.default_db_ports[var.db_config.engine]} (3306 para mysql/mariadb, 5432 para postgres)."
     }
   }
 }
 ```
+
+> **Alternativa más concisa:** la versión con un mapa `local` es más mantenible que un `if/else` encadenado. Para añadir un nuevo motor (`oracle = 1521`, `mssql = 1433`), basta con extender el mapa — no hay que tocar la condición. La validación con `contains([...], engine)` ya cubrió en `variables.tf` que `engine` esté en la lista permitida, así que el lookup `local.default_db_ports[engine]` es seguro.
 
 ### Paso 2: Probar configuración incoherente
 
@@ -629,15 +665,38 @@ output "extra_bucket_ids" {
 
 ### Paso 4: Invocar con 2 buckets
 
+`-var` interpreta su valor como **HCL**, no como JSON. La sintaxis correcta para un `map(object)` con claves dinámicas (que contienen `${ACCOUNT_ID}`) es más legible si se pasa por archivo `.tfvars` o se construye con `printf`:
+
+**Opción A — con archivo `extra_buckets.auto.tfvars`** (recomendado):
+
+```hcl
+# extra_buckets.auto.tfvars
+extra_buckets = {
+  "empresa-logs-123456789012"    = { purpose = "logs" }
+  "empresa-backups-123456789012" = { purpose = "backups" }
+}
+```
+
 ```bash
 terraform apply \
   -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro' \
-  -var="extra_buckets={
-    \"empresa-logs-${ACCOUNT_ID}\":    { purpose = \"logs\" },
-    \"empresa-backups-${ACCOUNT_ID}\": { purpose = \"backups\" }
-  }"
+  -var='db_password=MiPassword123Seguro'
+# (extra_buckets.auto.tfvars se carga automáticamente)
 ```
+
+**Opción B — inline con `printf`** (útil para CI/CD donde no quieres archivos extra):
+
+```bash
+EXTRA_BUCKETS=$(printf '{"empresa-logs-%s"={purpose="logs"},"empresa-backups-%s"={purpose="backups"}}' \
+  "$ACCOUNT_ID" "$ACCOUNT_ID")
+
+terraform apply \
+  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro' \
+  -var="extra_buckets=$EXTRA_BUCKETS"
+```
+
+> **Nota:** la sintaxis HCL para mapas usa `=` (no `:`), claves entre comillas dobles y valores object con `{ campo = "valor" }`. No mezclar con sintaxis JSON (`":"`) — Terraform rechazará el `-var` con un error de parseo.
 
 ### Paso 5: Verificar
 
@@ -675,7 +734,7 @@ terraform destroy \
   -var='db_password=MiPassword123Seguro'
 ```
 
-> **Nota:** Debes pasar las mismas variables obligatorias (`bucket_name` y `db_password`) en el destroy porque Terraform necesita evaluarlas para calcular el plan de destrucción. No destruyas el bucket S3 del lab02.
+> **Nota:** Debes pasar las mismas variables obligatorias (`bucket_name` y `db_password`) en el `destroy` porque Terraform necesita evaluarlas para calcular el plan. El laboratorio sí crea un bucket S3 propio (`empresa-lab23-data-…`) que se destruirá; no destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -690,7 +749,7 @@ LocalStack emula S3 y SSM Parameter Store en Community. Las validaciones, precon
 ## Buenas prácticas aplicadas
 
 - **Validación early-fail**: detectar errores en `terraform plan` (antes de cualquier llamada a AWS) es preferible a descubrirlos en mitad de un `terraform apply`. Las validaciones de variables permiten dar mensajes de error claros al desarrollador.
-- **Variables sensibles para secretos**: marcar contraseñas como `sensitive = true` evita que aparezcan en el output del plan/apply y en el state en texto claro en los logs de CI/CD.
+- **Variables sensibles para secretos**: marcar contraseñas como `sensitive = true` evita que aparezcan en el output de `plan`/`apply` y en los logs de CI/CD. **Importante:** `sensitive = true` **NO cifra** el valor en `terraform.tfstate` — el secreto se almacena ahí en texto plano. Por eso es **obligatorio** que el backend cifre el state (`encrypt = true` en S3, KMS para tfstate, o un backend con cifrado en reposo) y que el bucket / repositorio del state esté restringido por IAM. La directiva `sensitive` resuelve la fuga **por output**, no la fuga **por acceso al state**.
 - **Postcondiciones para invariantes de estado**: verificar el estado real del recurso después de su creación (por ejemplo, que el bucket tiene public access bloqueado) detecta inconsistencias entre la configuración Terraform y el estado real de AWS.
 - **Tipos complejos `object` para configuraciones relacionadas**: agrupar parámetros relacionados en un objeto en lugar de variables individuales previene configuraciones parcialmente incorrectas (por ejemplo, motor de BD y puerto inconsistentes).
 - **`can()` para detección de errores sin fallo**: usar `can(regex(..., var.name))` permite evaluar si una expresión produce error sin que el plan falle, útil para validaciones condicionales.

@@ -25,6 +25,11 @@ variable "db_config" {
     condition     = var.db_config.allocated_storage >= 20 && var.db_config.allocated_storage <= 1000
     error_message = "El almacenamiento debe estar entre 20 y 1000 GB."
   }
+
+  validation {
+    condition     = var.db_config.backup_retention_days >= 0 && var.db_config.backup_retention_days <= 35
+    error_message = "backup_retention_days debe estar entre 0 (backups deshabilitados) y 35 (límite de RDS)."
+  }
 }
 
 variable "db_password" {
@@ -32,14 +37,29 @@ variable "db_password" {
   description = "Contraseña del usuario administrador de la base de datos. No aparece en los logs de consola."
   sensitive   = true
 
+  # Validaciones separadas en lugar de una unica condicion compuesta:
+  # Terraform evalua y reporta TODAS las que fallen, asi que el alumno ve
+  # exactamente que reglas no cumple su contraseña en lugar de un mensaje
+  # generico que mezcla varios requisitos.
+
   validation {
     condition     = length(var.db_password) >= 12
     error_message = "La contraseña debe tener al menos 12 caracteres."
   }
 
   validation {
-    condition     = can(regex("[A-Z]", var.db_password)) && can(regex("[a-z]", var.db_password)) && can(regex("[0-9]", var.db_password))
-    error_message = "La contraseña debe contener al menos una mayúscula, una minúscula y un número."
+    condition     = can(regex("[A-Z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra mayúscula (A-Z)."
+  }
+
+  validation {
+    condition     = can(regex("[a-z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra minúscula (a-z)."
+  }
+
+  validation {
+    condition     = can(regex("[0-9]", var.db_password))
+    error_message = "La contraseña debe contener al menos un dígito (0-9)."
   }
 }
 

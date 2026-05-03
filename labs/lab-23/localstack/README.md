@@ -1,4 +1,4 @@
-# Laboratorio 19 — LocalStack: Diseño de Interfaz Robusta y "Fail-Safe"
+# Laboratorio 23 — LocalStack: Diseño de Interfaz Robusta y "Fail-Safe"
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
@@ -8,7 +8,7 @@ Esta guía adapta el lab23 para ejecutarse íntegramente en LocalStack. Los tres
 ## Prerrequisitos
 
 - LocalStack corriendo: `localstack start -d`
-- lab07/localstack desplegado (crea bucket `terraform-state-labs`)
+- lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)
 - AWS CLI configurado para LocalStack:
 
 ```bash
@@ -21,7 +21,7 @@ alias awslocal='aws --endpoint-url=http://localhost.localstack.cloud:4566'
 ## 1. Despliegue
 
 ```bash
-cd labs/lab23/localstack
+cd labs/lab-23/localstack
 
 terraform init -backend-config=localstack.s3.tfbackend
 

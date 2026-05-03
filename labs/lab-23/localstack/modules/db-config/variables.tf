@@ -25,6 +25,11 @@ variable "db_config" {
     condition     = var.db_config.allocated_storage >= 20 && var.db_config.allocated_storage <= 1000
     error_message = "El almacenamiento debe estar entre 20 y 1000 GB."
   }
+
+  validation {
+    condition     = var.db_config.backup_retention_days >= 0 && var.db_config.backup_retention_days <= 35
+    error_message = "backup_retention_days debe estar entre 0 (backups deshabilitados) y 35 (límite de RDS)."
+  }
 }
 
 variable "db_password" {
@@ -38,8 +43,18 @@ variable "db_password" {
   }
 
   validation {
-    condition     = can(regex("[A-Z]", var.db_password)) && can(regex("[a-z]", var.db_password)) && can(regex("[0-9]", var.db_password))
-    error_message = "La contraseña debe contener al menos una mayúscula, una minúscula y un número."
+    condition     = can(regex("[A-Z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra mayúscula (A-Z)."
+  }
+
+  validation {
+    condition     = can(regex("[a-z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra minúscula (a-z)."
+  }
+
+  validation {
+    condition     = can(regex("[0-9]", var.db_password))
+    error_message = "La contraseña debe contener al menos un dígito (0-9)."
   }
 }
 

@@ -1,7 +1,14 @@
 # ===========================================================================
 # Módulo safe-network — VPC con postcondición RFC 1918 (LocalStack)
 # ===========================================================================
-# Sin data source de AZs (emulación limitada en LocalStack).
+# Diferencias con la version aws/:
+#   - No usa `data "aws_availability_zones"`: en LocalStack Community la
+#     emulacion del data source de AZs no siempre devuelve resultados
+#     consistentes, asi que se itera sobre indices fijos (0, 1).
+#   - Las subnets se crean SIN `availability_zone`: en AWS real ese campo
+#     es requerido, pero LocalStack tolera la omision y asigna una AZ ficticia.
+# La postcondicion RFC 1918 funciona identicamente porque la evalua el motor
+# de Terraform, no el provider.
 
 locals {
   default_tags = {

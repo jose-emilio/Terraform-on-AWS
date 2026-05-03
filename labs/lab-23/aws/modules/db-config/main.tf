@@ -8,8 +8,16 @@
 # --- Secrets Manager: contraseña almacenada de forma segura ---
 
 resource "aws_secretsmanager_secret" "db_password" {
-  name                    = "${var.project_name}/db-password"
-  description             = "Contraseña del administrador de la base de datos"
+  name        = "${var.project_name}/db-password"
+  description = "Contraseña del administrador de la base de datos"
+
+  # recovery_window_in_days = 0 desactiva el periodo de recuperación
+  # (default 30, mínimo recomendado en producción 7). Se usa aquí para
+  # poder hacer terraform destroy/apply repetidamente en el laboratorio
+  # sin chocar con un secreto en estado "PendingDeletion" del despliegue
+  # anterior. En producción NUNCA pongas 0 — borrar el secreto es
+  # irreversible y, si una aplicación lo necesita, no hay forma de
+  # restaurarlo.
   recovery_window_in_days = 0
 
   tags = merge(var.tags, {
