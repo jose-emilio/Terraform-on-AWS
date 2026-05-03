@@ -73,10 +73,10 @@ resource "aws_subnet" "this" {
     },
     # Tags requeridos por EKS para el descubrimiento automático de subredes
     each.value.public ? {
-      "kubernetes.io/role/elb"                            = "1"
+      "kubernetes.io/role/elb"                    = "1"
       "kubernetes.io/cluster/${var.project_name}" = "shared"
-    } : {
-      "kubernetes.io/role/internal-elb"                   = "1"
+      } : {
+      "kubernetes.io/role/internal-elb"           = "1"
       "kubernetes.io/cluster/${var.project_name}" = "shared"
     }
   )

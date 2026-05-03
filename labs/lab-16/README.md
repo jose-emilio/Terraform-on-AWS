@@ -24,10 +24,9 @@ Implementar el plano maestro de una VPC profesional utilizando **funciones de c�
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado
-- lab07/aws desplegado (bucket S3 con versionado habilitado)
+- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
-- Terraform >= 1.5
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
 ```bash
 # Exportar el Account ID y nombre del bucket para usar en los comandos
@@ -39,7 +38,7 @@ echo "Bucket: $BUCKET"
 ## Estructura del proyecto
 
 ```
-lab16/
+lab-16/
 ├── README.md                    ← Esta guía
 ├── aws/
 │   ├── providers.tf             ← Backend S3 parcial
@@ -60,7 +59,33 @@ lab16/
 
 Antes de ejecutar nada, revisemos las técnicas clave del código en `main.tf`.
 
-### 1.1 Cálculo dinámico de CIDRs con `cidrsubnet()`
+### 1.1 La VPC y la resolución DNS
+
+```hcl
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(local.common_tags, {
+    Name = "vpc-${var.project_name}"
+  })
+
+  lifecycle {
+    postcondition { ... }   # Ver sección 1.5
+  }
+}
+```
+
+Tres atributos clave de la VPC:
+
+- **`cidr_block`** — el rango privado a partir del cual `cidrsubnet()` (sección 1.2) deriva las subredes. Por defecto `10.12.0.0/16`. AWS permite cualquier CIDR IPv4 (también públicos), pero la postcondición de la sección 1.5 obliga a usar uno RFC 1918.
+- **`enable_dns_support = true`** — habilita el servidor DNS interno de la VPC (`AmazonProvidedDNS`, accesible en `10.12.0.2` en este caso). Sin él, las instancias no resuelven nombres dentro de la VPC.
+- **`enable_dns_hostnames = true`** — hace que las instancias EC2 con IP pública reciban además un *hostname* DNS público (`ec2-X-X-X-X.compute.amazonaws.com`).
+
+Ambos flags son **requisitos previos para EKS**: el plano de control de Kubernetes resuelve los nodos por hostname y los servicios por DNS; sin estas dos opciones a `true`, el cluster no funciona. De ahí que las dejemos activadas desde el lab base de red.
+
+### 1.2 Cálculo dinámico de CIDRs con `cidrsubnet()`
 
 ```hcl
 cidr_block = cidrsubnet(aws_vpc.main.cidr_block, 8, each.value.subnet_index)
@@ -87,7 +112,7 @@ Con el CIDR `10.12.0.0/16` y `newbits = 8`, el cálculo produce:
 
 Los `netnum` de las subredes privadas (10, 11, 12) están separados intencionalmente de las públicas (0, 1, 2), dejando espacio para futuras subredes intermedias.
 
-### 1.2 Iteración con `for_each`
+### 1.3 Iteración con `for_each`
 
 ```hcl
 resource "aws_subnet" "this" {
@@ -104,7 +129,7 @@ En lugar de repetir 6 bloques `resource`, definimos un único recurso con `for_e
 
 Terraform crea instancias identificadas por clave: `aws_subnet.this["public-1"]`, `aws_subnet.this["private-2"]`, etc. Esto es más robusto que `count` porque renombrar o reordenar subredes no fuerza la destrucción y recreación.
 
-### 1.3 Tags dinámicos con `merge()`
+### 1.4 Tags dinámicos con `merge()`
 
 ```hcl
 tags = merge(
@@ -123,13 +148,13 @@ tags = merge(
 2. **Tags específicos** de cada subred (nombre y tier)
 3. **Tags EKS** condicionales — las subredes públicas reciben `kubernetes.io/role/elb` y las privadas `kubernetes.io/role/internal-elb`
 
-### 1.4 Postcondición para validar RFC 1918
+### 1.5 Postcondición para validar RFC 1918
 
 ```hcl
 lifecycle {
   postcondition {
     condition = can(regex("^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)", self.cidr_block))
-    error_message = "El CIDR de la VPC debe pertenecer a un rango privado RFC 1918."
+    error_message = "El CIDR de la VPC debe pertenecer a un rango privado RFC 1918 (10.0.0.0/8, 172.16.0.0/12 o 192.168.0.0/16)."
   }
 }
 ```
@@ -141,7 +166,7 @@ La `postcondition` se evalúa **después** de que el recurso se crea o actualiza
 ## 2. Despliegue
 
 ```bash
-cd labs/lab16/aws
+cd labs/lab-16/aws
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
@@ -171,7 +196,7 @@ terraform output
 
 ---
 
-## Verificación final
+## 3. Verificación final
 
 ### 3.1 Verificar la VPC
 
@@ -224,7 +249,7 @@ Terraform rechazará el apply con este error:
 │ El CIDR de la VPC debe pertenecer a un rango privado RFC 1918 (10.0.0.0/8, 172.16.0.0/12 o 192.168.0.0/16).
 ```
 
-> **Nota:** La postcondición se evalúa *después* de crear el recurso. En este caso AWS creará la VPC (cualquier CIDR RFC 1918 o no es válido en AWS), pero Terraform marcará el apply como fallido y en el siguiente `apply` con un CIDR correcto, la VPC se actualizará o recreará.
+> **Nota:** AWS acepta cualquier CIDR IPv4 (incluidos rangos públicos como `203.0.113.0/24`) al crear una VPC, así que la VPC se llega a crear realmente; es Terraform —no el provider— quien marca el `apply` como fallido al evaluar la postcondición sobre `self.cidr_block`. Para corregirlo, vuelve a ejecutar `terraform apply` con un CIDR RFC 1918 válido: como el atributo `cidr_block` **no es modificable in-place**, Terraform planificará la recreación de la VPC (no una actualización) y, una vez aplicada, la postcondición pasará.
 
 ---
 
@@ -242,9 +267,9 @@ Terraform rechazará el apply con este error:
 6. Al finalizar, `terraform apply` debe crear las 3 subredes adicionales sin modificar las 6 existentes
 
 **Pistas**:
-- Solo necesitas modificar `local.subnets` y la lógica condicional de tags en `main.tf`
-- Puedes añadir una tercera condición al operador ternario usando otra expresión condicional anidada, o cambiar la lógica para usar un `lookup` en un mapa de tags por tier
-- ¿Cómo verificas que las nuevas subredes no afectaron a las existentes?
+- Necesitarás modificar `local.subnets` (para añadir las 3 nuevas entradas) y la lógica de tags en `main.tf`. La solución propuesta más adelante refactoriza el bloque de tags para basarse en un campo `tier` y un mapa `local.eks_tags`; ese refactor **toca también las subredes existentes** (todas pasan a leer `each.value.tier` y a obtener los tags EKS desde `lookup(...)`), por lo que conviene comprobar el `plan` con cuidado para asegurarte de que los tags resultantes son idénticos a los actuales y Terraform no marca cambios "fantasma" en las 6 subredes ya desplegadas.
+- Como alternativa menos invasiva, puedes añadir una tercera rama al operador ternario (anidando otro condicional `each.value.tier == "database" ? {} : (each.value.public ? {…} : {…})`) y dejar las subredes existentes sin tocar la forma de leer los tags.
+- ¿Cómo verificas que las nuevas subredes no afectaron a las existentes? Mira el resumen de `terraform plan`: el objetivo es ver únicamente recursos en `+ create` para `database-*` y ningún `~ update` sobre `public-*` / `private-*`.
 
 La solución está en la [sección 6](#6-solución-del-reto).
 
@@ -287,7 +312,7 @@ locals {
 
 ### Paso 2: Actualizar los tags de las subredes
 
-Reemplaza la lógica condicional de tags por un `lookup` en el mapa:
+Reemplaza la lógica condicional de tags por un `lookup` en el mapa. **Importante:** este cambio afecta también a las 6 subredes existentes — pasan a leer `Tier` desde `each.value.tier` y los tags EKS desde `lookup(local.eks_tags, each.value.tier, {})`. Como los valores resultantes son idénticos a los que ya tenían (`Tier = "public"`/`"private"` y los mismos tags EKS), Terraform no debería marcar cambios; pero **vigila el `plan` antes de aplicar** para detectar cualquier diferencia accidental (espacios, comillas, claves nuevas).
 
 ```hcl
 resource "aws_subnet" "this" {
@@ -328,17 +353,22 @@ output "database_subnet_ids" {
 
 ```bash
 terraform plan
-# Plan: 3 to add, 0 to change, 0 to destroy.
+# Resultado esperado (refactor "limpio"):
+#   Plan: 3 to add, 0 to change, 0 to destroy.
+```
 
+> **Nota:** el `0 to change` depende de que el refactor produzca exactamente los mismos tags que tenían las 6 subredes originales. Si tu mapa `eks_tags` introduce alguna clave o valor distinto (por ejemplo, otro valor para `kubernetes.io/cluster/...`), Terraform detectará el cambio y lo reportará como `~ update in-place` sobre las subredes existentes. Eso no rompe nada (las modificaciones de tags se aplican en caliente), pero conviene revisar el `plan` línea por línea para descartar cambios involuntarios antes del `apply`.
+
+```bash
 terraform apply
 ```
 
-Verifica que las 6 subredes originales no fueron modificadas (0 to change) y las 3 nuevas se crearon correctamente:
+Verifica que las 6 subredes originales no fueron modificadas (`0 to change`) y las 3 nuevas se crearon correctamente. Filtramos por el tag `Name` (que siempre vale `lab16-database-N`) en lugar de por `Tier`, ya que el valor de `Tier` depende del camino que hayas elegido en el Reto: con el refactor "limpio" será `database`, pero si optaste por la alternativa menos invasiva que solo toca el ternario de tags EKS, el `Tier` de las nuevas subredes seguirá siendo `private` (porque `public = false`):
 
 ```bash
 aws ec2 describe-subnets \
-  --filters Name=tag:Project,Values=lab16 Name=tag:Tier,Values=database \
-  --query 'Subnets[*].[Tags[?Key==`Name`].Value|[0],AvailabilityZone,CidrBlock]' \
+  --filters "Name=tag:Project,Values=lab16" "Name=tag:Name,Values=lab16-database-*" \
+  --query 'Subnets[*].[Tags[?Key==`Name`].Value|[0],AvailabilityZone,CidrBlock,Tags[?Key==`Tier`].Value|[0]]' \
   --output table
 ```
 
@@ -347,11 +377,10 @@ aws ec2 describe-subnets \
 ## 7. Limpieza
 
 ```bash
-terraform destroy \
-  -var="region=us-east-1"
+terraform destroy
 ```
 
-> **Nota:** No destruyas el bucket S3, ya que es un recurso compartido entre laboratorios (lab02).
+> **Nota:** El laboratorio no crea ningún bucket S3 propio. No destruyas el bucket de tfstate del lab02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -367,8 +396,7 @@ Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md
 - **`for_each` sobre AZs disponibles**: iterar sobre `data.aws_availability_zones.available.names` en lugar de hardcodear `["us-east-1a", "us-east-1b"]` hace el código portable entre regiones sin modificación.
 - **Tags de discovery para EKS**: los tags `kubernetes.io/role/elb` y `kubernetes.io/role/internal-elb` son requeridos por EKS para descubrir automáticamente las subnets donde crear los Load Balancers.
 - **Postcondición para validar RFC 1918**: una postcondición que verifica que el CIDR de la VPC pertenece al espacio privado (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) detecta errores de configuración antes de que lleguen a producción.
-- **Subredes públicas y privadas separadas**: la separación en subredes públicas (con `map_public_ip_on_launch = true`) y privadas (sin IP pública) permite aplicar diferentes políticas de seguridad en cada capa.
-- **Internet Gateway separado del NAT Gateway**: el IGW da acceso a Internet a las subredes públicas; el NAT Gateway da salida a Internet a las subredes privadas sin exponer una IP pública a los recursos.
+- **Separación lógica de subredes públicas y privadas desde el plano de direccionamiento**: aunque en este laboratorio la diferencia entre "pública" y "privada" se materializa **únicamente** a nivel de `map_public_ip_on_launch` y de tags (no hay aún Internet Gateway, NAT Gateway ni tablas de rutas), reservar desde el principio rangos CIDR distintos (`10.x.0.0/24`–`10.x.2.0/24` para públicas, `10.x.10.0/24`–`10.x.12.0/24` para privadas) y etiquetar la intención facilita aplicar más adelante políticas de routing y seguridad diferenciadas por capa. El **routing real a Internet (IGW para públicas, NAT Gateway para privadas) se añade en el [lab-17](../lab-17/README.md)**; en lab-16 una subred "pública" todavía no tiene salida a Internet.
 
 ---
 
