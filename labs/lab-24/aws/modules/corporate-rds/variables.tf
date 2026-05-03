@@ -38,8 +38,16 @@ variable "db_engine" {
 
 variable "db_engine_version" {
   type        = string
-  description = "Versión del motor de la base de datos"
+  description = "Versión del motor de la base de datos. DEBE ser <major>.<minor> (ej: '8.0', '15.4'), NO incluir patch ('8.0.35' falla porque se usa para construir el `family` del parameter group de RDS, que solo acepta major.minor)."
   default     = "8.0"
+
+  validation {
+    # Solo aceptamos formato <major>.<minor> con dígitos a ambos lados.
+    # Esto evita que alguien pase "8.0.35" o "8" y rompa la construccion
+    # del family ("mysql8.0.35" o "mysql8" no son values validos en RDS).
+    condition     = can(regex("^[0-9]+\\.[0-9]+$", var.db_engine_version))
+    error_message = "db_engine_version debe tener formato <major>.<minor> (ejemplos válidos: '8.0', '15.4', '13.10'). Sin patch version."
+  }
 }
 
 variable "db_instance_class" {

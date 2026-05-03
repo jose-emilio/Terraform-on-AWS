@@ -53,14 +53,26 @@ output "db_master_user_secret_arn" {
 }
 
 # --- Seguridad (verificación de compliance) ---
+# Estos outputs reflejan el CONTRATO del wrapper: los flags están
+# hardcoded a `true` en el bloque `module "rds"` de main.tf, así que el
+# valor `true` es cierto por construcción mientras el módulo no se
+# modifique. La fuente de verdad real es el código del módulo (busca
+# `storage_encrypted` y `deletion_protection` en main.tf).
+#
+# El módulo `terraform-aws-modules/rds/aws` v6.x NO expone estos campos
+# como outputs, así que no podemos hacer `module.rds.db_instance_<flag>`.
+# Para auditar el estado real desde fuera de Terraform usa AWS CLI:
+#   aws rds describe-db-instances --db-instance-identifier <id> \
+#     --query 'DBInstances[0].{StorageEncrypted: StorageEncrypted, DeletionProtection: DeletionProtection}'
+# (La sección 3.2 del README muestra este comando.)
 
 output "db_storage_encrypted" {
-  description = "Confirmación de que el almacenamiento está cifrado (siempre true)"
+  description = "Confirmación de que el almacenamiento RDS está cifrado en reposo (true por contrato del wrapper)"
   value       = true
 }
 
 output "db_deletion_protection" {
-  description = "Confirmación de que la protección contra borrado está activa (siempre true)"
+  description = "Confirmación de que la protección contra borrado está activa (true por contrato del wrapper)"
   value       = true
 }
 

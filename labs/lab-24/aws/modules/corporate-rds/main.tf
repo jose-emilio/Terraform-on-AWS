@@ -28,6 +28,21 @@ locals {
   effective_tags = merge(var.tags, {
     Module = "corporate-rds"
   })
+
+  # Coherencia engine ↔ version. Lista los prefijos validos por motor
+  # para detectar combinaciones imposibles (ej: mysql con 15.4) ANTES de
+  # crear el security group. Si alguien añade un motor nuevo aqui debe
+  # tambien añadirlo a la validation de var.db_engine.
+  valid_engine_version_prefixes = {
+    mysql    = ["5.7", "8.0", "8.4"]
+    mariadb  = ["10.4", "10.5", "10.6", "10.11", "11.4"]
+    postgres = ["12.", "13.", "14.", "15.", "16.", "17."]
+  }
+
+  engine_version_is_valid = anytrue([
+    for prefix in local.valid_engine_version_prefixes[var.db_engine] :
+    startswith(var.db_engine_version, prefix)
+  ])
 }
 
 # ===========================================================================
@@ -46,7 +61,11 @@ module "vpc" {
   database_subnets = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, 20 + i)]
   public_subnets   = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, i)]
 
-  # NAT Gateway para que las subredes privadas tengan salida a Internet
+  # NAT Gateway para que las subredes privadas tengan salida a Internet.
+  # single_nat_gateway = true → un único NAT GW para todas las AZs,
+  # mas barato (~$32/mes en lugar de $32 × N). Aceptable en lab y dev.
+  # En PRODUCCION usa single_nat_gateway = false (uno por AZ) para que
+  # la caida de una AZ no rompa la salida a Internet del resto.
   enable_nat_gateway = true
   single_nat_gateway = true
 
@@ -92,6 +111,15 @@ resource "aws_security_group" "rds" {
 
   lifecycle {
     create_before_destroy = true
+
+    # Precondition: aborta antes de crear NADA si la combinacion
+    # engine+version no es coherente. Usamos el SG como punto de entrada
+    # porque se crea muy temprano en el grafo y porque las validation
+    # individuales en variables.tf solo ven una variable a la vez.
+    precondition {
+      condition     = local.engine_version_is_valid
+      error_message = "Combinación engine='${var.db_engine}' con engine_version='${var.db_engine_version}' no válida. Versiones soportadas: mysql=[5.7, 8.0, 8.4], mariadb=[10.4, 10.5, 10.6, 10.11, 11.4], postgres=[12-17]."
+    }
   }
 }
 
@@ -122,10 +150,13 @@ module "rds" {
   # ─── PARÁMETROS HARDCODED DE CUMPLIMIENTO ───
   # El usuario del wrapper NO puede desactivar estos valores.
   # Esto garantiza que todas las bases de datos de la empresa cumplan
-  # los estándares de seguridad mínimos.
-  storage_encrypted   = true    # Cifrado en reposo obligatorio
-  deletion_protection = false   # Temporalmente desactivado para destruir
-  publicly_accessible = false   # Sin acceso público NUNCA
+  # los estándares de seguridad mínimos. Para destruir el lab, el README
+  # (sección 8) explica el procedimiento manual: cambiar el flag a false,
+  # aplicar, y entonces destruir. Es intencional — fuerza una decisión
+  # consciente al borrar datos críticos.
+  storage_encrypted   = true  # Cifrado en reposo obligatorio
+  deletion_protection = true  # Protección contra borrado accidental
+  publicly_accessible = false # Sin acceso público NUNCA
 
   # ─── OUTPUTS ENCADENADOS DEL MÓDULO VPC ───
   # El vpc_id y las subredes generadas por el módulo de VPC se pasan
@@ -134,9 +165,20 @@ module "rds" {
   vpc_security_group_ids = [aws_security_group.rds.id]
   subnet_ids             = module.vpc.database_subnets
 
-  # --- Otros parámetros ---
-  multi_az                = var.multi_az
-  skip_final_snapshot     = true
+  # --- Otros parámetros (también hardcoded por política corporativa) ---
+  multi_az = var.multi_az
+
+  # ⚠ skip_final_snapshot = true: al destruir la BD, RDS NO crea un
+  # snapshot final. Está pensado para entornos de laboratorio donde la
+  # BD es desechable. EN PRODUCCIÓN ponlo a `false` (o, mejor, exponlo
+  # como variable y déjalo a false por defecto): perder datos al destruir
+  # sin querer es irrecuperable.
+  skip_final_snapshot = true
+
+  # backup_retention_period = 7: snapshots diarios automáticos durante
+  # 7 días (compromiso entre coste y RPO razonable). RDS permite 0–35.
+  # Hardcoded en el wrapper para garantizar que NINGUNA BD del estándar
+  # corporativo se quede sin backups por olvido del equipo de producto.
   backup_retention_period = 7
 
   # Family para parameter group (derivado del motor)

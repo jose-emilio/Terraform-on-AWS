@@ -36,9 +36,9 @@ Crear un módulo "wrapper" que orqueste módulos públicos del Terraform Registr
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado
+- lab-02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
-- Terraform >= 1.5
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3; los bloques `moved {}` requieren ≥ 1.1, así que ya está cubierto)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -46,12 +46,23 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 echo "Bucket: $BUCKET"
 ```
 
-> **Aviso de coste:** Este laboratorio crea una instancia RDS (`db.t4g.micro`) que tiene coste por hora. Destruye los recursos al finalizar para evitar cargos innecesarios.
+> **⚠️ Aviso de coste — desglose mensual aproximado en `us-east-1`:**
+>
+> | Componente | Tarifa | Coste/mes |
+> |---|---|---:|
+> | RDS `db.t4g.micro` (Single-AZ) | ~$0,016/h × 720 h | ~$11,50 |
+> | RDS storage 20 GB gp3 | ~$0,115/GB-mes | ~$2,30 |
+> | RDS backups (retention 7d, ≤storage gratis) | $0 hasta 100% storage | ~$0 |
+> | NAT Gateway (single, no por AZ) | ~$0,045/h × 720 h | ~$32 |
+> | Elastic IP del NAT | ~$0,005/h × 720 h | ~$3,60 |
+> | Secrets Manager (gestionado por RDS) | ~$0,40/secreto-mes | ~$0,40 |
+>
+> **Total base ≈ 50 USD/mes** sin contar tráfico procesado por NAT (~$0,045/GB) ni transferencia de datos. Si dejas el lab corriendo, la factura sube rápido. **Ejecuta `terraform destroy` (sección 8) en cuanto termines la práctica** — recuerda que primero hay que desactivar `deletion_protection`.
 
 ## Estructura del proyecto
 
 ```
-lab24/
+lab-24/
 ├── README.md                                <- Esta guía
 ├── aws/
 │   ├── providers.tf                         <- Backend S3 parcial
@@ -92,12 +103,12 @@ lab24/
 │  │ module "vpc"               │   │ module "rds"                 │   │
 │  │ terraform-aws-modules/vpc  │──►│ terraform-aws-modules/rds    │   │
 │  │                            │   │                              │   │
-│  │ vpc_id ─────────────────┐  │   │ storage_encrypted = true ⬅  │   │
-│  │ database_subnet_group   │  │   │deletion_protection = true⬅  │   │
-│  │ private_subnets_cidr    │  │   │ publicly_accessible = false⬅│   │
+│  │ vpc_id ─────────────────┐  │   │ storage_encrypted = true ⬅   │   │
+│  │ database_subnet_group   │  │   │deletion_protection = true⬅   │   │
+│  │ private_subnets_cidr    │  │   │ publicly_accessible = false⬅ │   │
 │  └─────────────────────────┤──┘   └──────────────────────────────┘   │
 │                            │                                         │
-│  ┌─────────────────────────▼──┐   ⬅ = Hardcoded (no overridable)    │
+│  ┌─────────────────────────▼──┐   ⬅ = Hardcoded (no overridable)     │
 │  │ aws_security_group "rds"   │                                      │
 │  │ Ingress: solo desde        │                                      │
 │  │ subredes privadas          │                                      │
@@ -178,11 +189,17 @@ module "rds" {
   # ...
 
   # ─── PARÁMETROS HARDCODED DE CUMPLIMIENTO ───
-  storage_encrypted   = true    # Cifrado en reposo obligatorio
-  deletion_protection = true    # Protección contra borrado accidental
-  publicly_accessible = false   # Sin acceso público NUNCA
+  storage_encrypted   = true  # Cifrado en reposo obligatorio
+  deletion_protection = true  # Protección contra borrado accidental
+  publicly_accessible = false # Sin acceso público NUNCA
+
+  # ─── OPERACIONALES, también hardcoded por política ───
+  backup_retention_period = 7    # Snapshots diarios automáticos durante 7 días
+  skip_final_snapshot     = true # ⚠ ver nota más abajo
 }
 ```
+
+> **Sobre `skip_final_snapshot = true`:** este flag dice a RDS **no crear** un snapshot final cuando se destruye la BD. Es práctico para un laboratorio (la BD es desechable), pero **en producción debería ser `false`** o, mejor, exponerse como variable con default `false` — perder datos al destruir sin querer es irrecuperable. Lo dejamos en `true` aquí solo para que `terraform destroy` funcione sin el paso adicional de proporcionar `final_snapshot_identifier`.
 
 Estos parámetros están **dentro del wrapper**, no expuestos como variables. El equipo de producto que consume el módulo no puede hacer:
 
@@ -251,7 +268,7 @@ Todo lo demás (VPC, subredes, security groups, cifrado, protección, subnet gro
 ## 2. Despliegue
 
 ```bash
-cd labs/lab24/aws
+cd labs/lab-24/aws
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
@@ -282,7 +299,7 @@ terraform output
 
 ---
 
-## Verificación final
+## 3. Verificación final
 
 ### 3.1 Verificar la VPC y subredes
 
@@ -402,29 +419,79 @@ module "network" {                           # Antes: module "vpc"
 }
 ```
 
-### Paso 2: Actualizar todas las referencias
+### Paso 2: Actualizar todas las referencias en `main.tf`
+
+En `modules/corporate-rds/main.tf` hay **4 referencias** a `module.vpc.*` que hay que cambiar a `module.network.*`. Antes de empezar, lista las que tienes para no dejar ninguna olvidada:
+
+```bash
+grep -nE "module\.vpc\." modules/corporate-rds/main.tf
+# 90:  vpc_id      = module.vpc.vpc_id
+# 96:    cidr_blocks = module.vpc.private_subnets_cidr_blocks
+# 164:  db_subnet_group_name   = module.vpc.database_subnet_group_name
+# 166:  subnet_ids             = module.vpc.database_subnets
+```
+
+**Cambio 1 + 2** — bloque `resource "aws_security_group" "rds"`:
 
 ```hcl
-# Security group
 resource "aws_security_group" "rds" {
-  vpc_id = module.network.vpc_id            # Antes: module.vpc.vpc_id
-  # ...
-  ingress {
-    cidr_blocks = module.network.private_subnets_cidr_blocks  # Antes: module.vpc...
-  }
-}
+  name_prefix = "${var.project_name}-rds-"
+  description = "Acceso a RDS solo desde subredes privadas"
+  vpc_id      = module.network.vpc_id          # ← Cambio 1 (antes: module.vpc.vpc_id)
 
-# Módulo RDS
-module "rds" {
-  # ...
-  db_subnet_group_name = module.network.database_subnet_group_name  # Antes: module.vpc...
-  subnet_ids           = module.network.database_subnets            # Antes: module.vpc...
+  ingress {
+    from_port   = var.db_port
+    to_port     = var.db_port
+    protocol    = "tcp"
+    cidr_blocks = module.network.private_subnets_cidr_blocks  # ← Cambio 2
+    description = "Acceso desde subredes privadas"
+  }
+
+  # egress, tags, lifecycle (sin cambios — no usan module.vpc.*)
 }
 ```
 
-### Paso 3: Actualizar los outputs
+**Cambio 3 + 4** — bloque `module "rds"`:
 
-En `modules/corporate-rds/outputs.tf`:
+```hcl
+module "rds" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "~> 6.0"
+
+  # ... (parámetros del motor, hardcoded de cumplimiento, etc., sin cambios)
+
+  # ─── OUTPUTS ENCADENADOS DEL MÓDULO VPC ───
+  db_subnet_group_name   = module.network.database_subnet_group_name  # ← Cambio 3
+  vpc_security_group_ids = [aws_security_group.rds.id]                # (sin cambios — referencia local)
+  subnet_ids             = module.network.database_subnets            # ← Cambio 4
+
+  # ... (multi_az, skip_final_snapshot, family, etc., sin cambios)
+}
+```
+
+**Verificación**: tras los 4 cambios, no debería quedar ninguna referencia a `module.vpc.*` en `main.tf`:
+
+```bash
+grep -nE "module\.vpc\." modules/corporate-rds/main.tf
+# (sin salida = todas las referencias migradas)
+```
+
+> **Nota:** las referencias a `aws_security_group.rds.id`, `var.db_*`, `local.*` y `data.aws_availability_zones` **no cambian** — solo se renombra el módulo VPC, no los demás recursos.
+
+### Paso 3: Actualizar los outputs en `outputs.tf`
+
+En `modules/corporate-rds/outputs.tf` hay **5 referencias** más a `module.vpc.*` que también hay que migrar (los outputs `db_*` apuntan a `module.rds`, no a la VPC, y NO se tocan):
+
+```bash
+grep -nE "module\.vpc\." modules/corporate-rds/outputs.tf
+# 5:  value       = module.vpc.vpc_id
+# 10: value       = module.vpc.vpc_cidr_block
+# 15: value       = module.vpc.private_subnets
+# 20: value       = module.vpc.database_subnets
+# 25: value       = module.vpc.database_subnet_group_name
+```
+
+Cambia cada una a `module.network.*`:
 
 ```hcl
 output "vpc_id" {
@@ -448,16 +515,44 @@ output "database_subnet_group_name" {
 }
 ```
 
-### Paso 4: Re-inicializar y verificar con plan
+**Verificación final** — combinada para `main.tf` + `outputs.tf`:
 
-Al renombrar un módulo que usa `source` del Registry, Terraform necesita re-registrar el módulo con su nuevo nombre local. Ejecuta `terraform init` antes del plan:
+```bash
+grep -rnE "module\.vpc\." modules/corporate-rds/
+# (sin salida = las 9 referencias totales migradas: 4 en main.tf + 5 en outputs.tf)
+```
+
+### Paso 4: Re-ejecutar `terraform init`
+
+Al renombrar un módulo que usa `source` del Registry, Terraform **necesita re-registrar el módulo con su nuevo nombre local**: el código fuente descargado del Registry se cachea en `.terraform/modules/<nombre-local>/`, así que el path cambia de `.terraform/modules/vpc/` a `.terraform/modules/network/`. Si saltas este paso, el siguiente `plan` falla inmediatamente con:
+
+```
+Error: Module not installed
+  on modules/corporate-rds/main.tf line N:
+   N: module "network" {
+This module is not yet installed. Run "terraform init" to install all
+modules required by this configuration.
+```
+
+Ejecuta:
 
 ```bash
 terraform init \
   -backend-config=aws.s3.tfbackend \
   -backend-config="bucket=$BUCKET"
+```
 
-terraform plan
+> **`init` es obligatorio aquí.** El cambio que hiciste en Paso 1 (renombrar `module "vpc"` → `module "network"`) toca la **interfaz de carga de módulos**, no solo el código. Sin `init` el plan ni siquiera arranca; con `init` Terraform descarga (o más bien, copia desde la caché) el módulo bajo el nuevo nombre y queda listo para evaluar el `moved {}`.
+
+### Paso 5: Verificar el `moved {}` con `plan`
+
+Ahora sí, comprueba que el rename se traduce en un `moved` y no en una destrucción:
+
+```bash
+# Tip opcional: -refresh=false acelera el plan saltándose la consulta a
+# AWS para ver si la infraestructura ha cambiado fuera de Terraform.
+# Útil cuando solo quieres validar el rename, no diff con AWS.
+terraform plan -refresh=false
 ```
 
 Debe mostrar algo como:
@@ -480,6 +575,80 @@ Plan: 0 to add, 0 to change, 0 to destroy.
 ```
 
 **Cero destrucciones.** Terraform entiende que los recursos son los mismos, solo con un nombre diferente en el código.
+
+> **⚠️ DETÉNTE antes del apply si ves esto:**
+>
+> ```
+> # module.corporate_rds.module.vpc.aws_vpc.this will be destroyed
+> - resource "aws_vpc" "this" { ... }
+>
+> # module.corporate_rds.module.network.aws_vpc.this will be created
+> + resource "aws_vpc" "this" { ... }
+>
+> Plan: N to add, 0 to change, N to destroy.
+> ```
+>
+> Eso significa que **Terraform no reconoció el rename como un `moved`** y va a destruir y recrear toda la infraestructura (VPC, subnets, NAT GW, RDS — todo). **NO ejecutes `apply`** o perderás la BD y todos los datos. Cancela con `Ctrl+C` o responde `no`.
+>
+> Causas posibles, en orden de probabilidad:
+>
+> 1. **Falta el bloque `moved {}`** (Paso 1 incompleto). Verifica que existe en `modules/corporate-rds/main.tf`:
+>
+>    ```bash
+>    grep -A2 "^moved " modules/corporate-rds/main.tf
+>    # moved {
+>    #   from = module.vpc
+>    #   to   = module.network
+>    # }
+>    ```
+>
+> 2. **Direcciones del `moved` mal escritas**. Las direcciones son **relativas** al módulo donde está el bloque. Como el `moved {}` vive dentro de `corporate-rds`, debe decir `from = module.vpc` y `to = module.network` — **NO** `module.corporate_rds.module.vpc`. Terraform añade el prefijo `module.corporate_rds.` automáticamente al evaluar.
+>
+> 3. **Falta `terraform init` tras el rename**. El módulo Registry se cachea bajo el nombre local; sin `init` el path nuevo no existe. Repite el `init` (ver inicio de este Paso 4).
+>
+> 4. **Quedan referencias huérfanas a `module.vpc.*`**. Aunque Terraform debería avisar con `Reference to undeclared module`, conviene verificar:
+>
+>    ```bash
+>    grep -rnE "module\.vpc\." modules/corporate-rds/
+>    # (debe estar vacío — si sale algo, esa referencia rompe el grafo)
+>    ```
+>
+> Tras corregir lo que aplique, **vuelve a ejecutar `terraform plan`**. Solo cuando veas `has moved to` (no `destroyed`/`created`) está seguro continuar al apply.
+
+### Paso 6: Aplicar y eliminar el bloque `moved {}` después
+
+Una vez que el `plan` muestra solo `has moved to` sin cambios reales, ejecuta el `apply` para que Terraform **persista las nuevas direcciones en el state**:
+
+```bash
+terraform apply
+# Plan: 0 to add, 0 to change, 0 to destroy.
+# (los "moved" se aplican silenciosamente — solo reorganizan el state)
+```
+
+Tras este `apply`, el state ya tiene los recursos bajo `module.network.*` y **el bloque `moved {}` ha cumplido su función**. Lo correcto es **eliminarlo** del código:
+
+```hcl
+# ELIMINAR de modules/corporate-rds/main.tf:
+# moved {
+#   from = module.vpc
+#   to   = module.network
+# }
+```
+
+**¿Por qué eliminarlo?** Cuatro razones:
+
+1. **Ya es ruido**: el rename está consolidado en el state, así que el bloque ya no hace nada — Terraform lo evalúa pero no produce efecto.
+2. **Confunde al lector**: alguien que abra el código en seis meses verá un `moved {}` apuntando a un `module.vpc` que **no existe** y se preguntará si falta algo o si es código muerto.
+3. **Acumulación**: si dejas todos los `moved {}` históricos en el código, en pocos años tendrás decenas inútiles que ofuscan el `main.tf`.
+4. **Verificable**: tras eliminar el bloque, un `terraform plan` debe seguir mostrando `Plan: 0 to add, 0 to change, 0 to destroy.` — confirma que el `moved` ya cumplió su papel y se puede borrar sin riesgo.
+
+```bash
+# Tras eliminar el moved {} y guardar el archivo:
+terraform plan
+# Plan: 0 to add, 0 to change, 0 to destroy.   ← OK, el state ya estaba migrado
+```
+
+> **Política de equipo recomendada:** mantener el `moved {}` durante **al menos un ciclo de despliegue completo** en todos los entornos (dev → staging → prod) para que cada uno aplique el rename. Una vez el último entorno haya hecho `apply`, abrir un PR de limpieza que elimine el bloque. Documenta la fecha del PR en el commit message para tener trazabilidad.
 
 ### Reflexión: ¿cuándo usar `moved {}`?
 
@@ -534,12 +703,20 @@ resource "aws_db_parameter_group" "corporate" {
   description = "Parámetros de seguridad corporativos para ${var.db_engine}"
 
   # ─── PARÁMETROS HARDCODED DE SEGURIDAD ───
+  # Cada parámetro de RDS se clasifica como "dinámico" o "estático" según
+  # si el motor puede aplicarlo en caliente o necesita reinicio:
+  #   - dinámico → apply_method = "immediate" (default), se aplica al instante
+  #   - estático → apply_method = "pending-reboot" obligatorio, se aplica
+  #                en el siguiente reinicio de la BD
   parameter {
+    # Dinámico — se aplica de inmediato sin reinicio.
     name  = "require_secure_transport"
     value = "1"
   }
 
   parameter {
+    # Estático — siempre requiere reboot. Si omites apply_method o pones
+    # "immediate", terraform apply falla con un error de RDS API.
     name         = "log_bin_trust_function_creators"
     value        = "0"
     apply_method = "pending-reboot"
@@ -612,34 +789,43 @@ Ninguno de estos puede ser desactivado por los equipos de producto. Si necesitan
 
 ## 8. Limpieza
 
-Dado que el wrapper tiene `deletion_protection = true`, antes de destruir debes desactivarlo:
+El wrapper tiene **`deletion_protection = true`** hardcoded ([`modules/corporate-rds/main.tf`](aws/modules/corporate-rds/main.tf), bloque `module "rds"`). Si intentas `terraform destroy` directamente, AWS rechaza la operación con `Cannot delete protected DB instance`. Es **intencional** — borrar una base de datos requiere un paso deliberado, no un `terraform destroy` accidental.
 
 ### Paso 1: Desactivar protección temporalmente
 
-En `modules/corporate-rds/main.tf`, cambiar en el módulo RDS:
+Edita `modules/corporate-rds/main.tf` y localiza el bloque `module "rds"`. Cambia la línea:
 
 ```hcl
-deletion_protection = false    # Temporalmente para destruir
+  deletion_protection = true  # Protección contra borrado accidental
 ```
 
-Aplicar el cambio:
+a:
+
+```hcl
+  deletion_protection = false # Temporal: SOLO durante el destroy del lab
+```
+
+Aplica el cambio para que AWS desactive la protección en la instancia RDS existente (este `apply` no destruye nada, solo modifica un atributo de la BD):
 
 ```bash
 terraform apply
+# Plan: 0 to add, 1 to change, 0 to destroy.
+#   ~ deletion_protection = true -> false
 ```
 
 ### Paso 2: Destruir
 
 ```bash
-terraform destroy \
-  -var="region=us-east-1"
+terraform destroy
 ```
 
-### Paso 3: Restaurar la protección
+> **Nota:** la destrucción tarda ~5-10 minutos (RDS hace shutdown ordenado).
 
-Si vas a seguir usando el wrapper, revierte `deletion_protection = true`.
+### Paso 3: Restaurar la protección si vas a redesplegar
 
-> **Nota:** En producción, este paso manual es **intencional** — destruir una base de datos requiere una acción deliberada, no un `terraform destroy` accidental. No destruyas el bucket S3 del lab02.
+Si después de destruir vas a volver a desplegar el lab (o reutilizar el wrapper en otro proyecto), **revierte el cambio** a `deletion_protection = true` en el código. Dejar el wrapper con `false` rompería su contrato corporativo.
+
+> **Nota:** En producción, este paso manual es **intencional** — destruir una base de datos requiere una acción deliberada, no un `terraform destroy` accidental. El laboratorio sí crea recursos propios (VPC, RDS, secret) que se destruyen aquí; no destruyas el bucket de tfstate del lab02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -656,7 +842,7 @@ Consulta [localstack/README.md](localstack/README.md) para más detalles.
 - **Módulos wrapper como capa de control corporativo**: el wrapper impone estándares de seguridad (cifrado, deletion protection, backup) que los equipos de desarrollo no pueden desactivar, garantizando cumplimiento sin fricción.
 - **Encadenamiento de outputs entre módulos**: pasar `module.vpc.vpc_id` y `module.vpc.private_subnets` como inputs del módulo RDS demuestra el patrón de composición modular, la base de la reutilización en Terraform.
 - **`moved {}` para refactorizar sin destruir**: los bloques `moved` permiten renombrar recursos o moverlos entre módulos manteniendo el estado intacto. Son preferibles a `terraform state mv` porque el cambio queda documentado en código.
-- **Variables obligatorias sin default**: las variables que no tienen `default` son obligatorias, lo que garantiza que el consumidor del módulo debe pensar conscientemente en cada parámetro crítico.
+- **Defaults razonables en el wrapper, obligatorios solo lo crítico**: un wrapper corporativo sirve para **reducir fricción** al consumidor, así que la mayoría de variables (`db_engine`, `db_engine_version`, `db_instance_class`, etc.) tienen defaults sensatos (`mysql 8.0`, `db.t4g.micro`) — el equipo de producto solo decide lo que de verdad varía. Lo único realmente obligatorio (sin `default`) es `project_name`, porque sin nombre no hay aislamiento de recursos. Este patrón es opuesto al de un módulo low-level (donde cada variable suele ser obligatoria para forzar elección consciente): un wrapper opina por defecto y el consumidor solo sobreescribe lo que necesita.
 - **`manage_master_user_password = true`**: delegar la gestión de credenciales a Secrets Manager elimina la necesidad de pasar contraseñas como variables de Terraform, que pueden quedar en el estado en texto claro.
 - **Módulos del Registry versionados con `~>`**: fijar la versión mínima con el operador pessimistic constraint `~>` permite actualizaciones de patch automáticas pero evita cambios de minor o major inesperados.
 
