@@ -38,9 +38,9 @@ Establecer un túnel privado entre dos VPCs independientes para permitir la comu
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado
+- lab-02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
-- Terraform >= 1.5
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -51,7 +51,7 @@ echo "Bucket: $BUCKET"
 ## Estructura del proyecto
 
 ```
-lab19/
+lab-19/
 ├── README.md                    <- Esta guía
 ├── aws/
 │   ├── providers.tf             <- Backend S3 parcial
@@ -63,7 +63,7 @@ lab19/
     ├── README.md                <- Guía específica para LocalStack
     ├── providers.tf
     ├── variables.tf
-    ├── main.tf                  <- VPCs y peerings (sin trafico real)
+    ├── main.tf                  <- VPCs y peerings (sin tráfico real)
     ├── outputs.tf
     └── localstack.s3.tfbackend  <- Backend completo para LocalStack
 ```
@@ -97,9 +97,19 @@ Tres VPCs con dos peerings:
 
 ```hcl
 resource "aws_vpc_peering_connection" "app_to_db" {
-  vpc_id        = aws_vpc.app.id       # Requester
-  peer_vpc_id   = aws_vpc.db.id        # Accepter
-  auto_accept   = true
+  vpc_id      = aws_vpc.app.id     # Requester
+  peer_vpc_id = aws_vpc.db.id      # Accepter
+  auto_accept = true
+
+  # DNS resolution cross-peering: cada lado resuelve los nombres DNS
+  # privados de la VPC peer (ej. endpoints internos de RDS). Sin estos
+  # bloques solo funciona la conectividad por IP.
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
 
   tags = merge(local.common_tags, {
     Name = "peering-app-db-${var.project_name}"
@@ -108,6 +118,8 @@ resource "aws_vpc_peering_connection" "app_to_db" {
 ```
 
 `auto_accept = true` solo funciona si ambas VPCs están en la **misma cuenta y región**. En un escenario multi-cuenta o cross-region, la cuenta/región accepter debe aceptar la solicitud con `aws_vpc_peering_connection_accepter`.
+
+Los bloques `requester` y `accepter` con `allow_remote_vpc_dns_resolution = true` activan la resolución DNS cross-peering: una instancia en `vpc-app` puede hacer `dig <hostname-privado-en-vpc-db>` y obtener la IP privada (no la pública). Imprescindible si vas a apuntar a recursos por nombre — RDS, ALB internos, endpoints VPC, etc. Sin este flag, sólo la conectividad por IP funciona.
 
 **¿Qué pasa si los CIDRs se solapan?**
 
@@ -147,7 +159,7 @@ TCP requiere comunicación en ambas direcciones (SYN → SYN-ACK → ACK). Si so
 ```hcl
 resource "aws_security_group" "db" {
   name        = "db-${var.project_name}"
-  description = "Permite MySQL desde VPC app"
+  description = "Permite MySQL desde VPC app, ICMP desde app"
   vpc_id      = aws_vpc.db.id
 
   ingress {
@@ -156,6 +168,25 @@ resource "aws_security_group" "db" {
     protocol    = "tcp"
     cidr_blocks = [var.app_cidr]
     description = "MySQL desde VPC app"
+  }
+
+  # ICMP desde app: permite que las pruebas de `ping` de la sección 3.4
+  # funcionen. Sin esta regla, el peering y las rutas serían correctos
+  # pero el ping fallaría — un error fácil de diagnosticar mal.
+  ingress {
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = [var.app_cidr]
+    description = "ICMP desde VPC app"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Todo el tráfico saliente"
   }
 }
 ```
@@ -180,13 +211,14 @@ vpc-app (10.15.0.0/16)
 vpc-db (10.16.0.0/16)
 ```
 
-Aunque vpc-c tiene peering con app, y app tiene peering con db, vpc-c **no puede** enviar tráfico a db a través de app. ¿Por qué?
+Aunque vpc-c tiene peering con app, y app tiene peering con db, vpc-c **no puede** enviar tráfico a db a través de app. La razón está en cómo AWS valida las rutas asociadas a un peering:
 
-1. vpc-c envía un paquete a `10.16.0.0/16` (db)
-2. La tabla de rutas de vpc-c **no tiene** ruta hacia `10.16.0.0/16` → el paquete se descarta
-3. Incluso si añadiéramos una ruta `10.16.0.0/16 → peering-app-c`, el paquete llegaría a app pero app **no reenvía** tráfico entre peerings — AWS lo descarta explícitamente
+1. vpc-c envía un paquete a `10.16.0.0/16` (db).
+2. La tabla de rutas de vpc-c **no tiene** ruta hacia `10.16.0.0/16` → el paquete se descarta en origen.
+3. Si intentáramos crear esa ruta apuntando al peering existente — `route 10.16.0.0/16 → peering-app-c` — **AWS rechaza la creación de la ruta** con un error como `RouteNotSupported: The route's CIDR block 10.16.0.0/16 is not equal to or part of the peer VPC's CIDR (10.15.0.0/16)`. La validación es estricta: el destino de una ruta peering debe estar contenido en el CIDR del peer (vpc-app, no vpc-db).
+4. Tampoco se puede crear una ruta `10.16.0.0/16 → peering-app-db` desde vpc-c, porque vpc-c **no es** parte de ese peering — AWS rechaza referenciar un peering al que la VPC no pertenece.
 
-Esta es una restricción a nivel de la plataforma AWS, no de configuración. El peering es **estrictamente punto a punto**. Para conectividad transitiva, se necesita Transit Gateway (lab20).
+En otras palabras, el bloqueo no ocurre "en tiempo de tráfico" (el paquete llega a app y se descarta), sino **en tiempo de configuración** (AWS no permite siquiera crear la ruta intermedia). Esa es la garantía de que el peering es **estrictamente punto a punto** y no transitivo. Para conectividad transitiva, se necesita Transit Gateway (lab-20).
 
 ### 1.6 Acceso SSM sin salida a Internet — AMI con SSM + VPC Endpoints
 
@@ -215,7 +247,7 @@ resource "aws_vpc_endpoint" "db_ssm" {
 ## 2. Despliegue
 
 ```bash
-cd labs/lab19/aws
+cd labs/lab-19/aws
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
@@ -224,7 +256,9 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará ~35 recursos: 3 VPCs, subredes, IGW, NAT Gateway, 2 peerings, rutas bidireccionales, Security Groups, IAM role SSM e instancias de test.
+Terraform creará ~49 recursos: 3 VPCs, 8 subredes (4 en app, 2 en db, 2 en vpc-c), IGW + EIP + NAT Gateway en app, 4 tablas de rutas con sus asociaciones, 2 peerings + 4 rutas peering, **6 VPC Interface Endpoints** (3 servicios SSM × 2 VPCs sin Internet) + 2 SGs para los endpoints, 3 IAM (rol + attachment + instance profile) para SSM, 3 Security Groups (app/db/c) y 3 instancias EC2 de test.
+
+> **⚠️ Aviso de coste — VPC Interface Endpoints:** los 6 Interface Endpoints (PrivateLink) facturan **~0,01 USD/hora por endpoint y AZ**. Asumiendo 1 AZ activa: 6 endpoints × 0,01 USD × 720 h ≈ **43,20 USD/mes** solo por los endpoints SSM, además del NAT Gateway (~32 USD/mes) y el resto de cargos. Si dejas el lab desplegado, el coste se acumula rápido — ejecuta `terraform destroy` (sección 6) en cuanto termines la práctica.
 
 ```bash
 terraform output
@@ -243,7 +277,7 @@ terraform output
 
 ---
 
-## Verificación final
+## 3. Verificación final
 
 ### 3.1 Estado de los peerings
 
@@ -374,9 +408,10 @@ aws ssm describe-instance-information \
 5. Reflexionar: ahora tienes 3 peerings para 3 VPCs. ¿Cuántos peerings necesitarías para 10 VPCs? (Respuesta: 45). ¿Y para 20? (190). Este es el problema que resuelve Transit Gateway.
 
 **Pistas**:
-- El tercer peering sigue el mismo patron que los dos existentes
-- Necesitas 2 rutas nuevas (vpc-c → db y db → vpc-c) y 1 regla de SG
-- La formula para peerings en una malla completa es N×(N-1)/2
+- El tercer peering sigue el mismo patrón que los dos existentes (incluidos los bloques `requester` / `accepter` con `allow_remote_vpc_dns_resolution = true`).
+- Necesitas 2 rutas nuevas (vpc-c → db y db → vpc-c) y reglas en los SG de db **y** vpc-c (la verificación con `ping` requiere reglas en ambos sentidos; consulta el Paso 3).
+- **No tienes que tocar el SG de `app`**: ya admite ICMP desde `var.db_cidr` y `var.c_cidr` ([aws/main.tf:444](aws/main.tf#L444)), así que cualquier `ping` saliente desde db o vpc-c hacia app sigue funcionando sin cambios. Lo mismo para el SG de los endpoints SSM, que están limitados al CIDR de su propia VPC y no se ven afectados por este Reto.
+- La fórmula para peerings en una malla completa es N×(N-1)/2.
 
 La solución está en la [sección 5](#5-solucion-del-reto).
 
@@ -386,11 +421,20 @@ La solución está en la [sección 5](#5-solucion-del-reto).
 
 ### Paso 1: Crear el tercer peering
 
+Mismo patrón que los dos existentes — incluidos los bloques `requester` / `accepter` para que la resolución DNS cross-peering también funcione entre vpc-c y vpc-db:
+
 ```hcl
 resource "aws_vpc_peering_connection" "c_to_db" {
   vpc_id      = aws_vpc.c.id
   peer_vpc_id = aws_vpc.db.id
   auto_accept = true
+
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
 
   tags = merge(local.common_tags, {
     Name = "peering-c-db-${var.project_name}"
@@ -472,8 +516,8 @@ exit
 
 ### Reflexión: escalabilidad del peering
 
-| VPCs | Peerings necesarios (malla completa) |
-|------|--------------------------------------|
+| VPCs | Peerings necesarios para malla completa: n(n-1)/2 |
+|------|---------------------------------------------------|
 | 3 | 3 |
 | 5 | 10 |
 | 10 | 45 |
@@ -486,12 +530,13 @@ Cada peering requiere 2 rutas + reglas de SG. Con 20 VPCs serían 190 peerings, 
 
 ## 6. Limpieza
 
+> **⚠️ Importante — coste acumulado:** este lab incluye **6 VPC Interface Endpoints** (~0,01 USD/hora por endpoint y AZ ≈ **43,20 USD/mes asumiendo 3 AZ activas**, sin contar el tráfico procesado), 1 NAT Gateway (~32 USD/mes) y 3 EIPs. Si dejas el despliegue activo, la factura crece rápido. Ejecuta `terraform destroy` en cuanto termines la práctica (incluido el Reto, si lo has hecho).
+
 ```bash
-terraform destroy \
-  -var="region=us-east-1"
+terraform destroy
 ```
 
-> **Nota:** No destruyas el bucket S3 (lab02).
+> **Nota:** El laboratorio no crea ningún bucket S3 propio. No destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -508,8 +553,8 @@ LocalStack emula VPC Peering a nivel de API pero no ejecuta tráfico real. El ob
 - **CIDR no solapantes entre VPCs**: el VPC Peering no funciona si los bloques CIDR de las VPCs se solapan. Planificar el espacio de direccionamiento desde el principio evita tener que redesplegar toda la infraestructura de red.
 - **Rutas explícitas en ambas tablas de rutas**: el peering es bidireccional pero las rutas no se crean automáticamente. Deben declararse en la tabla de rutas de cada VPC para que el tráfico pueda fluir en ambas direcciones.
 - **Aceptación automática con `auto_accept = true`**: solo funciona cuando ambas VPCs pertenecen a la misma cuenta. Para peerings cross-account, el proceso de aceptación debe ser manual o gestionado por un módulo dedicado.
-- **`enable_dns_resolution = true` en el peering**: necesario si quieres resolver nombres DNS de recursos en la VPC remota (por ejemplo, endpoints de RDS). Sin esta opción, solo funciona la conectividad por IP.
-- **Seguridad via Security Groups**: aunque el peering establece conectividad, el acceso real entre instancias lo controlan los Security Groups. Referenciar el Security Group de la VPC remota en las reglas de ingress es más seguro que abrir rangos CIDR amplios.
+- **DNS resolution cross-peering (`allow_remote_vpc_dns_resolution = true`)**: el lab activa este flag en los bloques `requester` y `accepter` de cada `aws_vpc_peering_connection`. Permite que una instancia en una VPC resuelva los nombres DNS privados de la VPC peer (típico caso: una EC2 en `vpc-app` resolviendo el endpoint privado de un RDS en `vpc-db`). Sin estos bloques solo funciona la conectividad por IP, lo que impide usar nombres estables como `mydb.cluster-xxx.us-east-1.rds.amazonaws.com`.
+- **Seguridad por CIDR de la VPC peer en los Security Groups**: en VPC Peering, los Security Groups se referencian por **CIDR** de la VPC remota (`cidr_blocks = [var.app_cidr]`), no por ID de SG. Es lo que hace este lab. Existe la posibilidad de **referenciar un SG remoto** (`security_groups = [<sg-id-remoto>]`), pero solo funciona en peerings same-region y requiere que esté explícitamente habilitado en ambos lados; además, no escala bien a muchas VPCs. Como recomendación: usar CIDR es portable y suficientemente granular si los CIDRs están bien planificados; reservar la referencia por SG remoto para casos concretos en los que necesites filtrar por *qué workload* hace la conexión, no por *desde qué red* viene.
 - **Documentar la no transitividad**: en arquitecturas con tres o más VPCs, el equipo debe saber que VPC-A puede hablar con VPC-B y VPC-C pero que VPC-B no puede hablar con VPC-C a través de VPC-A. Para transitividad, usar Transit Gateway.
 
 ---

@@ -29,7 +29,7 @@ output "db_sg_id" {
 }
 
 output "nat_public_ip" {
-  description = "IP publica del NAT Gateway de app"
+  description = "IP pública del NAT Gateway de app"
   value       = aws_eip.nat_app.public_ip
 }
 

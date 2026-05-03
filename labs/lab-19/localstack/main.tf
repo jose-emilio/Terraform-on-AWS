@@ -1,7 +1,7 @@
 # ===========================================================================
 # Lab19 — Conectividad Punto a Punto con VPC Peering (LocalStack)
 # ===========================================================================
-# Nota: LocalStack emula VPC Peering a nivel de API pero no ejecuta trafico
+# Nota: LocalStack emula VPC Peering a nivel de API pero no ejecuta tráfico
 # real. El objetivo es validar la estructura de Terraform.
 
 # --- Data Sources ---
@@ -157,6 +157,13 @@ resource "aws_vpc_peering_connection" "app_to_db" {
   peer_vpc_id = aws_vpc.db.id
   auto_accept = true
 
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
+
   tags = merge(local.common_tags, {
     Name = "peering-app-db-${var.project_name}"
   })
@@ -183,6 +190,13 @@ resource "aws_vpc_peering_connection" "app_to_c" {
   peer_vpc_id = aws_vpc.c.id
   auto_accept = true
 
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
+
   tags = merge(local.common_tags, {
     Name = "peering-app-c-${var.project_name}"
   })
@@ -205,8 +219,10 @@ resource "aws_route" "c_to_app" {
 # ===========================================================================
 
 resource "aws_instance" "test_app" {
+  # AMI e instance_type alineados con la version aws/ (AL2023 ARM + t4g.micro)
+  # para mantener paridad. LocalStack no ejecuta tráfico ni user_data real.
   ami           = "ami-00000000000000000"
-  instance_type = "t3.micro"
+  instance_type = "t4g.micro"
   subnet_id     = aws_subnet.app_private["private-1"].id
 
   tags = merge(local.common_tags, {
@@ -215,8 +231,10 @@ resource "aws_instance" "test_app" {
 }
 
 resource "aws_instance" "test_db" {
+  # AMI e instance_type alineados con la version aws/ (AL2023 ARM + t4g.micro)
+  # para mantener paridad. LocalStack no ejecuta tráfico ni user_data real.
   ami           = "ami-00000000000000000"
-  instance_type = "t3.micro"
+  instance_type = "t4g.micro"
   subnet_id     = aws_subnet.db["private-1"].id
 
   tags = merge(local.common_tags, {
@@ -225,8 +243,10 @@ resource "aws_instance" "test_db" {
 }
 
 resource "aws_instance" "test_c" {
+  # AMI e instance_type alineados con la version aws/ (AL2023 ARM + t4g.micro)
+  # para mantener paridad. LocalStack no ejecuta tráfico ni user_data real.
   ami           = "ami-00000000000000000"
-  instance_type = "t3.micro"
+  instance_type = "t4g.micro"
   subnet_id     = aws_subnet.c["private-1"].id
 
   tags = merge(local.common_tags, {

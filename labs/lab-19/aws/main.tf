@@ -1,7 +1,7 @@
 # ===========================================================================
 # Lab19 — Conectividad Punto a Punto con VPC Peering
 # ===========================================================================
-# Topologia:
+# Topología:
 #   vpc-app (10.15.0.0/16) ◄──peering──► vpc-db  (10.16.0.0/16)
 #   vpc-app (10.15.0.0/16) ◄──peering──► vpc-c   (10.17.0.0/16)
 #   vpc-c   (10.17.0.0/16)  ── ✗ ──      vpc-db  (sin peering, no transitivo)
@@ -20,21 +20,51 @@ data "aws_availability_zones" "available" {
   }
 }
 
-# AMI Amazon Linux 2023 estandar (NO minimal): incluye SSM Agent preinstalado.
+# AMI Amazon Linux 2023 estándar (NO minimal): incluye SSM Agent preinstalado.
 # Las instancias en vpc-db y vpc-c no tienen salida a Internet para descargar
 # paquetes, por lo que necesitan una AMI que ya incluya el agente.
+#
+# Patrones de nombre AL2023 publicados por Amazon (owner = "amazon"):
+#   - estándar : al2023-ami-2023.X.YYYYMMDD.0-kernel-X.Y-arm64
+#   - minimal  : al2023-ami-minimal-2023.X.YYYYMMDD.0-kernel-X.Y-arm64
+# Filtramos exigiendo "kernel-*-arm64" en el nombre y ANCLANDO el prefijo a
+# "al2023-ami-2023." (con el punto), de modo que el patron de minimal —que
+# inserta "minimal-" entre "al2023-ami-" y "2023."— queda excluido sin
+# ambiguedad. Anadimos ademas filtros explicitos por owner-alias, arquitectura,
+# tipo de imagen, virtualizacion y dispositivo de root para evitar que
+# cualquier AMI promocional o de terceros con un nombre parecido haga match.
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["al2023-ami-2023*-arm64"]
+    values = ["al2023-ami-2023.*-kernel-*-arm64"]
+  }
+
+  filter {
+    name   = "owner-alias"
+    values = ["amazon"]
   }
 
   filter {
     name   = "architecture"
     values = ["arm64"]
+  }
+
+  filter {
+    name   = "image-type"
+    values = ["machine"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
   }
 
   filter {
@@ -69,7 +99,7 @@ resource "aws_vpc" "app" {
   })
 }
 
-# --- Subredes publicas ---
+# --- Subredes públicas ---
 
 resource "aws_subnet" "app_public" {
   for_each = { for idx, az in local.azs : "public-${idx + 1}" => { az = az, index = idx } }
@@ -110,7 +140,7 @@ resource "aws_internet_gateway" "app" {
   })
 }
 
-# --- Tabla de rutas publica ---
+# --- Tabla de rutas pública ---
 
 resource "aws_route_table" "app_public" {
   vpc_id = aws_vpc.app.id
@@ -270,6 +300,17 @@ resource "aws_vpc_peering_connection" "app_to_db" {
   peer_vpc_id = aws_vpc.db.id
   auto_accept = true
 
+  # DNS resolution cross-peering: permite que las instancias de cada lado
+  # resuelvan los nombres DNS privados de la VPC peer (por ejemplo, los
+  # endpoints internos de RDS en vpc-db). Sin esto, solo funciona la
+  # conectividad por IP.
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
+
   tags = merge(local.common_tags, {
     Name = "peering-app-db-${var.project_name}"
   })
@@ -284,7 +325,7 @@ resource "aws_route" "app_to_db" {
   vpc_peering_connection_id = aws_vpc_peering_connection.app_to_db.id
 }
 
-# db → app (solo trafico hacia el CIDR de app, no ruta por defecto)
+# db → app (solo tráfico hacia el CIDR de app, no ruta por defecto)
 resource "aws_route" "db_to_app" {
   route_table_id            = aws_route_table.db.id
   destination_cidr_block    = var.app_cidr
@@ -300,6 +341,13 @@ resource "aws_vpc_peering_connection" "app_to_c" {
   peer_vpc_id = aws_vpc.c.id
   auto_accept = true
 
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
+
   tags = merge(local.common_tags, {
     Name = "peering-app-c-${var.project_name}"
   })
@@ -314,7 +362,7 @@ resource "aws_route" "app_to_c" {
   vpc_peering_connection_id = aws_vpc_peering_connection.app_to_c.id
 }
 
-# vpc-c → app (solo trafico hacia el CIDR de app, no ruta por defecto)
+# vpc-c → app (solo tráfico hacia el CIDR de app, no ruta por defecto)
 resource "aws_route" "c_to_app" {
   route_table_id            = aws_route_table.c.id
   destination_cidr_block    = var.app_cidr
@@ -324,8 +372,8 @@ resource "aws_route" "c_to_app" {
 # ===========================================================================
 # VPC Interface Endpoints para SSM — vpc-db y vpc-c
 # ===========================================================================
-# El peering no permite reenviar trafico a Internet. Las instancias usan
-# una AMI con SSM Agent preinstalado (AL2023 estandar), pero el agente
+# El peering no permite reenviar tráfico a Internet. Las instancias usan
+# una AMI con SSM Agent preinstalado (AL2023 estándar), pero el agente
 # necesita conectarse a los endpoints de Systems Manager para registrarse.
 # Los VPC Interface Endpoints (PrivateLink) permiten esa conexion sin Internet.
 
@@ -434,7 +482,7 @@ resource "aws_iam_instance_profile" "ssm" {
 
 resource "aws_security_group" "app" {
   name        = "app-${var.project_name}"
-  description = "Permite ICMP desde db y vpc-c, trafico saliente"
+  description = "Permite ICMP desde db y vpc-c, tráfico saliente"
   vpc_id      = aws_vpc.app.id
 
   ingress {
@@ -450,7 +498,7 @@ resource "aws_security_group" "app" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el trafico saliente"
+    description = "Todo el tráfico saliente"
   }
 
   tags = merge(local.common_tags, {
@@ -484,7 +532,7 @@ resource "aws_security_group" "db" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el trafico saliente"
+    description = "Todo el tráfico saliente"
   }
 
   tags = merge(local.common_tags, {
@@ -494,7 +542,7 @@ resource "aws_security_group" "db" {
 
 resource "aws_security_group" "c" {
   name        = "c-${var.project_name}"
-  description = "Permite ICMP desde app, trafico saliente"
+  description = "Permite ICMP desde app, tráfico saliente"
   vpc_id      = aws_vpc.c.id
 
   ingress {
@@ -510,7 +558,7 @@ resource "aws_security_group" "c" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el trafico saliente"
+    description = "Todo el tráfico saliente"
   }
 
   tags = merge(local.common_tags, {
@@ -530,7 +578,7 @@ resource "aws_instance" "test_app" {
   iam_instance_profile   = aws_iam_instance_profile.ssm.name
   private_ip             = cidrhost(aws_subnet.app_private["private-1"].cidr_block, 10)
 
-  # Sin user_data: la AMI AL2023 estandar ya incluye SSM Agent.
+  # Sin user_data: la AMI AL2023 estándar ya incluye SSM Agent.
 
   tags = merge(local.common_tags, {
     Name = "test-app-${var.project_name}"
@@ -547,7 +595,7 @@ resource "aws_instance" "test_db" {
   iam_instance_profile   = aws_iam_instance_profile.ssm.name
   private_ip             = cidrhost(aws_subnet.db["private-1"].cidr_block, 10)
 
-  # Sin user_data: la AMI AL2023 estandar ya incluye SSM Agent.
+  # Sin user_data: la AMI AL2023 estándar ya incluye SSM Agent.
   # Los VPC Endpoints permiten que el agente se registre sin Internet.
 
   tags = merge(local.common_tags, {
@@ -565,7 +613,7 @@ resource "aws_instance" "test_c" {
   iam_instance_profile   = aws_iam_instance_profile.ssm.name
   private_ip             = cidrhost(aws_subnet.c["private-1"].cidr_block, 10)
 
-  # Sin user_data: la AMI AL2023 estandar ya incluye SSM Agent.
+  # Sin user_data: la AMI AL2023 estándar ya incluye SSM Agent.
   # Los VPC Endpoints permiten que el agente se registre sin Internet.
 
   tags = merge(local.common_tags, {
