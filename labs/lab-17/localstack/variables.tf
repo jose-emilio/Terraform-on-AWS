@@ -24,6 +24,6 @@ variable "environment" {
 
 variable "use_nat_instance" {
   type        = bool
-  description = "true = Instancia NAT EC2 (dev, ahorro ~75%); false = NAT Gateway (producción, alta disponibilidad)"
+  description = "true = Instancia NAT EC2 (dev, ahorro ~62%); false = NAT Gateway (producción, alta disponibilidad)"
   default     = false
 }

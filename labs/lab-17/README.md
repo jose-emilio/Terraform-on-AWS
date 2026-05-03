@@ -34,10 +34,9 @@ Configurar la conectividad de salida a Internet priorizando la **alta disponibil
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado
-- lab07/aws desplegado (bucket S3 con versionado habilitado)
+- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
-- Terraform >= 1.5
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -48,14 +47,17 @@ echo "Bucket: $BUCKET"
 ## Estructura del proyecto
 
 ```
-lab17/
+lab-17/
 ├── README.md                    ← Esta guía
 ├── aws/
 │   ├── providers.tf             ← Backend S3 parcial
 │   ├── variables.tf             ← Variables: región, CIDR, proyecto, use_nat_instance
 │   ├── main.tf                  ← VPC + subredes + IGW + NAT GW/Instance + VPC Endpoint S3
 │   ├── outputs.tf               ← IDs, IPs, modo NAT activo
-│   └── aws.s3.tfbackend         ← Parámetros del backend (sin bucket)
+│   ├── aws.s3.tfbackend         ← Parámetros del backend (sin bucket)
+│   └── scripts/
+│       ├── nat_init.sh          ← user_data de la NAT Instance (iptables + SSM)
+│       └── test_init.sh         ← user_data de la instancia de test (SSM)
 └── localstack/
     ├── README.md                ← Guía específica para LocalStack
     ├── providers.tf
@@ -237,7 +239,7 @@ Solo uno de los dos conjuntos existe en cada despliegue. En ambos casos se crean
 ## 2. Despliegue — Modo producción (NAT Gateway)
 
 ```bash
-cd labs/lab17/aws
+cd labs/lab-17/aws
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
@@ -246,7 +248,7 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará ~25 recursos: VPC, 6 subredes, IGW, 3 EIPs, 3 NAT Gateways, 1 tabla de rutas pública + 3 privadas (una por AZ), rutas, asociaciones, VPC Endpoint, IAM role SSM.
+Terraform creará ~35 recursos: VPC, 6 subredes, IGW, 3 EIPs, 3 NAT Gateways, 1 tabla de rutas pública + 3 privadas (una por AZ), rutas y asociaciones, VPC Endpoint S3, IAM role + policy attachments + instance profile (SSM), security group e instancia de test.
 
 ```bash
 terraform output
@@ -257,7 +259,7 @@ terraform output
 
 ---
 
-## Verificación final
+## 3. Verificación final
 
 ### 3.1 Tabla de rutas pública
 
@@ -316,11 +318,9 @@ Estos son los rangos IP de S3 que el Gateway Endpoint intercepta antes de que ll
 
 ## 4. Despliegue — Modo desarrollo (Instancia NAT)
 
-Destruye el despliegue anterior y redespliega con la instancia NAT:
+Se modifica el despliegue anterior y redespliega con la instancia NAT:
 
 ```bash
-terraform destroy -var="region=us-east-1"
-
 terraform apply -var="use_nat_instance=true"
 ```
 
@@ -356,7 +356,7 @@ Ahora cada ruta `0.0.0.0/0` apunta a `eni-xxx` (la interfaz de red de la instanc
 
 ---
 
-## 5. Verificacion end-to-end con instancia de test
+## 5. Verificación end-to-end con instancia de test
 
 La instancia de test se despliega automáticamente en la subred `private-1` con cada `terraform apply`. Es una `t4g.micro` con SSM Agent, que permite verificar la conectividad NAT sin SSH.
 
@@ -384,7 +384,7 @@ curl -s --max-time 5 https://checkip.amazonaws.com
 
 # Test 2: Verificar acceso a S3 (a través del VPC Endpoint, sin pasar por NAT)
 aws s3 ls --region us-east-1 2>&1 | head -5
-# Debe listar buckets (si el role tiene permisos) o dar error de permisos (NO timeout)
+# Debe listar buckets (si el role tiene permisos) o dar error de permisos (NO timeout). Ojo, sólo mostrará los buckets de S3 de la región donde está desplegada la instancia de prueba
 
 # Test 3: Verificar que la IP de salida coincide con el NAT
 echo "IP de salida: $(curl -s https://checkip.amazonaws.com)"
@@ -419,8 +419,7 @@ aws ssm describe-instance-information \
 ## 6. Limpieza
 
 ```bash
-terraform destroy \
-  -var="region=us-east-1"
+terraform destroy
 ```
 
 Si desplegaste con `-var="use_nat_instance=true"`, incluye la misma variable:
@@ -431,7 +430,7 @@ terraform destroy \
   -var="use_nat_instance=true"
 ```
 
-> **Nota:** No destruyas el bucket S3, ya que es un recurso compartido entre laboratorios (lab02).
+> **Nota:** El laboratorio no crea ningún bucket S3 propio. No destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -446,11 +445,12 @@ La Instancia NAT no está disponible en LocalStack (requiere AMIs reales de EC2)
 ## Buenas prácticas aplicadas
 
 - **NAT Gateway por AZ en producción**: desplegar un NAT Gateway por AZ elimina la dependencia de una única zona para la conectividad de salida. Si una AZ cae, las instancias de las otras AZs mantienen salida a Internet.
-- **Instancia NAT solo en desarrollo**: la Instancia NAT es mucho más barata que el NAT Gateway (~$5/mes vs ~$32/mes) pero tiene menor throughput, sin alta disponibilidad y requiere gestión del SO. Usarla solo en entornos no críticos.
+- **Instancia NAT solo en desarrollo**: la Instancia NAT es más barata que el NAT Gateway (~$12.26/mes en `t4g.small` vs ~$32/mes por NAT Gateway, ahorro ~62%) pero tiene menor throughput, sin alta disponibilidad gestionada y requiere mantenimiento del SO (parches, iptables, monitoreo). Usarla solo en entornos no críticos.
 - **VPC Gateway Endpoint para S3 y DynamoDB**: el Gateway Endpoint no tiene costo y evita que el tráfico hacia S3 o DynamoDB salga por el NAT Gateway (ahorrando costes de procesamiento). Siempre debe activarse en VPCs con subnets privadas.
 - **`count` para despliegue condicional**: usar `count = var.use_nat_gateway ? 1 : 0` permite elegir entre NAT Gateway e Instancia NAT en tiempo de despliegue con una sola variable, sin duplicar código de infraestructura.
 - **IP Elástica para el NAT Gateway**: la IP fija del NAT Gateway permite configurar reglas de firewall en los destinos que solo permiten IPs conocidas, sin depender de IPs efímeras.
 - **Disable source/dest check en la Instancia NAT**: las instancias EC2 normales descartan paquetes que no van dirigidos a su IP. La Instancia NAT necesita este check deshabilitado para poder reenviar paquetes de otras instancias.
+- **`ingress = []` explícito en Security Groups sin entrada**: aunque un SG sin reglas de ingreso ya bloquea por defecto todo el tráfico entrante, declarar `ingress = []` de forma explícita (como en `aws_security_group.test`) deja documentada la intención de "deny all inbound" y evita findings falsos de linters de seguridad (tfsec, Checkov, etc.) que marcan los SGs sin bloque `ingress` declarado. La administración de la instancia se realiza por SSM Session Manager, que sólo requiere tráfico saliente.
 
 ---
 

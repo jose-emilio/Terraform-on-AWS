@@ -348,6 +348,14 @@ resource "aws_security_group" "test" {
   description = "Instancia de test: solo trafico saliente"
   vpc_id      = aws_vpc.main.id
 
+  # Sin ingress: la instancia no acepta conexiones entrantes. La administración
+  # se hace por SSM Session Manager (saliente al endpoint de Systems Manager),
+  # nunca por SSH. Declaramos `ingress = []` de forma explícita para que sea
+  # evidente que la ausencia de reglas es intencional (linters/políticas tipo
+  # tfsec/Checkov suelen marcar como warning los SGs sin bloque ingress
+  # declarado, aunque el comportamiento por defecto ya sea "deny all").
+  ingress = []
+
   egress {
     from_port   = 0
     to_port     = 0

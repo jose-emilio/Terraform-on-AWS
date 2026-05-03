@@ -186,6 +186,12 @@ resource "aws_security_group" "test" {
   description = "Instancia de test: solo trafico saliente"
   vpc_id      = aws_vpc.main.id
 
+  # `ingress = []` explícito: la instancia no acepta conexiones entrantes.
+  # Aunque el comportamiento por defecto de un SG sin ingress ya es "deny all",
+  # declarar la lista vacía hace explícita la intención y evita findings
+  # falsos de linters como tfsec/Checkov.
+  ingress = []
+
   egress {
     from_port   = 0
     to_port     = 0
