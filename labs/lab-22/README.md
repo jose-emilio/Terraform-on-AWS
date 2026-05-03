@@ -35,9 +35,9 @@ Transformar un recurso S3 "hardcoded" en un componente flexible y profesional me
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado
+- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
-- Terraform >= 1.5
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -48,7 +48,7 @@ echo "Bucket: $BUCKET"
 ## Estructura del proyecto
 
 ```
-lab22/
+lab-22/
 ├── README.md                          <- Esta guía
 ├── aws/
 │   ├── providers.tf                   <- Backend S3 parcial
@@ -70,7 +70,7 @@ lab22/
     ├── localstack.s3.tfbackend        <- Backend completo para LocalStack
     └── modules/
         └── s3-bucket/
-            ├── main.tf               <- Módulo sin prevent_destroy (LocalStack)
+            ├── main.tf               <- Módulo sin prevent_destroy ni public_access_block
             ├── variables.tf
             └── outputs.tf
 ```
@@ -325,7 +325,7 @@ Ambos buckets comparten: bloqueo de acceso público, tags de proyecto, y protecc
 ## 2. Despliegue
 
 ```bash
-cd labs/lab22/aws
+cd labs/lab-22/aws
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
@@ -334,22 +334,26 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará 6 recursos:
+Terraform creará **6 recursos** en la versión `aws/`:
 - 2 × `aws_s3_bucket` (logs y data)
 - 2 × `aws_s3_bucket_versioning` (uno Enabled, otro Suspended)
 - 2 × `aws_s3_bucket_public_access_block`
 
+> **Nota — versión LocalStack:** el módulo de LocalStack omite `aws_s3_bucket_public_access_block` (LocalStack Community no emula esa API completamente), así que `terraform apply` en `localstack/` crea **4 recursos** (2 buckets + 2 versionings). El resto del comportamiento es idéntico.
+
 ```bash
 terraform output
-# logs_bucket_id  = "lab22-logs-123456789012"
-# logs_bucket_arn = "arn:aws:s3:::lab22-logs-123456789012"
-# data_bucket_id  = "lab22-data-123456789012"
-# data_bucket_arn = "arn:aws:s3:::lab22-data-123456789012"
+# logs_bucket_id           = "lab22-logs-123456789012"
+# logs_bucket_arn          = "arn:aws:s3:::lab22-logs-123456789012"
+# logs_bucket_domain_name  = "lab22-logs-123456789012.s3.amazonaws.com"
+# data_bucket_id           = "lab22-data-123456789012"
+# data_bucket_arn          = "arn:aws:s3:::lab22-data-123456789012"
+# data_bucket_domain_name  = "lab22-data-123456789012.s3.amazonaws.com"
 ```
 
 ---
 
-## Verificación final
+## 3. Verificación final
 
 ### 3.1 Verificar los buckets creados
 
@@ -358,7 +362,7 @@ LOGS_BUCKET=$(terraform output -raw logs_bucket_id)
 DATA_BUCKET=$(terraform output -raw data_bucket_id)
 
 # Listar ambos buckets
-aws s3 ls | grep lab18
+aws s3 ls | grep lab22
 # 2026-xx-xx lab22-logs-123456789012
 # 2026-xx-xx lab22-data-123456789012
 ```
@@ -506,19 +510,26 @@ terraform apply
 aws s3api get-bucket-lifecycle-configuration \
   --bucket $(terraform output -raw logs_bucket_id)
 # {
-#   "Rules": [{
-#     "ID": "auto-expire",
-#     "Status": "Enabled",
-#     "Expiration": { "Days": 90 },
-#     "Filter": {}
-#   }]
+#   "Rules": [
+#     {
+#       "Expiration": { "Days": 90 },
+#       "ID": "auto-expire",
+#       "Filter": { "Prefix": "" },   ← AWS normaliza filter {} a Prefix: ""
+#       "Status": "Enabled"
+#     }
+#   ]
 # }
+# Nota: aunque en HCL declaramos `filter {}` (sin atributos, "todos los
+# objetos"), AWS lo persiste como `Filter: { "Prefix": "" }` — un prefix
+# vacío que matchea cualquier key. Es semánticamente equivalente.
 
 # Bucket de datos: no debe tener regla
 aws s3api get-bucket-lifecycle-configuration \
   --bucket $(terraform output -raw data_bucket_id)
-# Error: The lifecycle configuration does not exist
-# (esto es correcto — no se creó ninguna regla)
+# An error occurred (NoSuchLifecycleConfiguration) when calling the
+# GetBucketLifecycleConfiguration operation: The lifecycle configuration
+# does not exist
+# (esto es correcto — count = 0 en el módulo, no se creó ninguna regla)
 ```
 
 ---
@@ -596,6 +607,11 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
 
 `bucket_key_enabled = true` reduce costes de KMS al cachear la clave de datos a nivel de bucket en vez de generar una por cada objeto. Solo tiene sentido con SSE-KMS.
 
+> **Nota — qué cambia para cada bucket tras este Reto:**
+>
+> - **logs_bucket** (`kms_key_arn = null`): el módulo aplica `sse_algorithm = "AES256"`, lo que es **funcionalmente equivalente** al cifrado SSE-S3 que AWS ya aplica por defecto en cualquier bucket nuevo desde 2023. Lo que cambia es que ahora el cifrado es **explícito en el state**: `terraform plan` lo enseña, los auditores lo ven, y queda blindado frente a un futuro cambio del comportamiento por defecto de AWS.
+> - **data_bucket** (`kms_key_arn = aws_kms_key.data.arn`): cambia el cifrado **real**, pasa de SSE-S3 (default implícito) a SSE-KMS con una CMK gestionada por el cliente. Esto **sí** modifica el comportamiento — cada `GET` y `PUT` requiere ahora permisos `kms:Decrypt` / `kms:GenerateDataKey` además de los permisos S3.
+
 ### Paso 4: Invocar desde el Root Module
 
 ```hcl
@@ -651,6 +667,18 @@ aws s3api get-bucket-encryption \
 
 En general: SSE-S3 es suficiente para la mayoría de casos. SSE-KMS es necesario cuando se requiere control granular sobre quién puede descifrar los datos o cuando hay requisitos de compliance que exigen claves gestionadas por el cliente.
 
+> **⚠️ Aviso al destruir — periodo de eliminación de claves KMS:** cuando ejecutas `terraform destroy` con un `aws_kms_key`, AWS **no la borra inmediatamente** sino que la pone en estado `PendingDeletion` durante un periodo configurable (default 30 días, mínimo 7). Durante ese tiempo la clave se sigue cobrando (~$1/mes). Si vas a crear y destruir el lab varias veces, acumularás claves "pending deletion" cada una con su factura. Dos formas de mitigarlo:
+>
+> ```hcl
+> resource "aws_kms_key" "data" {
+>   description             = "..."
+>   enable_key_rotation     = true
+>   deletion_window_in_days = 7    # mínimo permitido
+> }
+> ```
+>
+> O bien cancelar la eliminación pendiente desde la consola y reutilizar la clave (más complejo). Para entornos de laboratorio, `deletion_window_in_days = 7` es lo razonable.
+
 ---
 
 ## 8. Limpieza
@@ -667,18 +695,19 @@ lifecycle {
 }
 ```
 
+> **Nota:** `prevent_destroy` es un meta-argumento del bloque `lifecycle`, **no se guarda en el state** de Terraform. Por eso cambiarlo no requiere un `apply` previo — basta con guardar el cambio en el `.tf` y el siguiente `plan` / `destroy` ya lo respeta. (Si ejecutas `terraform plan` después del cambio, verás `No changes. Your infrastructure matches the configuration.`).
+
 ### Paso 2: Destruir
 
 ```bash
-terraform destroy \
-  -var="region=us-east-1"
+terraform destroy
 ```
 
 ### Paso 3: Restaurar la protección
 
 Si vas a seguir usando el módulo, revierte el cambio a `prevent_destroy = true`.
 
-> **Nota:** En producción, este paso manual es **intencional** — obliga a pensar dos veces antes de destruir datos críticos. No destruyas el bucket S3 del lab02.
+> **Nota:** En producción, este paso manual es **intencional** — obliga a pensar dos veces antes de destruir datos críticos. El laboratorio no crea ningún bucket S3 propio aparte de los dos del módulo: no destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -697,7 +726,7 @@ LocalStack emula S3 completamente en Community Edition. La versión localstack u
 - **`prevent_destroy = true` en buckets de datos**: proteger los buckets de borrado accidental durante un `terraform destroy` mal ejecutado evita pérdida de datos irreversible.
 - **Outputs con `value` y `description`**: documentar el propósito de cada output hace que el módulo sea autoexplicativo para los consumidores que solo leen la interfaz.
 - **Invocación múltiple del mismo módulo**: usar el mismo módulo para crear el bucket de aplicación y el de logs demuestra la reutilización real y garantiza que ambos tienen los mismos estándares de seguridad.
-- **Cifrado por defecto con SSE-KMS opcional**: proporcionar cifrado S3 SSE-S3 por defecto y permitir escalar a SSE-KMS para datos confidenciales hace que el módulo sea útil en todos los entornos sin complicar el caso de uso básico.
+- **Cifrado declarativo y opción de SSE-KMS para datos confidenciales** (Reto 2): el módulo base de este lab no declara explícitamente el cifrado — confía en el cifrado SSE-S3 que AWS aplica automáticamente desde 2023 a todo bucket nuevo. El Reto 2 añade `aws_s3_bucket_server_side_encryption_configuration` al módulo, lo que (a) hace el cifrado **explícito en el state** (visible en `plan` y auditable) y (b) permite **escalar a SSE-KMS** con una clave gestionada por el cliente cuando hace falta control granular o compliance. Como recomendación general: declarar el cifrado en Terraform (incluso si AWS lo aplicaría igual por defecto) hace el código autoexplicativo y resistente a cambios futuros de comportamiento por defecto del proveedor.
 
 ---
 

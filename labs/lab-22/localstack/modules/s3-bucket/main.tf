@@ -1,11 +1,11 @@
 # ===========================================================================
-# Modulo s3-bucket — Version LocalStack
+# Módulo s3-bucket — Versión LocalStack
 # ===========================================================================
 # Igual que la version AWS pero sin prevent_destroy para facilitar la
-# limpieza en entorno local. El bloqueo de acceso publico no se incluye
+# limpieza en entorno local. El bloqueo de acceso público no se incluye
 # porque LocalStack Community no lo emula completamente.
 
-# --- Locals: combinacion de etiquetas ---
+# --- Locals: combinación de etiquetas ---
 
 locals {
   default_tags = {
@@ -27,7 +27,7 @@ resource "aws_s3_bucket" "this" {
   })
 }
 
-# --- Versionado ---
+# --- Versiónado ---
 
 resource "aws_s3_bucket_versioning" "this" {
   bucket = aws_s3_bucket.this.id

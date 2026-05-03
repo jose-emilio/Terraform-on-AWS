@@ -1,13 +1,13 @@
 # ===========================================================================
-# Modulo s3-bucket — Bucket S3 con buenas practicas
+# Módulo s3-bucket — Bucket S3 con buenas prácticas
 # ===========================================================================
 # Crea un bucket S3 con:
 #   - Versionado configurable
-#   - Bloqueo total de acceso publico
-#   - Proteccion contra destruccion accidental (lifecycle)
-#   - Etiquetado combinado (merge de tags globales + especificas)
+#   - Bloqueo total de acceso público
+#   - Protección contra destrucción accidental (lifecycle)
+#   - Etiquetado combinado (merge de tags globales + específicas)
 
-# --- Locals: combinacion de etiquetas ---
+# --- Locals: combinación de etiquetas ---
 
 locals {
   default_tags = {
@@ -43,7 +43,7 @@ resource "aws_s3_bucket_versioning" "this" {
   }
 }
 
-# --- Bloqueo de acceso publico ---
+# --- Bloqueo de acceso público ---
 
 resource "aws_s3_bucket_public_access_block" "this" {
   bucket = aws_s3_bucket.this.id

@@ -1,6 +1,6 @@
 variable "bucket_name" {
   type        = string
-  description = "Nombre del bucket S3. Debe ser globalmente unico"
+  description = "Nombre del bucket S3. Debe ser globalmente único"
 }
 
 variable "enable_versioning" {
@@ -17,6 +17,6 @@ variable "force_destroy" {
 
 variable "tags" {
   type        = map(string)
-  description = "Etiquetas adicionales que se combinan con las etiquetas por defecto del modulo"
+  description = "Etiquetas adicionales que se combinan con las etiquetas por defecto del módulo"
   default     = {}
 }

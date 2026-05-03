@@ -1,4 +1,4 @@
-# Laboratorio 18 — LocalStack: Refactorizacion Avanzada de S3
+# Laboratorio 22 — LocalStack: Refactorización Avanzada de S3
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
@@ -8,7 +8,7 @@ Esta guia adapta el lab22 para ejecutarse integramente en LocalStack. S3 esta co
 ## Prerrequisitos
 
 - LocalStack corriendo: `localstack start -d`
-- lab07/localstack desplegado (crea bucket `terraform-state-labs`)
+- lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)
 - AWS CLI configurado para LocalStack:
 
 ```bash
@@ -21,7 +21,7 @@ alias awslocal='aws --endpoint-url=http://localhost.localstack.cloud:4566'
 ## 1. Despliegue
 
 ```bash
-cd labs/lab22/localstack
+cd labs/lab-22/localstack
 
 terraform init -backend-config=localstack.s3.tfbackend
 
@@ -41,7 +41,7 @@ terraform output
 ### 2.1 Listar buckets
 
 ```bash
-awslocal s3 ls | grep lab18
+awslocal s3 ls | grep lab22
 # lab22-logs-000000000000
 # lab22-data-000000000000
 ```

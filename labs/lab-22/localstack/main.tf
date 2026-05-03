@@ -1,5 +1,5 @@
 # ===========================================================================
-# Lab22 — Refactorizacion Avanzada de S3 (De Monolitico a Modular)
+# Lab22 — Refactorización Avanzada de S3 (De Monolítico a Modular)
 # ===========================================================================
 # Version LocalStack: usa account_id fijo ya que skip_requesting_account_id = true
 # ===========================================================================
@@ -17,7 +17,7 @@ locals {
 }
 
 # ===========================================================================
-# Modulo S3 — Bucket de Logs
+# Módulo S3 — Bucket de Logs
 # ===========================================================================
 
 module "logs_bucket" {
@@ -34,7 +34,7 @@ module "logs_bucket" {
 }
 
 # ===========================================================================
-# Modulo S3 — Bucket de Datos
+# Módulo S3 — Bucket de Datos
 # ===========================================================================
 
 module "data_bucket" {
@@ -42,7 +42,10 @@ module "data_bucket" {
 
   bucket_name       = "${var.project_name}-data-${local.account_id}"
   enable_versioning = true
-  force_destroy     = true
+  # En la version aws/, force_destroy = false para proteger datos criticos.
+  # En LocalStack lo dejamos en true para facilitar la limpieza local —
+  # no hay datos reales que proteger en esta emulacion.
+  force_destroy = true
 
   tags = merge(local.common_tags, {
     Purpose            = "data"

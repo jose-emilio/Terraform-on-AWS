@@ -1,11 +1,11 @@
 # ===========================================================================
-# Lab22 — Refactorizacion Avanzada de S3 (De Monolitico a Modular)
+# Lab22 — Refactorización Avanzada de S3 (De Monolítico a Modular)
 # ===========================================================================
-# Dos instancias del modulo s3-bucket:
-#   - logs: bucket para almacenar logs de la aplicacion
-#   - data: bucket para datos criticos del negocio
+# Dos instancias del módulo s3-bucket:
+#   - logs: bucket para almacenar logs de la aplicación
+#   - data: bucket para datos críticos del negocio
 # Cada instancia recibe etiquetas globales del proyecto combinadas con
-# etiquetas especificas de su proposito mediante merge().
+# etiquetas específicas de su propósito mediante merge().
 # ===========================================================================
 
 # --- Data Sources ---
@@ -25,7 +25,7 @@ locals {
 }
 
 # ===========================================================================
-# Modulo S3 — Bucket de Logs
+# Módulo S3 — Bucket de Logs
 # ===========================================================================
 
 module "logs_bucket" {
@@ -42,7 +42,7 @@ module "logs_bucket" {
 }
 
 # ===========================================================================
-# Modulo S3 — Bucket de Datos
+# Módulo S3 — Bucket de Datos
 # ===========================================================================
 
 module "data_bucket" {
