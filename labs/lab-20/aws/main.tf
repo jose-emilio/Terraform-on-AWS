@@ -1,18 +1,18 @@
 # ===========================================================================
 # Lab20 — Hub-and-Spoke con Transit Gateway y RAM
 # ===========================================================================
-# Topologia con inspeccion centralizada:
+# Topología con inspección centralizada:
 #
 #   client-a (10.16.0.0/16) ──┐
 #                              ├── TGW ── inspection (10.17.0.0/16) ── TGW ── egress (10.18.0.0/16) ── Internet
 #   client-b (10.19.0.0/16) ──┘            (Appliance Mode)                   (IGW + NAT GW)
 #
 # Tablas de rutas del TGW:
-#   - client-rt:      0.0.0.0/0 → inspection (todo pasa por inspeccion)
+#   - client-rt:      0.0.0.0/0 → inspection (todo pasa por inspección)
 #   - inspection-rt:  0.0.0.0/0 → egress + rutas propagadas de clients
 #   - egress-rt:      rutas propagadas de clients + inspection
 #
-# RAM comparte el TGW con una cuenta de aplicacion simulada.
+# RAM comparte el TGW con una cuenta de aplicación simulada.
 
 # --- Data Sources ---
 
@@ -54,6 +54,15 @@ locals {
     Environment = var.environment
     ManagedBy   = "terraform"
     Project     = var.project_name
+  }
+
+  # Mapeo explícito subred privada → subred pública (con su NAT GW) por AZ.
+  # Cada subred privada de egress sale por el NAT GW de la subred pública
+  # de la misma AZ (índice idéntico). Hacerlo explícito evita el split() de
+  # cadenas y previene errores silenciosos si alguien renombra las claves.
+  egress_az_pairs = {
+    for idx, az in local.azs :
+    "private-${idx + 1}" => "public-${idx + 1}"
   }
 }
 
@@ -142,7 +151,7 @@ resource "aws_route_table_association" "client_b" {
 }
 
 # ===========================================================================
-# VPC inspection — Todo el trafico inter-VPC y a Internet pasa por aqui
+# VPC inspection — Todo el tráfico inter-VPC y a Internet pasa por aqui
 # ===========================================================================
 
 resource "aws_vpc" "inspection" {
@@ -197,7 +206,7 @@ resource "aws_vpc" "egress" {
   })
 }
 
-# --- Subredes publicas (IGW) ---
+# --- Subredes públicas (IGW) ---
 
 resource "aws_subnet" "egress_public" {
   for_each = { for idx, az in local.azs : "public-${idx + 1}" => { az = az, index = idx } }
@@ -238,7 +247,7 @@ resource "aws_internet_gateway" "egress" {
   })
 }
 
-# --- Tabla de rutas publica ---
+# --- Tabla de rutas pública ---
 
 resource "aws_route_table" "egress_public" {
   vpc_id = aws_vpc.egress.id
@@ -261,8 +270,8 @@ resource "aws_route_table_association" "egress_public" {
   route_table_id = aws_route_table.egress_public.id
 }
 
-# Rutas de retorno en la tabla publica: el NAT GW necesita saber como
-# devolver trafico a las otras VPCs via TGW.
+# Rutas de retorno en la tabla pública: el NAT GW necesita saber como
+# devolver tráfico a las otras VPCs via TGW.
 resource "aws_route" "egress_public_to_clients" {
   for_each = tomap({
     client_a   = var.client_a_cidr
@@ -319,18 +328,19 @@ resource "aws_route" "egress_private_nat" {
 
   route_table_id         = aws_route_table.egress_private[each.key].id
   destination_cidr_block = "0.0.0.0/0"
-  # Cada subred privada sale por el NAT Gateway de su misma AZ
-  nat_gateway_id         = aws_nat_gateway.egress["public-${split("-", each.key)[1]}"].id
+  # Cada subred privada sale por el NAT Gateway de su misma AZ.
+  # Mapeo explicito en local.egress_az_pairs (sin manipular cadenas).
+  nat_gateway_id = aws_nat_gateway.egress[local.egress_az_pairs[each.key]].id
 }
 
-# Rutas de retorno en cada tabla privada: trafico hacia las otras VPCs via TGW
+# Rutas de retorno en cada tabla privada: tráfico hacia las otras VPCs via TGW
 resource "aws_route" "egress_private_to_clients" {
   for_each = {
     for pair in setproduct(keys(aws_subnet.egress_private), keys(tomap({
       client_a   = var.client_a_cidr
       client_b   = var.client_b_cidr
       inspection = var.inspection_cidr
-    }))) : "${pair[0]}-${pair[1]}" => {
+      }))) : "${pair[0]}-${pair[1]}" => {
       subnet_key = pair[0]
       cidr = tomap({
         client_a   = var.client_a_cidr
@@ -398,7 +408,7 @@ resource "aws_ec2_transit_gateway_vpc_attachment" "inspection" {
   vpc_id             = aws_vpc.inspection.id
   subnet_ids         = [for k, s in aws_subnet.inspection : s.id]
 
-  # Appliance Mode: garantiza simetria de trafico (ida y vuelta por la misma AZ).
+  # Appliance Mode: garantiza simetría de tráfico (ida y vuelta por la misma AZ).
   # Esencial para firewalls stateful de terceros (Palo Alto, Fortinet, etc.).
   appliance_mode_support = var.enable_appliance_mode ? "enable" : "disable"
 
@@ -418,9 +428,9 @@ resource "aws_ec2_transit_gateway_vpc_attachment" "egress" {
 }
 
 # ===========================================================================
-# TGW Route Tables — Segmentacion de trafico por inspeccion
+# TGW Route Tables — Segmentación de tráfico por inspección
 # ===========================================================================
-# client-rt:      todo el trafico (0.0.0.0/0) va a inspection
+# client-rt:      todo el tráfico (0.0.0.0/0) va a inspection
 # inspection-rt:  Internet (0.0.0.0/0) va a egress + rutas de vuelta a clients
 # egress-rt:      rutas de vuelta a clients e inspection
 
@@ -444,14 +454,14 @@ resource "aws_ec2_transit_gateway_route_table_association" "client_b" {
   transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.client.id
 }
 
-# Todo el trafico de los clients pasa por inspection
+# Todo el tráfico de los clients pasa por inspection
 resource "aws_ec2_transit_gateway_route" "client_default" {
   destination_cidr_block         = "0.0.0.0/0"
   transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.inspection.id
   transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.client.id
 }
 
-# --- Tabla de inspeccion ---
+# --- Tabla de inspección ---
 
 resource "aws_ec2_transit_gateway_route_table" "inspection" {
   transit_gateway_id = aws_ec2_transit_gateway.main.id
@@ -516,7 +526,7 @@ resource "aws_ec2_transit_gateway_route_table_propagation" "inspection_to_egress
 }
 
 # ===========================================================================
-# Rutas en las VPCs — Todo el trafico no local va al TGW
+# Rutas en las VPCs — Todo el tráfico no local va al TGW
 # ===========================================================================
 
 # Clients: 0.0.0.0/0 → TGW (el TGW lo envia a inspection)
@@ -546,7 +556,7 @@ resource "aws_route" "inspection_default" {
 }
 
 # ===========================================================================
-# AWS RAM — Compartir el TGW con una cuenta de aplicacion
+# AWS RAM — Compartir el TGW con una cuenta de aplicación
 # ===========================================================================
 
 resource "aws_ram_resource_share" "tgw" {
@@ -602,15 +612,16 @@ resource "aws_iam_instance_profile" "ssm" {
 }
 
 # ===========================================================================
-# VPC Flow Logs — Verificar que el trafico pasa por inspection
+# TGW Flow Logs — Verificar todo el tráfico que atraviesa el hub
 # ===========================================================================
-# Se habilitan Flow Logs en la inspection-vpc para demostrar que todo el
-# trafico inter-VPC y a Internet atraviesa esta VPC. Si un paquete entre
-# client-a y client-b aparece en los flow logs de inspection, confirma
-# que la segmentacion del TGW funciona correctamente.
+# A diferencia de los VPC Flow Logs (que sólo capturan tráfico que atraviesa
+# las ENI de la propia VPC), los TGW Flow Logs registran todos los paquetes
+# que pasan por el Transit Gateway, incluidos los DESCARTADOS por rutas
+# blackhole. Esto los hace imprescindibles para auditar la segmentación
+# (sección 3.8) y, en particular, para verificar el aislamiento del Reto 2.
 
-resource "aws_cloudwatch_log_group" "inspection_flow_logs" {
-  name              = "/vpc/${var.project_name}/inspection-flow-logs"
+resource "aws_cloudwatch_log_group" "tgw_flow_logs" {
+  name              = "/tgw/${var.project_name}/flow-logs"
   retention_in_days = var.flow_log_retention_days
 
   tags = local.common_tags
@@ -619,6 +630,8 @@ resource "aws_cloudwatch_log_group" "inspection_flow_logs" {
 resource "aws_iam_role" "flow_logs" {
   name = "vpc-flow-logs-${var.project_name}"
 
+  # El service principal es el mismo (vpc-flow-logs.amazonaws.com) tanto para
+  # VPC Flow Logs como para TGW Flow Logs.
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -653,16 +666,16 @@ resource "aws_iam_role_policy" "flow_logs" {
   })
 }
 
-resource "aws_flow_log" "inspection" {
-  vpc_id               = aws_vpc.inspection.id
-  traffic_type         = "ALL"
+resource "aws_flow_log" "tgw" {
+  transit_gateway_id       = aws_ec2_transit_gateway.main.id
   max_aggregation_interval = 60
-  log_destination_type = "cloud-watch-logs"
-  log_destination      = aws_cloudwatch_log_group.inspection_flow_logs.arn
-  iam_role_arn         = aws_iam_role.flow_logs.arn
+  log_destination_type     = "cloud-watch-logs"
+  log_destination          = aws_cloudwatch_log_group.tgw_flow_logs.arn
+  iam_role_arn             = aws_iam_role.flow_logs.arn
+  # traffic_type no aplica a TGW Flow Logs (siempre captura todo el tráfico).
 
   tags = merge(local.common_tags, {
-    Name = "flow-log-inspection-${var.project_name}"
+    Name = "flow-log-tgw-${var.project_name}"
   })
 }
 

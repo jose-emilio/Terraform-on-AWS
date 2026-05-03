@@ -1,6 +1,6 @@
 variable "region" {
   type        = string
-  description = "Region de AWS donde se despliega la infraestructura"
+  description = "Región de AWS donde se despliega la infraestructura"
   default     = "us-east-1"
 }
 
@@ -18,7 +18,7 @@ variable "client_b_cidr" {
 
 variable "inspection_cidr" {
   type        = string
-  description = "CIDR block de la VPC de inspeccion"
+  description = "CIDR block de la VPC de inspección"
   default     = "10.17.0.0/16"
 }
 
@@ -42,18 +42,18 @@ variable "environment" {
 
 variable "enable_appliance_mode" {
   type        = bool
-  description = "Habilitar Appliance Mode en el attachment de la VPC de inspeccion (simetria de trafico para firewalls stateful)"
+  description = "Habilitar Appliance Mode en el attachment de la VPC de inspección (simetría de tráfico para firewalls stateful)"
   default     = true
 }
 
 variable "flow_log_retention_days" {
   type        = number
-  description = "Dias de retencion de los VPC Flow Logs en CloudWatch"
+  description = "Días de retención de los VPC Flow Logs en CloudWatch"
   default     = 7
 }
 
 variable "app_account_id" {
   type        = string
-  description = "ID de la cuenta de aplicacion para compartir el TGW via RAM (simulado)"
+  description = "ID de la cuenta de aplicación para compartir el TGW vía RAM (simulado)"
   default     = "123456789012"
 }

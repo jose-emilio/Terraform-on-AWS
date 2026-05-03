@@ -14,7 +14,7 @@ output "client_b_vpc_id" {
 }
 
 output "inspection_vpc_id" {
-  description = "ID de la VPC de inspeccion"
+  description = "ID de la VPC de inspección"
   value       = aws_vpc.inspection.id
 }
 
@@ -34,7 +34,7 @@ output "tgw_attachment_client_b" {
 }
 
 output "tgw_attachment_inspection" {
-  description = "ID del TGW attachment de inspeccion"
+  description = "ID del TGW attachment de inspección"
   value       = aws_ec2_transit_gateway_vpc_attachment.inspection.id
 }
 
@@ -44,13 +44,13 @@ output "tgw_attachment_egress" {
 }
 
 output "appliance_mode" {
-  description = "Estado del Appliance Mode en el attachment de inspeccion"
+  description = "Estado del Appliance Mode en el attachment de inspección"
   value       = aws_ec2_transit_gateway_vpc_attachment.inspection.appliance_mode_support
 }
 
-output "inspection_flow_log_group" {
-  description = "Nombre del CloudWatch Log Group de Flow Logs de inspection"
-  value       = aws_cloudwatch_log_group.inspection_flow_logs.name
+output "tgw_flow_log_group" {
+  description = "Nombre del CloudWatch Log Group de TGW Flow Logs"
+  value       = aws_cloudwatch_log_group.tgw_flow_logs.name
 }
 
 output "ram_resource_share" {
@@ -59,7 +59,7 @@ output "ram_resource_share" {
 }
 
 output "nat_public_ips" {
-  description = "IPs publicas de los NAT Gateways de egress (una por AZ)"
+  description = "IPs públicas de los NAT Gateways de egress (una por AZ)"
   value = {
     for key, eip in aws_eip.nat_egress : key => eip.public_ip
   }
