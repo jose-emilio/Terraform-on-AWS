@@ -186,6 +186,46 @@ locals {
 
 ---
 
+## 5.7.5 Funciones de Colección Menos Conocidas pero Útiles
+
+Más allá de `length`, `merge`, `flatten` y `concat`, hay un grupo de funciones de colección que aparece poco en tutoriales pero resuelve problemas frecuentes en módulos reales:
+
+```hcl
+locals {
+  # coalesce(): primer valor no-null/no-vacío. Útil para fallbacks en chain.
+  region_efectiva = coalesce(var.region_override, var.region_default, "eu-west-1")
+
+  # compact(): elimina strings vacíos de una lista (no toca null en mapas).
+  emails_validos = compact(["alice@a.com", "", "bob@b.com", ""])
+  # → ["alice@a.com", "bob@b.com"]
+
+  # distinct(): elimina duplicados manteniendo el orden de la primera aparición.
+  azs_unicas = distinct(["eu-west-1a", "eu-west-1b", "eu-west-1a"])
+  # → ["eu-west-1a", "eu-west-1b"]
+
+  # slice(): subconjunto por índices [start, end).
+  primeras_dos_azs = slice(data.aws_availability_zones.az.names, 0, 2)
+
+  # sort(): orden lexicográfico ascendente. Útil para outputs estables en diff.
+  subnets_ordenadas = sort([for s in aws_subnet.app : s.id])
+
+  # setunion / setintersection: operaciones de conjunto sobre toset()
+  permisos_combinados = setunion(
+    toset(var.permisos_base),
+    toset(var.permisos_extra),
+  )
+
+  # contains(): test de pertenencia. Ideal en validations y locals booleanos.
+  es_prod = contains(["prd", "production"], var.environment)
+}
+```
+
+> **Patrón frecuente:** `slice(data.aws_availability_zones.available.names, 0, 3)` para limitar despliegues multi-AZ a las **3 primeras** AZs sin importar si la región tiene 4 o 6 — evita explosiones de coste por NAT Gateways adicionales.
+
+> **Cuándo `coalesce` se queda corto:** si necesitas el primer valor que cumpla una condición arbitraria (no solo "no nulo"), usa una expresión `for` con `if` y toma `[0]`. `coalesce` solo distingue null/vacío.
+
+---
+
 ## 5.8 Mapeo Dinámico: `keys`, `values` y `zipmap`
 
 Para construir inventarios y trabajar con los metadatos de mapas:

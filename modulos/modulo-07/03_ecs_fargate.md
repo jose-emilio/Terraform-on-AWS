@@ -96,6 +96,87 @@ resource "aws_cloudwatch_log_group" "ecs" {
 
 Para la mayoría de los proyectos, **Fargate es la elección correcta**: no gestionas parches del SO, no necesitas configurar AMIs ECS optimizadas, no tienes que calcular el bin-packing de contenedores en instancias.
 
+### Cuándo usar ECS sobre EC2 — `aws_ecs_capacity_provider`
+
+A pesar de que Fargate cubre el 90% de los casos, **EC2 sigue siendo necesario** para: cargas con GPU, tipos de instancia exóticos (Graviton-bare-metal, instancias de red optimizadas), licencias por socket de CPU, o cuando tienes Reserved Instances/Savings Plans EC2 que aprovechar. El patrón canónico es `aws_ecs_capacity_provider` envolviendo un Auto Scaling Group:
+
+```hcl
+# 1. Launch Template para los nodos del cluster ECS (con AMI ECS-optimizada)
+data "aws_ssm_parameter" "ecs_ami" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"
+}
+
+resource "aws_launch_template" "ecs_nodes" {
+  name_prefix   = "${var.project}-ecs-"
+  image_id      = jsondecode(data.aws_ssm_parameter.ecs_ami.value)["image_id"]
+  instance_type = "m6i.large"
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.ecs_node.arn
+  }
+
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    echo ECS_CLUSTER=${aws_ecs_cluster.main.name} >> /etc/ecs/ecs.config
+    echo ECS_ENABLE_CONTAINER_METADATA=true >> /etc/ecs/ecs.config
+  EOF
+  )
+}
+
+# 2. ASG que materializa los nodos
+resource "aws_autoscaling_group" "ecs" {
+  name                = "${var.project}-ecs-asg"
+  vpc_zone_identifier = var.private_subnet_ids
+  min_size            = 0    # Permite escalar a 0 cuando no hay tasks
+  max_size            = 10
+  desired_capacity    = 2
+
+  launch_template {
+    id      = aws_launch_template.ecs_nodes.id
+    version = "$Latest"
+  }
+
+  # IMPRESCINDIBLE: ECS gestiona el escalado, no las políticas del propio ASG
+  protect_from_scale_in = true
+
+  tag {
+    key                 = "AmazonECSManaged"
+    value               = "true"
+    propagate_at_launch = true
+  }
+}
+
+# 3. Capacity Provider: el "puente" entre ECS y el ASG
+resource "aws_ecs_capacity_provider" "ec2" {
+  name = "${var.project}-ec2-cp"
+
+  auto_scaling_group_provider {
+    auto_scaling_group_arn         = aws_autoscaling_group.ecs.arn
+    managed_termination_protection = "ENABLED"
+
+    managed_scaling {
+      maximum_scaling_step_size = 5
+      minimum_scaling_step_size = 1
+      status                    = "ENABLED"
+      target_capacity           = 80   # ECS escala el ASG buscando este % de uso
+    }
+  }
+}
+
+# 4. Asociar el capacity provider al cluster
+resource "aws_ecs_cluster_capacity_providers" "main" {
+  cluster_name       = aws_ecs_cluster.main.name
+  capacity_providers = [aws_ecs_capacity_provider.ec2.name, "FARGATE", "FARGATE_SPOT"]
+
+  default_capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.ec2.name
+    weight            = 1
+  }
+}
+```
+
+> **Por qué `protect_from_scale_in = true`:** sin esa protección, el ASG podría terminar nodos que aún tengan tasks corriendo. El capacity provider debe ser quien decida cuándo terminar — no el ASG por su cuenta. Este es uno de los foot-guns más comunes con ECS sobre EC2.
+
 ---
 
 ## 3.4 `aws_ecs_task_definition`: El Blueprint del Contenedor

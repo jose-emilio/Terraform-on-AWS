@@ -384,6 +384,64 @@ resource "aws_appautoscaling_policy" "redis_replicas"  { ... }
 
 ---
 
+## 10.5 ElastiCache Serverless: Sin Capacidad Provisionada
+
+Desde finales de 2023, ElastiCache ofrece un modelo Serverless (Redis, Memcached y Valkey) que elimina por completo la gestión de nodos: AWS escala automáticamente la capacidad, cobra por uso real (datos almacenados + ECPUs consumidos), y no requiere configurar `node_type`, `num_cache_clusters` ni replication group:
+
+```hcl
+resource "aws_elasticache_serverless_cache" "redis" {
+  engine = "redis"          # "redis" | "memcached" | "valkey"
+  name   = "${var.project}-serverless-redis"
+
+  # Límites opcionales: techo de coste y de rendimiento
+  cache_usage_limits {
+    data_storage {
+      maximum = 10   # GB máximos de datos almacenados
+      unit    = "GB"
+    }
+    ecpu_per_second {
+      maximum = 5000   # Operaciones/seg máximas (1 ECPU ≈ 1 GET/SET simple)
+    }
+  }
+
+  major_engine_version = "7"
+
+  # Subnets privadas para aislar la cache (el SG lo gestiona AWS internamente,
+  # pero puedes filtrar con security_group_ids)
+  subnet_ids         = var.private_subnet_ids
+  security_group_ids = [aws_security_group.cache_clients.id]
+
+  # Cifrado in-transit obligatorio (no se puede desactivar en serverless)
+  kms_key_id = aws_kms_key.redis.arn   # CMK propia para SSE
+
+  # Snapshots opcionales
+  daily_snapshot_time      = "03:00"
+  snapshot_retention_limit = 7
+
+  tags = local.common_tags
+}
+
+# Endpoint de conexión: <name>-<random>.serverless.<region>.cache.amazonaws.com:6379
+output "redis_endpoint" {
+  value = aws_elasticache_serverless_cache.redis.endpoint[0].address
+}
+```
+
+**Cuándo Serverless vs Replication Group:**
+
+| | Serverless | Replication Group (provisioned) |
+|--|-----------|--------------------------------|
+| Setup | 1 recurso, 1 minuto | Múltiples recursos: subnet group, parameter group, replication group |
+| Coste mínimo | Pago por uso real (~$70/mes baseline) | Coste del nodo más pequeño 24/7 (~$30/mes para `cache.t4g.micro`) |
+| Picos de tráfico | Auto-escala instantáneo | Manual o con appautoscaling |
+| Multi-AZ | Automático | `multi_az_enabled = true` |
+| Control fino | Limitado (sin parameter group) | Total (custom params, eviction policies) |
+| Ideal para | Tráfico irregular, prototipos, equipos pequeños | Producción con perfil de carga estable |
+
+> **Trade-off de coste:** Serverless tiene un **mínimo facturable mayor** que un nodo provisionado pequeño, pero **escala a cero esfuerzo operativo**. Para entornos de desarrollo con tráfico esporádico, salen las cuentas. Para producción con carga predecible 24/7, el provisioned con Reserved Nodes sigue siendo más barato.
+
+---
+
 ## 11. Best Practices: Rendimiento y Seguridad
 
 **Rendimiento:**

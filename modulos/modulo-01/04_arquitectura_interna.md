@@ -170,14 +170,44 @@ Este archivo **congela las versiones exactas** de los providers usadas. Es el eq
 
 ```hcl
 # .terraform.lock.hcl (generado automáticamente — sí debe commitearse a Git)
+# Ejemplo realista: tres providers, hashes h1 y zh, plataformas múltiples
+
 provider "registry.terraform.io/hashicorp/aws" {
   version     = "6.0.0"
   constraints = "~> 6.0"
   hashes = [
-    "h1:abc123...",   # Hash criptográfico para verificar integridad
+    "h1:RkxqSGX0HvxHo+wq3HVN1nXyNfIBJk0M8Jx5x6lU3pY=",   # h1: hash documentado del binario instalado
+    "zh:3a4b...c1f2",   # zh: hash del archivo zip descargado del Registry
+    "zh:6d8e...9a01",
+  ]
+}
+
+provider "registry.terraform.io/hashicorp/random" {
+  version     = "3.6.0"
+  constraints = "~> 3.6"
+  hashes = [
+    "h1:I8MBeauYA8J8yheLJ8oSMWqB0kovn16dF/wKZ1QTdkk=",
+  ]
+}
+
+provider "registry.terraform.io/hashicorp/tls" {
+  version = "4.0.5"
+  hashes = [
+    "h1:zeG5RmggBZW/8JWIVrdaeSJa0OG62uFX5HY1eE8SjzY=",
   ]
 }
 ```
+
+**Pre-generar hashes para múltiples plataformas** (necesario si el equipo mezcla macOS Intel, macOS ARM y Linux en CI):
+
+```bash
+terraform providers lock \
+  -platform=linux_amd64 \
+  -platform=darwin_amd64 \
+  -platform=darwin_arm64
+```
+
+Esto añade los hashes `h1` de los tres binarios al lockfile, evitando errores `Failed to query available provider packages` cuando un miembro del equipo (o el runner de CI) usa una plataforma distinta a la del autor original.
 
 > **Regla:** `.terraform/` **nunca** se sube a Git (está en el `.gitignore`). `.terraform.lock.hcl` **siempre** se sube (fija versiones del equipo).
 

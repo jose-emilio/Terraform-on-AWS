@@ -104,6 +104,81 @@ resource "aws_cloudwatch_event_target" "pipeline" {
 }
 ```
 
+### Alternativa moderna: `trigger {}` nativo (Pipeline V2)
+
+Con `pipeline_type = "V2"` (provider AWS 5.50+) puedes declarar el filtrado de PRs y branches **dentro del propio `aws_codepipeline`**, sin EventBridge externo. Es la forma recomendada para pipelines V2 que consumen GitHub/Bitbucket/GitLab vía **CodeStar Connection**:
+
+```hcl
+resource "aws_codepipeline" "terraform_v2" {
+  name          = "${var.project}-iac-pipeline"
+  pipeline_type = "V2"
+  role_arn      = aws_iam_role.pipeline.arn
+
+  artifact_store { ... }
+
+  # Stage Source con CodeStarSourceConnection
+  stage {
+    name = "Source"
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["SourceOutput"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = "mi-org/mi-repo"
+        BranchName       = "main"
+      }
+    }
+  }
+
+  stage { name = "Build"   action { ... } }
+  stage { name = "Deploy"  action { ... } }
+
+  # ✨ Trigger nativo: filtra eventos del repositorio sin EventBridge
+  trigger {
+    provider_type = "CodeStarSourceConnection"
+
+    git_configuration {
+      source_action_name = "Source"
+
+      # Push events: solo dispara con cambios en infra/* y config/*
+      push {
+        branches {
+          includes = ["main", "release/*"]
+        }
+        file_paths {
+          includes = ["infra/**", "config/**"]
+          excludes = ["**/*.md"]
+        }
+      }
+
+      # Pull request events: validación pre-merge
+      pull_request {
+        events = ["OPEN", "UPDATED"]
+        branches {
+          includes = ["main"]
+        }
+      }
+    }
+  }
+}
+```
+
+**Ventajas del trigger nativo vs EventBridge:**
+
+| | EventBridge externo | `trigger {}` nativo (V2) |
+|--|---------------------|--------------------------|
+| Recursos Terraform | 3+ (rule, target, IAM role) | 1 (inline en pipeline) |
+| Filtrado por path/branch | Pattern JSON manual | Bloques `branches`/`file_paths` |
+| PR events | Configuración compleja con webhooks | `pull_request { events }` directo |
+| Multi-source | Una rule por source | Un `trigger` por source action |
+
+> **Cuándo usar EventBridge igual:** si la fuente es **CodeCommit** (no soportado por `trigger {}`), o si necesitas disparar el pipeline desde eventos no-Git (cambios en S3, CloudWatch alarms, EventBridge schedules). Para repos GitHub/Bitbucket/GitLab vía CodeStar Connection, el trigger nativo es siempre preferible.
+
 ---
 
 ## 4. Stage Build — Generando el Plan Inmutable

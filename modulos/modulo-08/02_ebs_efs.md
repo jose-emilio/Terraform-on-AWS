@@ -135,6 +135,52 @@ resource "aws_ebs_snapshot_copy" "cross_region" {
 
 **Fast Snapshot Restore (FSR)**: al restaurar un snapshot, los bloques se cargan a demanda, lo que causa degradación de IOPS durante la inicialización. FSR pre-carga todos los bloques anticipadamente, eliminando este problema. Tiene coste adicional por AZ habilitada.
 
+### Recycle Bin: red de seguridad contra borrado accidental
+
+`aws_rbin_rule` (Recycle Bin de AWS, GA en 2021) retiene snapshots y AMIs borradas durante un periodo configurable, permitiendo recuperarlas como si nunca se hubieran eliminado. Es la última línea de defensa contra `terraform destroy` o `aws ec2 delete-snapshot` ejecutados por error en producción:
+
+```hcl
+# Retención: 7 días para snapshots con tag Backup=critical
+resource "aws_rbin_rule" "snapshots_critical" {
+  description   = "Recycle bin para snapshots EBS críticos"
+  resource_type = "EBS_SNAPSHOT"   # o "EC2_IMAGE" para AMIs
+
+  retention_period {
+    retention_period_value = 7
+    retention_period_unit  = "DAYS"
+  }
+
+  # Filtro por tag: solo retiene los snapshots etiquetados como críticos.
+  # Sin este bloque, la regla aplicaría a TODOS los snapshots de la cuenta.
+  resource_tags {
+    resource_tag_key   = "Backup"
+    resource_tag_value = "critical"
+  }
+
+  tags = {
+    ManagedBy = "terraform"
+  }
+}
+
+# Regla equivalente para AMIs
+resource "aws_rbin_rule" "amis_prod" {
+  description   = "Recycle bin para AMIs de producción"
+  resource_type = "EC2_IMAGE"
+
+  retention_period {
+    retention_period_value = 30
+    retention_period_unit  = "DAYS"
+  }
+
+  resource_tags {
+    resource_tag_key   = "Environment"
+    resource_tag_value = "production"
+  }
+}
+```
+
+> **Cuándo importa:** un snapshot eliminado de una BD de producción es **irrecuperable** sin Recycle Bin. Con la regla activa, pasa al estado `recycle bin retained` y puedes restaurarlo con un clic en consola o `aws rbin restore-rule`. El coste de almacenamiento sigue corriendo durante la retención, así que ajusta `retention_period_value` al RTO real del negocio (no más).
+
 ---
 
 ## 2.6 Data Lifecycle Manager: Automatización de Snapshots

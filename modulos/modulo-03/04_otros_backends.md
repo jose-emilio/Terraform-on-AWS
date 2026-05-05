@@ -177,4 +177,89 @@ La elección del backend depende de tu infraestructura existente, requisitos de 
 
 ---
 
+## 4.7 Migración entre Backends: `terraform init -migrate-state`
+
+Una de las operaciones más temidas por los equipos: **cambiar el backend sin perder el state ni recrear la infraestructura**. Terraform tiene un mecanismo nativo seguro para esto.
+
+**Caso típico: migrar de S3 + DynamoDB a S3 Native Locking (TF 1.10+)**
+
+```hcl
+# ANTES (legacy con DynamoDB)
+terraform {
+  backend "s3" {
+    bucket         = "mi-empresa-tfstate"
+    key            = "prod/networking.tfstate"
+    region         = "eu-west-1"
+    encrypt        = true
+    dynamodb_table = "terraform-locks"   # ← Eliminar tras migrar
+  }
+}
+
+# DESPUÉS (Native S3 Locking)
+terraform {
+  backend "s3" {
+    bucket       = "mi-empresa-tfstate"
+    key          = "prod/networking.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true   # ← Reemplaza dynamodb_table
+  }
+}
+```
+
+```bash
+# 1. Hacer backup defensivo del state actual
+terraform state pull > backup-pre-migration.tfstate
+
+# 2. Cambiar el bloque backend en el código (ver arriba)
+
+# 3. Ejecutar migración interactiva
+$ terraform init -migrate-state
+
+#   Initializing the backend...
+#   Backend configuration changed!
+#
+#   Do you want to copy existing state to the new backend?
+#     Pre-existing state was found while migrating the previous "s3" backend
+#     to the newly configured "s3" backend. ...
+#
+#   Enter a value: yes
+
+# 4. Verificar que el state migró correctamente
+terraform plan
+#   No changes. Your infrastructure matches the configuration.
+
+# 5. (Opcional) Eliminar la tabla DynamoDB legacy del código
+#    Se puede hacer en un PR posterior una vez confirmada la migración
+```
+
+**Migración cross-backend (S3 → HCP Terraform):**
+
+```hcl
+# Reemplazar el bloque backend "s3" por el bloque cloud
+terraform {
+  cloud {
+    organization = "mi-empresa"
+    workspaces { name = "prod-networking" }
+  }
+}
+```
+
+```bash
+terraform login                  # Si no hay token aún
+terraform init -migrate-state    # Mismo comando, distinto destino
+```
+
+**Si algo sale mal (rollback de emergencia):**
+
+```bash
+# Restaurar el state original al backend antiguo
+terraform state push backup-pre-migration.tfstate
+# Solo si sabes exactamente lo que haces — destructivo
+```
+
+> **Regla de oro:** la migración solo cambia **dónde vive el JSON del state**, no el contenido. El primer `terraform plan` después debe mostrar `No changes`. Si muestra cambios, **no apliques** — el state se corrompió y hay que restaurar el backup.
+
+---
+
 > **Siguiente:** [Sección 5 — Comandos del State →](./05_comandos_state.md)

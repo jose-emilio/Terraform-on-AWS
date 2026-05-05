@@ -49,6 +49,65 @@ resource "aws_cloudwatch_log_group" "app_logs" {
 | CloudTrail | 365+ días | Requisito normativo |
 | Sin valor definido | Infinita — ⚠️ evitar | Coste creciente sin límite |
 
+### Resource Policy: cuando un servicio AWS necesita escribir en tu Log Group
+
+Algunos servicios AWS (Route 53 Query Logs, ACM Certificate Transparency, OpenSearch slow logs, Elasticsearch...) escriben directamente en CloudWatch Logs y **necesitan un resource policy** que les autorice. Sin esta policy, el servicio falla silenciosamente — los logs simplemente no aparecen, sin error visible:
+
+```hcl
+# Log Group para Route 53 Query Logs
+resource "aws_cloudwatch_log_group" "route53_queries" {
+  # ⚠️ Route 53 exige que el log group esté en us-east-1
+  provider          = aws.virginia
+  name              = "/aws/route53/${var.zone_name}"
+  retention_in_days = 30
+}
+
+# Resource Policy: permite a route53.amazonaws.com escribir en CW Logs
+resource "aws_cloudwatch_log_resource_policy" "route53" {
+  provider    = aws.virginia
+  policy_name = "route53-query-logs"
+
+  policy_document = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "route53.amazonaws.com" }
+      Action = [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+      ]
+      Resource = "${aws_cloudwatch_log_group.route53_queries.arn}:*"
+      Condition = {
+        ArnLike = {
+          "aws:SourceArn" = "arn:aws:route53:::hostedzone/*"
+        }
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+      }
+    }]
+  })
+}
+
+# Activar query logging en la zona
+resource "aws_route53_query_log" "main" {
+  provider                 = aws.virginia
+  zone_id                  = aws_route53_zone.public.zone_id
+  cloudwatch_log_group_arn = aws_cloudwatch_log_group.route53_queries.arn
+
+  depends_on = [aws_cloudwatch_log_resource_policy.route53]
+}
+```
+
+> **Diferencia con bucket policies de S3:** los `aws_cloudwatch_log_resource_policy` son **regionales y a nivel de cuenta** (no se aplican a un log group específico — el filtro va en el `Resource` del policy document). Por eso las condiciones `aws:SourceArn` y `aws:SourceAccount` son críticas: sin ellas, **cualquier zona Route 53 de cualquier cuenta** podría escribir en tu log group si conoce el ARN.
+
+| Servicio | Principal en la policy | Caso de uso |
+|----------|------------------------|-------------|
+| `route53.amazonaws.com` | Query Logs DNS | Auditoría de resoluciones internas/externas |
+| `delivery.logs.amazonaws.com` | VPC Flow Logs, ELB access logs | Telemetría de red |
+| `es.amazonaws.com` / `opensearchservice.amazonaws.com` | OpenSearch slow logs | Análisis de performance del cluster |
+| `acm.amazonaws.com` | ACM Certificate Transparency | Auditoría de emisión de certificados |
+
 ---
 
 ## 3. Metric Alarms: Detectando el Fallo

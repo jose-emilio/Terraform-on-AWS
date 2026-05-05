@@ -552,6 +552,51 @@ Cuatro recursos trabajan en cadena: `aws_apigatewayv2_api` → `aws_apigatewayv2
 
 ---
 
+## 4.14.5 Lambda Function URL: HTTPS sin API Gateway
+
+Para casos simples — un webhook, un endpoint interno, una API minimal — montar API Gateway delante de Lambda introduce coste y complejidad innecesarios. **Function URLs** (GA desde 2022) dan a la Lambda un endpoint HTTPS público nativo, sin recursos adicionales:
+
+```hcl
+resource "aws_lambda_function" "webhook" {
+  function_name = "${var.project}-webhook"
+  role          = aws_iam_role.lambda.arn
+  handler       = "index.handler"
+  runtime       = "nodejs20.x"
+  filename      = data.archive_file.webhook.output_path
+  source_code_hash = data.archive_file.webhook.output_base64sha256
+}
+
+# Endpoint HTTPS único: https://<id>.lambda-url.<region>.on.aws/
+resource "aws_lambda_function_url" "webhook" {
+  function_name      = aws_lambda_function.webhook.function_name
+  authorization_type = "NONE"   # NONE = público | AWS_IAM = SigV4 obligatorio
+
+  cors {
+    allow_origins = ["https://${var.domain}"]
+    allow_methods = ["POST"]
+    allow_headers = ["Content-Type", "X-Webhook-Signature"]
+    max_age       = 3600
+  }
+}
+
+# Output con la URL generada — perfecta para configurar el origen del webhook
+output "webhook_url" {
+  value = aws_lambda_function_url.webhook.function_url
+}
+```
+
+| | Function URL | API Gateway HTTP API |
+|--|-------------|---------------------|
+| Coste por invocación | Solo el de Lambda | $1.00/M requests + Lambda |
+| Custom domain | Solo vía CloudFront delante | Nativo |
+| Routing avanzado | Una URL = una función | Múltiples rutas |
+| Throttling, API keys, JWT | No | Sí |
+| Tiempo de setup | 1 recurso | 4 recursos en cadena |
+
+> **Regla:** Function URLs para 1 endpoint = 1 lambda (webhooks, jobs disparados por HTTP, microservicios atómicos). API Gateway cuando necesites routing, autorización compleja o múltiples endpoints en el mismo dominio. Para públicos masivos, Function URL **detrás de CloudFront** combina lo mejor de ambos.
+
+---
+
 ## 4.15 Lambda@Edge y CloudFront Functions
 
 Para ejecutar código en los edge locations de CloudFront — cerca del usuario final — hay dos opciones:

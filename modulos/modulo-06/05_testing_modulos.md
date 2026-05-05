@@ -196,6 +196,57 @@ run "validate_naming_convention" {
 
 Los Mock Providers son perfectos para validar la lógica de naming, los tags, las condiciones y las expresiones del módulo sin necesitar credenciales. El equipo de CI puede ejecutar estos tests en cada commit sin configuración de AWS.
 
+### `override_resource` y `override_module` (Terraform 1.7+)
+
+Cuando un módulo depende de otros recursos o módulos cuyo apply real es caro o no deseado en CI, los bloques `override_resource`, `override_data` y `override_module` interceptan la llamada al provider y devuelven valores prefabricados — sin tocar la nube:
+
+```hcl
+# tests/unit_with_overrides.tftest.hcl
+
+mock_provider "aws" {}
+
+# Override de un data source: devolver un objeto fingido
+override_data {
+  target = data.aws_caller_identity.current
+  values = {
+    account_id = "123456789012"
+    arn        = "arn:aws:iam::123456789012:user/test-runner"
+  }
+}
+
+# Override de un recurso concreto: el módulo usará estos atributos
+# como si AWS hubiera devuelto este recurso tras un create
+override_resource {
+  target = aws_kms_key.app
+  values = {
+    arn    = "arn:aws:kms:eu-west-1:123456789012:key/abcd-1234"
+    key_id = "abcd-1234-ef56-7890"
+  }
+}
+
+# Override de un módulo entero: solo necesitas declarar sus outputs
+override_module {
+  target = module.networking
+  outputs = {
+    vpc_id             = "vpc-0123456789abcdef0"
+    private_subnet_ids = ["subnet-aaa", "subnet-bbb"]
+  }
+}
+
+run "valida_logica_dependiente" {
+  command = plan
+
+  assert {
+    condition     = startswith(output.bucket_arn, "arn:aws:s3:::")
+    error_message = "El bucket ARN debería tener formato S3 estándar"
+  }
+}
+```
+
+> **Cuándo usar override:** cuando tu módulo recibe outputs de otros módulos (`module.networking.vpc_id`) o consulta data sources (`data.aws_caller_identity.current`) y quieres aislar la lógica que **realmente** estás testeando. Sin overrides, el test fallaría intentando contactar AWS para resolver esas dependencias.
+
+> **Argumento opcional `override_during`:** acepta `plan` o `apply`. Por defecto el override aplica a ambas fases, pero puedes restringirlo (ej. solo overridear durante `apply` para validar que el `plan` consulta correctamente la API real).
+
 ---
 
 ## 5.8 Idempotencia: El Test del Segundo Plan
