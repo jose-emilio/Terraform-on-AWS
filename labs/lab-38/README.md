@@ -798,7 +798,9 @@ locals {
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Añadir una nueva VPC con subredes</summary>
+<summary><strong>Solución al Reto 1 — Añadir una nueva VPC con subredes</strong></summary>
+
+### Solución al Reto 1 — Añadir una nueva VPC con subredes
 
 Añade en `variables.tf` dentro del `default` de `vpc_config`:
 
@@ -854,7 +856,9 @@ solo en la variable de entrada.
 </details>
 
 <details>
-<summary>Reto 2 — Precondition de solapamiento de CIDR</summary>
+<summary><strong>Solución al Reto 2 — Precondition de solapamiento de CIDR</strong></summary>
+
+### Solución al Reto 2 — Precondition de solapamiento de CIDR
 
 #### Donde añadir la precondition
 
@@ -1001,7 +1005,9 @@ terraform plan
 </details>
 
 <details>
-<summary>Reto 3 — Configuración de monitoreo por entorno</summary>
+<summary><strong>Solución al Reto 3 — Configuración de monitoreo por entorno</strong></summary>
+
+### Solución al Reto 3 — Configuración de monitoreo por entorno
 
 Añade en `variables.tf`:
 

@@ -803,7 +803,9 @@ dentro de la VPC corporativa a través de VPC endpoints de tipo Interface.
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Versión 1.1.0 con NAT Gateway por AZ</summary>
+<summary><strong>Solución al Reto 1 — Versión 1.1.0 con NAT Gateway por AZ</strong></summary>
+
+### Solución al Reto 1 — Versión 1.1.0 con NAT Gateway por AZ
 
 **`module/vpc/variables.tf`** — añadir:
 
@@ -936,7 +938,9 @@ terraform apply
 </details>
 
 <details>
-<summary>Reto 2 — Repositorio upstream npm</summary>
+<summary><strong>Solución al Reto 2 — Repositorio upstream npm</strong></summary>
+
+### Solución al Reto 2 — Repositorio upstream npm
 
 **Añadir a `aws/main.tf`**:
 
@@ -1073,7 +1077,9 @@ terraform destroy -target=aws_codeartifact_repository.npm_internal \
 </details>
 
 <details>
-<summary>Reto 3 — Política de dominio con restricción por VPC endpoint</summary>
+<summary><strong>Solución al Reto 3 — Política de dominio con restricción por VPC endpoint</strong></summary>
+
+### Solución al Reto 3 — Política de dominio con restricción por VPC endpoint
 
 **Añadir variables en `aws/variables.tf`**:
 

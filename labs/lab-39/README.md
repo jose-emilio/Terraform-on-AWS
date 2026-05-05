@@ -919,7 +919,9 @@ documentacion del recurso en el Terraform Registry.
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Revertir drift en la región secundaria</summary>
+<summary><strong>Solución al Reto 1 — Revertir drift en la región secundaria</strong></summary>
+
+### Solución al Reto 1 — Revertir drift en la región secundaria
 
 **Simular drift en eu-west-3 con CLI**:
 
@@ -988,9 +990,11 @@ aws s3api get-bucket-tagging \
 </details>
 
 <details>
-<summary>Reto 2 — Adoptar un parametro SSM existente</summary>
+<summary><strong>Solución al Reto 2 — Adoptar un parámetro SSM existente</strong></summary>
 
-**1. Crear el parametro SSM con AWS CLI**:
+### Solución al Reto 2 — Adoptar un parámetro SSM existente
+
+**1. Crear el parámetro SSM con AWS CLI**:
 
 ```bash
 aws ssm put-parameter \

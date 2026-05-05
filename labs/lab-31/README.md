@@ -185,7 +185,7 @@ lab31/
 
 ---
 
-## 1. Despliegue en AWS Real
+## Despliegue en AWS Real
 
 ### 1.1 Arquitectura
 
@@ -469,11 +469,40 @@ terraform apply
 
 > **Antes de comenzar los retos**, asegúrate de que `terraform apply` ha completado sin errores y la API responde correctamente. Ejecuta `curl -s "$API/items"` para confirmarlo.
 
-## 2. Reto 1: CORS y Throttling
+## Verificación final
+
+```bash
+# Obtener la URL de la API
+API_URL=$(terraform output -raw api_url)
+
+# Probar el endpoint raiz
+curl -s "${API_URL}/"
+# Esperado: {"message": "Hello from Lambda Layer!", ...}
+
+# Probar el endpoint de health
+curl -s "${API_URL}/health"
+# Esperado: {"status": "ok"}
+
+# Verificar que la Layer esta asociada a la funcion
+aws lambda get-function-configuration \
+  --function-name $(terraform output -raw lambda_function_name) \
+  --query 'Layers[*].Arn' --output text
+
+# Comprobar que los logs se generan en CloudWatch
+aws logs describe-log-groups \
+  --query 'logGroups[?contains(logGroupName,`lab31`)].logGroupName' \
+  --output text
+```
+
+---
+
+## Retos
+
+### Reto 1 — CORS y Throttling
 
 La API actual no tiene cabeceras CORS, lo que impide llamarla desde aplicaciones web en el navegador (el navegador bloqueará las peticiones cross-origin). Tampoco tiene limitación de tasa, por lo que un cliente descontrolado podría generar invocaciones masivas de Lambda con coste ilimitado.
 
-### Requisitos
+**Requisitos**
 
 1. Añade un bloque `cors_configuration` en `aws_apigatewayv2_api` que permita:
    - Headers: `Content-Type`
@@ -484,17 +513,13 @@ La API actual no tiene cabeceras CORS, lo que impide llamarla desde aplicaciones
    - `throttling_burst_limit = 100` (peticiones simultáneas máximas)
    - `throttling_rate_limit  = 50`  (peticiones por segundo sostenidas)
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - Una petición `OPTIONS` a `/items` devuelve 200 con la cabecera `Access-Control-Allow-Origin: *`.
 - La configuración de throttling es visible en la consola de API Gateway o con `aws apigatewayv2 get-stage`.
 - Puedes explicar la diferencia entre `throttling_burst_limit` (capacidad de ráfaga) y `throttling_rate_limit` (tasa sostenida), y qué código HTTP devuelve API Gateway cuando se supera el límite.
 
-[Ver solución →](#4-solución-de-los-retos)
-
----
-
-## 3. Reto 2: Lambda Versioning y Alias
+### Reto 2 — Lambda Versioning y Alias
 
 En producción, la integración de API Gateway no debería apuntar a `$LATEST` (la versión mutable y siempre actualizable de Lambda) sino a un **alias** que apunte a una versión numerada e inmutable. Esto permite hacer rollback a una versión anterior cambiando solo a qué versión apunta el alias, sin modificar la integración de API Gateway.
 
@@ -506,7 +531,7 @@ En producción, la integración de API Gateway no debería apuntar a `$LATEST` (
 4. Actualiza `aws_lambda_permission` para usar `qualifier = aws_lambda_alias.live.name`, de modo que el permiso se aplique sobre el alias y no sobre `$LATEST`.
 5. Añade un output `function_version` con el número de versión publicada más reciente.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws lambda list-versions-by-function` muestra al menos la versión `1` publicada.
 - `aws lambda get-alias --name live` muestra que el alias apunta a esa versión.
@@ -514,15 +539,14 @@ En producción, la integración de API Gateway no debería apuntar a `$LATEST` (
 - Al modificar el código y hacer `terraform apply`, se publica una nueva versión y el alias avanza automáticamente.
 - Puedes explicar por qué el permiso debe usar `qualifier` y no solo `function_name`.
 
-[Ver solución →](#4-solución-de-los-retos)
-
 ---
 
-## 4. Solución de los Retos
+## Soluciones
 
-> Intenta resolver los retos antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — CORS y Throttling</strong></summary>
 
-### Solución Reto 1 — CORS y Throttling
+### Solución al Reto 1 — CORS y Throttling
 
 Modifica `aws_apigatewayv2_api` y `aws_apigatewayv2_stage` en `main.tf`:
 
@@ -581,7 +605,12 @@ aws apigatewayv2 get-stage \
 
 Cuando se supera `throttling_rate_limit`, API Gateway devuelve `429 Too Many Requests` sin invocar Lambda — lo que protege la función de picos de coste.
 
-### Solución Reto 2 — Lambda Versioning y Alias
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — Lambda Versioning y Alias</strong></summary>
+
+### Solución al Reto 2 — Lambda Versioning y Alias
 
 Añade `publish = true` a `aws_lambda_function` y los nuevos recursos en `main.tf`:
 
@@ -686,36 +715,11 @@ aws lambda get-alias --function-name "$FUNCTION" --name live --query FunctionVer
 
 El alias `live` avanza automáticamente porque `function_version = aws_lambda_function.api.version` es un atributo dinámico: cada vez que Terraform crea una nueva versión publicada (`publish = true`), `version` devuelve el nuevo número y el alias se actualiza en el mismo `apply`.
 
----
-
-## Verificación final
-
-```bash
-# Obtener la URL de la API
-API_URL=$(terraform output -raw api_url)
-
-# Probar el endpoint raiz
-curl -s "${API_URL}/"
-# Esperado: {"message": "Hello from Lambda Layer!", ...}
-
-# Probar el endpoint de health
-curl -s "${API_URL}/health"
-# Esperado: {"status": "ok"}
-
-# Verificar que la Layer esta asociada a la funcion
-aws lambda get-function-configuration \
-  --function-name $(terraform output -raw lambda_function_name) \
-  --query 'Layers[*].Arn' --output text
-
-# Comprobar que los logs se generan en CloudWatch
-aws logs describe-log-groups \
-  --query 'logGroups[?contains(logGroupName,`lab31`)].logGroupName' \
-  --output text
-```
+</details>
 
 ---
 
-## 5. Limpieza
+## Limpieza
 
 ```bash
 # Desde lab31/aws/
@@ -732,7 +736,7 @@ rm -f aws/layer.zip aws/function.zip
 
 ---
 
-## 6. LocalStack
+## LocalStack
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
@@ -740,7 +744,7 @@ LocalStack Community soporta Lambda, IAM y CloudWatch Logs. **API Gateway v2 no 
 
 ---
 
-## 7. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|

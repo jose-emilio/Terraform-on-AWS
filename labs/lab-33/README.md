@@ -169,7 +169,7 @@ lab33/
 
 ---
 
-## 1. Despliegue en AWS Real
+## Despliegue en AWS Real
 
 ### 1.1 Arquitectura
 
@@ -364,11 +364,41 @@ Confirma que el `Statement` tiene `Effect: Deny`, `aws:sourceVpce` con el ID del
 
 > **Antes de comenzar los retos**, verifica que `get-bucket-encryption` muestra `BucketKeyEnabled: true` y que `list-object-versions` devuelve dos versiones de `test.txt`.
 
-## 2. Reto 1: S3 Access Logging
+## Verificación final
+
+```bash
+# Confirmar que el acceso publico esta bloqueado
+aws s3api get-public-access-block \
+  --bucket $(terraform output -raw bucket_name) \
+  --query 'PublicAccessBlockConfiguration'
+
+# Verificar cifrado con CMK y Bucket Key
+aws s3api get-bucket-encryption \
+  --bucket $(terraform output -raw bucket_name) \
+  --query 'ServerSideEncryptionConfiguration.Rules[0]'
+
+# Comprobar que el versionado esta habilitado
+aws s3api get-bucket-versioning \
+  --bucket $(terraform output -raw bucket_name) \
+  --query 'Status'
+# Esperado: "Enabled"
+
+# Verificar el VPC Gateway Endpoint creado
+aws ec2 describe-vpc-endpoints \
+  --filters "Name=service-name,Values=com.amazonaws.us-east-1.s3" \
+  --query 'VpcEndpoints[*].{ID:VpcEndpointId,State:State}' \
+  --output table
+```
+
+---
+
+## Retos
+
+### Reto 1 — S3 Access Logging
 
 El bucket de datos no registra quién accede a sus objetos. Añadir **S3 Access Logging** crea un log por cada petición HTTP recibida — imprescindible en entornos regulados (PCI-DSS, HIPAA) para detectar accesos no autorizados.
 
-### Requisitos
+**Requisitos**
 
 1. Crea un segundo bucket (`${var.project}-logs-<ACCOUNT_ID>`) para almacenar los logs. Este bucket debe tener:
    - `aws_s3_bucket_public_access_block` con los cuatro controles activos.
@@ -376,17 +406,13 @@ El bucket de datos no registra quién accede a sus objetos. Añadir **S3 Access 
 2. Añade un `aws_s3_bucket_logging` al bucket principal que apunte al bucket de logs con `target_prefix = "access-logs/"`.
 3. Añade un output `log_bucket_name` con el nombre del bucket de logs.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws s3api get-bucket-logging --bucket "$BUCKET"` muestra el bucket de destino y el prefijo.
 - Tras subir un objeto al bucket principal, aparecen logs en `s3://LOGS_BUCKET/access-logs/` (puede tardar hasta 1 hora en AWS real).
 - Puedes explicar por qué el bucket de logs debe ser un bucket separado y no el mismo bucket principal.
 
-[Ver solución →](#4-solución-de-los-retos)
-
----
-
-## 3. Reto 2: S3 Object Lock en modo GOVERNANCE
+### Reto 2 — S3 Object Lock en modo GOVERNANCE
 
 El versionado protege contra borrados accidentales, pero un administrador con permisos suficientes puede borrar versiones individuales. **Object Lock** añade protección WORM (Write Once Read Many): una vez bloqueado, ningún usuario — ni siquiera el root de la cuenta — puede borrar el objeto antes de que expire el periodo de retención.
 
@@ -398,21 +424,20 @@ El versionado protege contra borrados accidentales, pero un administrador con pe
    - `rule.default_retention.days = 7` (7 días de retención por defecto).
 3. Añade un output `object_lock_bucket_name` con el nombre del nuevo bucket.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws s3api get-object-lock-configuration --bucket "$OBJECT_LOCK_BUCKET"` muestra `ObjectLockEnabled: Enabled` con `Mode: GOVERNANCE` y `Days: 7`.
 - Sube un objeto al bucket. Intenta borrarlo sin el permiso `BypassGovernanceRetention` — debe fallar con `AccessDenied`.
 - Puedes explicar la diferencia entre `GOVERNANCE` (bypasseable con permiso especial) y `COMPLIANCE` (nadie puede borrar, ni root).
 
-[Ver solución →](#4-solución-de-los-retos)
-
 ---
 
-## 4. Solución de los Retos
+## Soluciones
 
-> Intenta resolver los retos antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — S3 Access Logging</strong></summary>
 
-### Solución Reto 1 — S3 Access Logging
+### Solución al Reto 1 — S3 Access Logging
 
 El bucket de logs y el recurso `aws_s3_bucket_logging` se añaden en el **módulo raíz** (`aws/main.tf`), no dentro de `modules/secure-bucket`. El módulo `secure-bucket` encapsula los controles de un único bucket; el bucket de logs es un recurso independiente que coexiste con él. La referencia al bucket principal se obtiene a través del output `module.datalake.bucket_id`.
 
@@ -506,7 +531,12 @@ cat /tmp/access.log
 
 El bucket de logs debe ser **separado** del bucket principal porque si ambos fueran el mismo, cada log generaría a su vez un evento de escritura que generaría otro log — un bucle infinito que crearía millones de objetos y facturas elevadas.
 
-### Solución Reto 2 — S3 Object Lock en modo GOVERNANCE
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — S3 Object Lock en modo GOVERNANCE</strong></summary>
+
+### Solución al Reto 2 — S3 Object Lock en modo GOVERNANCE
 
 El bucket WORM y sus recursos asociados van en el **módulo raíz** (`aws/main.tf`), no dentro de `modules/secure-bucket`. Hay dos razones:
 
@@ -606,37 +636,11 @@ aws s3api list-object-versions \
 
 **GOVERNANCE vs COMPLIANCE**: en modo `GOVERNANCE`, un usuario con el permiso `s3:BypassGovernanceRetention` puede borrar el objeto enviando el header `x-amz-bypass-governance-retention: true`. En modo `COMPLIANCE`, nadie puede borrar el objeto antes de que expire la retención — ni el root de la cuenta. Para datos con requisitos regulatorios estrictos (registros financieros, historiales médicos) se usa `COMPLIANCE`.
 
----
-
-## Verificación final
-
-```bash
-# Confirmar que el acceso publico esta bloqueado
-aws s3api get-public-access-block \
-  --bucket $(terraform output -raw bucket_name) \
-  --query 'PublicAccessBlockConfiguration'
-
-# Verificar cifrado con CMK y Bucket Key
-aws s3api get-bucket-encryption \
-  --bucket $(terraform output -raw bucket_name) \
-  --query 'ServerSideEncryptionConfiguration.Rules[0]'
-
-# Comprobar que el versionado esta habilitado
-aws s3api get-bucket-versioning \
-  --bucket $(terraform output -raw bucket_name) \
-  --query 'Status'
-# Esperado: "Enabled"
-
-# Verificar el VPC Gateway Endpoint creado
-aws ec2 describe-vpc-endpoints \
-  --filters "Name=service-name,Values=com.amazonaws.us-east-1.s3" \
-  --query 'VpcEndpoints[*].{ID:VpcEndpointId,State:State}' \
-  --output table
-```
+</details>
 
 ---
 
-## 5. Limpieza
+## Limpieza
 
 ```bash
 # Vaciar el bucket antes de destruir (requiere borrar las versiones)
@@ -658,7 +662,7 @@ terraform destroy
 
 ---
 
-## 6. LocalStack
+## LocalStack
 
 Los recursos S3 (bucket, public access block, versionado, lifecycle) y KMS se crean correctamente en LocalStack Community. La condición `aws:sourceVpce` de la bucket policy no se evalúa realmente — el bucket es accesible sin restricción de endpoint.
 
@@ -666,7 +670,7 @@ Consulta [localstack/README.md](localstack/README.md) para instrucciones detalla
 
 ---
 
-## 7. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|

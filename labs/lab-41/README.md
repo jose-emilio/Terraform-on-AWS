@@ -1281,7 +1281,9 @@ aws codecommit evaluate-pull-request-approval-rules \
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Proteger ramas release/*</summary>
+<summary><strong>Solución al Reto 1 — Proteger ramas release/*</strong></summary>
+
+### Solución al Reto 1 — Proteger ramas release/*
 
 **Crear `terraform.tfvars`**:
 
@@ -1328,7 +1330,9 @@ git branch -D release/1.2.3
 </details>
 
 <details>
-<summary>Reto 2 — Añadir elena-lead sin recrear el template</summary>
+<summary><strong>Solución al Reto 2 — Añadir elena-lead sin recrear el template</strong></summary>
+
+### Solución al Reto 2 — Añadir elena-lead sin recrear el template
 
 **Actualizar `variables.tf` o `terraform.tfvars`**:
 
@@ -1416,7 +1420,9 @@ git clone "<CLONE_URL>" /tmp/platform-backend-elena
 </details>
 
 <details>
-<summary>Reto 3 — Four-eyes principle con 2 aprobaciones</summary>
+<summary><strong>Solución al Reto 3 — Four-eyes principle con 2 aprobaciones</strong></summary>
+
+### Solución al Reto 3 — Four-eyes principle con 2 aprobaciones
 
 **Actualizar la variable**:
 

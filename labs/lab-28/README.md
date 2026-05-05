@@ -133,7 +133,7 @@ lab28/
 
 ---
 
-## 1. Despliegue en AWS Real
+## Despliegue en AWS Real
 
 ### 1.1 Arquitectura
 
@@ -338,32 +338,57 @@ El ASG aumentará `DesiredCapacity` para mantener la CPU media en torno al 50%. 
 
 > **Antes de comenzar los retos**, asegúrate de que todos los cambios de `main.tf` están aplicados (`terraform apply`). Si hay modificaciones pendientes en el ASG, se aplicarán junto con el reto y el criterio *"sin cambios en recursos existentes"* no se cumplirá.
 
-## 2. Reto 1: Escalado Programado
+## Verificación final
+
+```bash
+# Obtener la URL del ALB
+ALB_URL=$(terraform output -raw alb_url)
+
+# Probar la aplicacion
+curl -s "http://${ALB_URL}" | head -5
+
+# Verificar que el ASG tiene instancias en servicio
+aws autoscaling describe-auto-scaling-groups \
+  --query 'AutoScalingGroups[?contains(AutoScalingGroupName,`lab28`)].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}' \
+  --output table
+
+# Ver el estado del target group
+TG_ARN=$(terraform output -raw target_group_arn 2>/dev/null || \
+  aws elbv2 describe-target-groups \
+    --query 'TargetGroups[?contains(TargetGroupName,`lab28`)].TargetGroupArn' \
+    --output text)
+aws elbv2 describe-target-health \
+  --target-group-arn "$TG_ARN" \
+  --query 'TargetHealthDescriptions[*].{ID:Target.Id,State:TargetHealth.State}' \
+  --output table
+```
+
+---
+
+## Retos
+
+### Reto 1 — Escalado Programado
 
 La política de Target Tracking reacciona a la carga en tiempo real, pero hay patrones de uso predecibles — por ejemplo, un pico de tráfico siempre entre las 08:00 y las 20:00 UTC de lunes a viernes. El escalado programado (`aws_autoscaling_schedule`) ajusta la capacidad del ASG en horarios fijos, complementando al Target Tracking.
 
-### Requisitos
+**Requisitos**
 
 1. Crea un archivo `schedules.tf` en `aws/` con dos recursos `aws_autoscaling_schedule`.
 2. El primero, `scale_up`, debe ejecutarse de lunes a viernes a las **08:00 UTC** y escalar el ASG a `min_size = 4`, `desired_capacity = 4`.
 3. El segundo, `scale_down`, debe ejecutarse de lunes a viernes a las **20:00 UTC** y devolver el ASG a `min_size = var.min_size`, `desired_capacity = var.desired_capacity`.
 4. Ambas acciones deben expresarse en formato cron y referenciar el ASG ya existente sin modificarlo.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `terraform plan` no muestra cambios en los recursos existentes — solo añade los dos schedules.
 - `aws autoscaling describe-scheduled-actions --auto-scaling-group-name lab28-asg` lista las dos acciones con los horarios correctos.
 - Puedes explicar por qué `max_size` no se modifica en `scale_up` aunque la capacidad deseada aumente.
 
-[Ver solución →](#4-solución-de-los-retos)
-
----
-
-## 3. Reto 2: Alarma CloudWatch y Notificacion SNS
+### Reto 2 — Alarma CloudWatch y Notificación SNS
 
 El Target Tracking gestiona el escalado, pero no avisa al equipo cuando la carga es anormalmente alta. Un umbral de CPU del 80% sostenido durante 2 minutos podría indicar un problema en la aplicación (bucle infinito, fuga de memoria) más que una demanda legítima.
 
-### Requisitos
+**Requisitos**
 
 1. Crea un archivo `alerts.tf` en `aws/` con los siguientes recursos:
    - `aws_sns_topic` con nombre `"${var.project}-alerts"`.
@@ -372,22 +397,21 @@ El Target Tracking gestiona el escalado, pero no avisa al equipo cuando la carga
 2. La alarma debe también enviar una notificación de recuperación (`ok_actions`) cuando la CPU baje del umbral.
 3. Añade a `outputs.tf` la ARN del SNS topic y el nombre de la alarma.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `terraform apply` completa sin errores.
 - Recibes un correo de confirmación de suscripción SNS de AWS; debes aceptarlo para activar las notificaciones.
 - `aws cloudwatch describe-alarms --alarm-names "lab28-cpu-high"` muestra el estado `OK`.
 - Al generar carga de CPU superior al 80% durante 2 minutos (usando `yes > /dev/null &`), recibes un correo de alerta.
 
-[Ver solución →](#4-solución-de-los-retos)
-
 ---
 
-## 4. Solución de los Retos
+## Soluciones
 
-> Intenta resolver los retos antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — Escalado Programado</strong></summary>
 
-### Solución Reto 1 — Escalado Programado
+### Solución al Reto 1 — Escalado Programado
 
 Crea el archivo `aws/schedules.tf`:
 
@@ -428,7 +452,12 @@ aws autoscaling describe-scheduled-actions \
   --output table
 ```
 
-### Solución Reto 2 — Alarma CloudWatch y Notificación SNS
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — Alarma CloudWatch y Notificación SNS</strong></summary>
+
+### Solución al Reto 2 — Alarma CloudWatch y Notificación SNS
 
 Crea el archivo `aws/alerts.tf`:
 
@@ -502,36 +531,11 @@ watch -n 15 "aws cloudwatch describe-alarms \
   --query 'MetricAlarms[0].StateValue' --output text"
 ```
 
----
-
-## Verificación final
-
-```bash
-# Obtener la URL del ALB
-ALB_URL=$(terraform output -raw alb_url)
-
-# Probar la aplicacion
-curl -s "http://${ALB_URL}" | head -5
-
-# Verificar que el ASG tiene instancias en servicio
-aws autoscaling describe-auto-scaling-groups \
-  --query 'AutoScalingGroups[?contains(AutoScalingGroupName,`lab28`)].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}' \
-  --output table
-
-# Ver el estado del target group
-TG_ARN=$(terraform output -raw target_group_arn 2>/dev/null || \
-  aws elbv2 describe-target-groups \
-    --query 'TargetGroups[?contains(TargetGroupName,`lab28`)].TargetGroupArn' \
-    --output text)
-aws elbv2 describe-target-health \
-  --target-group-arn "$TG_ARN" \
-  --query 'TargetHealthDescriptions[*].{ID:Target.Id,State:TargetHealth.State}' \
-  --output table
-```
+</details>
 
 ---
 
-## 5. Limpieza
+## Limpieza
 
 ```bash
 # Desde lab28/aws/
@@ -544,7 +548,7 @@ El destroy elimina recursos en orden inverso. El NAT Gateway, el ALB y las insta
 
 ---
 
-## 6. LocalStack
+## LocalStack
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
@@ -552,7 +556,7 @@ LocalStack Community soporta VPC, subnets y Launch Templates completamente. El A
 
 ---
 
-## 7. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|

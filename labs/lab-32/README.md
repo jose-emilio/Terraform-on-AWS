@@ -177,7 +177,7 @@ lab32/
 
 ---
 
-## 1. Despliegue en AWS Real
+## Despliegue en AWS Real
 
 ### 1.1 Arquitectura
 
@@ -437,11 +437,41 @@ El alias `live` siempre usa `--qualifier live`, no el número de versión direct
 
 > **Antes de comenzar los retos**, verifica que la invocación al alias devuelve `"init_type": "provisioned-concurrency"` y que el servicio ECS tiene tareas en estado `RUNNING`.
 
-## 2. Reto 1: Lambda Function URL para Invocacion Directa
+## Verificación final
+
+```bash
+# Verificar que la funcion Lambda usa Provisioned Concurrency
+aws lambda get-provisioned-concurrency-config \
+  --function-name $(terraform output -raw lambda_function_name) \
+  --qualifier live \
+  --query 'RequestedProvisionedConcurrentExecutions'
+
+# Invocar la funcion via alias y comprobar init_type
+aws lambda invoke \
+  --function-name "$(terraform output -raw lambda_function_name):live" \
+  --payload '{}' /tmp/response.json && cat /tmp/response.json
+# Esperado: "init_type": "provisioned-concurrency"
+
+# Verificar tareas ECS en RUNNING
+aws ecs list-tasks \
+  --cluster $(terraform output -raw ecs_cluster_name) \
+  --query 'taskArns' --output table
+
+# Comprobar la alarma de CloudWatch
+aws cloudwatch describe-alarms \
+  --query 'MetricAlarms[?contains(AlarmName,`lab32`)].{Name:AlarmName,State:StateValue}' \
+  --output table
+```
+
+---
+
+## Retos
+
+### Reto 1 — Lambda Function URL para Invocación Directa
 
 La función Lambda está dentro de una VPC y actualmente solo se puede invocar con `aws lambda invoke`. Añadir una **Lambda Function URL** permite invocarla directamente mediante HTTPS sin necesidad de API Gateway, manteniendo el alias y la Provisioned Concurrency activos.
 
-### Requisitos
+**Requisitos**
 
 1. Crea `aws_lambda_function_url` apuntando al alias `"live"` (usa `qualifier = aws_lambda_alias.live.name`).
    - `authorization_type = "NONE"` para permitir invocaciones sin autenticación (válido para laboratorio; en producción usa `"AWS_IAM"`).
@@ -449,17 +479,13 @@ La función Lambda está dentro de una VPC y actualmente solo se puede invocar c
 2. Añade un output `function_url` con la URL generada.
 3. Invoca la URL con `curl` y verifica que `init_type` es `"provisioned-concurrency"`.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `terraform output -raw function_url` devuelve una URL `https://` válida.
 - `curl -s "$(terraform output -raw function_url)" | python3 -m json.tool` devuelve la respuesta del handler con `"init_type": "provisioned-concurrency"`.
 - Puedes explicar por qué la Function URL debe apuntar al alias y no a `$LATEST` para beneficiarse de la Provisioned Concurrency.
 
-[Ver solución →](#4-solución-de-los-retos)
-
----
-
-## 3. Reto 2: ECS Auto Scaling con Target Tracking
+### Reto 2 — ECS Auto Scaling con Target Tracking
 
 El servicio ECS tiene `desired_count` fijo. En producción, el número de tareas debe adaptarse a la carga real. El objetivo es añadir un **Auto Scaling** basado en CPU que escale entre 1 y 6 tareas manteniendo la CPU media por debajo del 60%.
 
@@ -476,21 +502,20 @@ El servicio ECS tiene `desired_count` fijo. En producción, el número de tareas
    - `scale_in_cooldown = 300`, `scale_out_cooldown = 60`
 3. Añade outputs `autoscaling_min`, `autoscaling_max` y `autoscaling_target_cpu`.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws application-autoscaling describe-scalable-targets --service-namespace ecs` muestra el servicio registrado con `min = 1` y `max = 6`.
 - `aws application-autoscaling describe-scaling-policies --service-namespace ecs` muestra la política con `TargetValue: 60.0`.
 - Puedes explicar la diferencia entre `scale_in_cooldown` (300 s) y `scale_out_cooldown` (60 s) y por qué se recomienda un cooldown de scale-in más largo.
 
-[Ver solución →](#4-solución-de-los-retos)
-
 ---
 
-## 4. Solución de los Retos
+## Soluciones
 
-> Intenta resolver los retos antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — Lambda Function URL para Invocación Directa</strong></summary>
 
-### Solución Reto 1 — Lambda Function URL
+### Solución al Reto 1 — Lambda Function URL para Invocación Directa
 
 Añade en `main.tf`:
 
@@ -533,7 +558,12 @@ La respuesta debe incluir `"init_type": "provisioned-concurrency"` porque la URL
 
 Si usaras `qualifier = "$LATEST"` o no especificaras qualifier, la URL apuntaría a `$LATEST` y la Provisioned Concurrency no se aplicaría — las primeras invocaciones sufrirían cold start.
 
-### Solución Reto 2 — ECS Auto Scaling con Target Tracking
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — ECS Auto Scaling con Target Tracking</strong></summary>
+
+### Solución al Reto 2 — ECS Auto Scaling con Target Tracking
 
 Añade en `main.tf`:
 
@@ -597,37 +627,11 @@ aws application-autoscaling describe-scaling-policies \
 
 `scale_in_cooldown = 300` evita que el Auto Scaling reduzca tareas inmediatamente después de un pico, lo que provocaría ciclos continuos de scale-out/scale-in ("thrashing"). `scale_out_cooldown = 60` permite reaccionar rápido ante picos de carga sin esperar.
 
----
-
-## Verificación final
-
-```bash
-# Verificar que la funcion Lambda usa Provisioned Concurrency
-aws lambda get-provisioned-concurrency-config \
-  --function-name $(terraform output -raw lambda_function_name) \
-  --qualifier live \
-  --query 'RequestedProvisionedConcurrentExecutions'
-
-# Invocar la funcion via alias y comprobar init_type
-aws lambda invoke \
-  --function-name "$(terraform output -raw lambda_function_name):live" \
-  --payload '{}' /tmp/response.json && cat /tmp/response.json
-# Esperado: "init_type": "provisioned-concurrency"
-
-# Verificar tareas ECS en RUNNING
-aws ecs list-tasks \
-  --cluster $(terraform output -raw ecs_cluster_name) \
-  --query 'taskArns' --output table
-
-# Comprobar la alarma de CloudWatch
-aws cloudwatch describe-alarms \
-  --query 'MetricAlarms[?contains(AlarmName,`lab32`)].{Name:AlarmName,State:StateValue}' \
-  --output table
-```
+</details>
 
 ---
 
-## 5. Limpieza
+## Limpieza
 
 ```bash
 # Desde lab32/aws/

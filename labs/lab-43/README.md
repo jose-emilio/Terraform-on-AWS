@@ -1074,7 +1074,9 @@ AWS y no requerir ningún servidor adicional.
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Caché S3 de providers de Terraform</summary>
+<summary><strong>Solución al Reto 1 — Caché S3 de providers de Terraform</strong></summary>
+
+### Solución al Reto 1 — Caché S3 de providers de Terraform
 
 ### Por qué existe el problema
 
@@ -1294,7 +1296,9 @@ imagen Docker ni el repositorio ECR.
 </details>
 
 <details>
-<summary>Reto 2 — Alertas de fallo via EventBridge + SNS</summary>
+<summary><strong>Solución al Reto 2 — Alertas de fallo via EventBridge + SNS</strong></summary>
+
+### Solución al Reto 2 — Alertas de fallo via EventBridge + SNS
 
 ### Arquitectura de la solución
 

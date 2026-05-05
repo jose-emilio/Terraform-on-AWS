@@ -179,7 +179,7 @@ lab30/
 
 ---
 
-## 1. Despliegue en AWS Real
+## Despliegue en AWS Real
 
 ### 1.1 Arquitectura
 
@@ -440,11 +440,41 @@ aws logs tail "$LOG_GROUP" --format short
 
 > **Antes de comenzar los retos**, asegúrate de que `terraform apply` ha completado sin errores y de que enviando un mensaje premium a la cola de órdenes Lambda lo procesa correctamente (verifica los logs).
 
-## 2. Reto 1: Alarma en la Dead Letter Queue
+## Verificación final
+
+```bash
+# Verificar las 4 colas SQS creadas (main, premium, dlq, destinations)
+aws sqs list-queues \
+  --query 'QueueUrls[?contains(@,`lab30`)]' --output table
+
+# Enviar un mensaje de prueba a la cola principal
+QUEUE_URL=$(terraform output -raw main_queue_url)
+aws sqs send-message \
+  --queue-url "$QUEUE_URL" \
+  --message-body '{"order_type":"premium","order_id":"test-001"}'
+
+# Verificar que Lambda procesó el mensaje (ver logs)
+aws logs tail "/aws/lambda/$(terraform output -raw lambda_function_name)" \
+  --since 5m
+
+# Comprobar que la DLQ está vacia (no hay mensajes fallidos)
+DLQ_URL=$(terraform output -raw dlq_url)
+aws sqs get-queue-attributes \
+  --queue-url "$DLQ_URL" \
+  --attribute-names ApproximateNumberOfMessages \
+  --query 'Attributes.ApproximateNumberOfMessages'
+# Esperado: "0"
+```
+
+---
+
+## Retos
+
+### Reto 1 — Alarma en la Dead Letter Queue
 
 En producción, los mensajes que llegan a la DLQ indican fallos que requieren atención. Sin una alarma, estos mensajes pueden acumularse días sin ser detectados. El objetivo de este reto es configurar un mecanismo de alerta temprana sobre la DLQ.
 
-### Requisitos
+**Requisitos**
 
 1. Crea un recurso `aws_cloudwatch_metric_alarm` que se active cuando `ApproximateNumberOfMessagesVisible` en la DLQ sea `>= 1`.
    - `alarm_name`: `"${var.project}-dlq-not-empty"`
@@ -458,17 +488,13 @@ En producción, los mensajes que llegan a la DLQ indican fallos que requieren at
    - `threshold`: `1`
 2. Añade un output `dlq_alarm_name` con el nombre de la alarma.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws cloudwatch describe-alarms --alarm-names "${var.project}-dlq-not-empty"` muestra la alarma en estado `OK` o `ALARM`.
 - Si envías un mensaje que falla sistemáticamente (amount > 9999) y esperas a que llegue a la DLQ, la alarma pasa al estado `ALARM`.
 - Puedes explicar la diferencia entre `period` (ventana de evaluación) y `evaluation_periods` (cuántas ventanas consecutivas deben cumplir la condición).
 
-[Ver solución →](#4-solución-de-los-retos)
-
----
-
-## 3. Reto 2: Fallos Parciales de Lote (report_batch_item_failures)
+### Reto 2 — Fallos Parciales de Lote (report_batch_item_failures)
 
 Actualmente, si un lote de 10 mensajes contiene 1 mensaje inválido, Lambda lanza una excepción y los 10 mensajes se reencolan. Esto provoca que 9 mensajes válidos se procesen hasta 3 veces antes de que el inválido llegue a la DLQ. `report_batch_item_failures` permite que Lambda reporte exactamente qué mensajes fallaron, para que solo esos se reencolen.
 
@@ -493,22 +519,21 @@ def lambda_handler(event, context):
 
 3. Verifica que, con un lote mixto (un mensaje inválido + varios válidos), solo el inválido se reencola y eventualmente llega a la DLQ, mientras los válidos se procesan una sola vez.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws lambda list-event-source-mappings` muestra `FunctionResponseTypes: ["ReportBatchItemFailures"]` en el mapping.
 - Enviando un lote mixto (puedes enviar varios mensajes rapidamente), los mensajes válidos aparecen procesados en los logs exactamente una vez.
 - El mensaje inválido aparece en la DLQ tras `maxReceiveCount` reintentos.
 - Puedes explicar por qué sin `report_batch_item_failures` el procesamiento de duplicados puede disparar costes inesperados en colas de alto volumen.
 
-[Ver solución →](#4-solución-de-los-retos)
-
 ---
 
-## 4. Solución de los Retos
+## Soluciones
 
-> Intenta resolver los retos antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — Alarma en la Dead Letter Queue</strong></summary>
 
-### Solución Reto 1 — Alarma en la Dead Letter Queue
+### Solución al Reto 1 — Alarma en la Dead Letter Queue
 
 Añade el recurso `aws_cloudwatch_metric_alarm` en `main.tf`:
 
@@ -551,7 +576,12 @@ Justo después del `terraform apply`, la alarma muestra `INSUFFICIENT_DATA` con 
 
 `treat_missing_data = "notBreaching"` es lo que evita que esa ausencia inicial de datos se interprete como un fallo y dispare la alarma prematuramente.
 
-### Solución Reto 2 — Fallos Parciales de Lote
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — Fallos Parciales de Lote</strong></summary>
+
+### Solución al Reto 2 — Fallos Parciales de Lote
 
 **Terraform** — actualiza `aws_lambda_event_source_mapping` en `main.tf`:
 
@@ -681,37 +711,11 @@ aws lambda invoke \
 
 Con el handler del Reto 2, la respuesta sigue siendo `{"batchItemFailures": ["msg-bad-1"]}` — `msg-ok-1` ya se procesó antes del fallo y `msg-ok-2` no llega a procesarse pero tampoco se reporta como fallido, por lo que SQS lo eliminará junto con `msg-ok-1`. Solo `msg-bad-1` se reencola.
 
----
-
-## Verificación final
-
-```bash
-# Verificar las 4 colas SQS creadas (main, premium, dlq, destinations)
-aws sqs list-queues \
-  --query 'QueueUrls[?contains(@,`lab30`)]' --output table
-
-# Enviar un mensaje de prueba a la cola principal
-QUEUE_URL=$(terraform output -raw main_queue_url)
-aws sqs send-message \
-  --queue-url "$QUEUE_URL" \
-  --message-body '{"order_type":"premium","order_id":"test-001"}'
-
-# Verificar que Lambda procesó el mensaje (ver logs)
-aws logs tail "/aws/lambda/$(terraform output -raw lambda_function_name)" \
-  --since 5m
-
-# Comprobar que la DLQ está vacia (no hay mensajes fallidos)
-DLQ_URL=$(terraform output -raw dlq_url)
-aws sqs get-queue-attributes \
-  --queue-url "$DLQ_URL" \
-  --attribute-names ApproximateNumberOfMessages \
-  --query 'Attributes.ApproximateNumberOfMessages'
-# Esperado: "0"
-```
+</details>
 
 ---
 
-## 5. Limpieza
+## Limpieza
 
 ```bash
 # Desde lab30/aws/
@@ -725,7 +729,7 @@ rm -f function.zip
 
 ---
 
-## 6. LocalStack
+## LocalStack
 
 Las colas SQS, Lambda y el Event Source Mapping funcionan correctamente en LocalStack Community. `filter_criteria` y Lambda Destinations tienen soporte parcial — los recursos se crean sin errores pero su comportamiento puede diferir del real.
 
@@ -733,7 +737,7 @@ Consulta [localstack/README.md](localstack/README.md) para instrucciones detalla
 
 ---
 
-## 7. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|

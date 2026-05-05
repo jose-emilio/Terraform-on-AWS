@@ -203,7 +203,7 @@ lab29/
 
 ---
 
-## 1. Despliegue en AWS Real
+## Despliegue en AWS Real
 
 ### 1.1 Arquitectura
 
@@ -591,11 +591,41 @@ Cuando el Circuit Breaker dispara verás en los eventos (orden cronológico inve
 
 > **Antes de comenzar los retos**, asegúrate de que todos los cambios de `main.tf` están aplicados y el servicio tiene `runningCount = desiredCount`. Si hay un despliegue en curso, espera a que complete.
 
-## 2. Reto 1: Microservicio Worker como Cliente Puro de Service Connect
+## Verificación final
+
+```bash
+# Verificar que el servicio ECS esta en RUNNING
+aws ecs describe-services \
+  --cluster $(terraform output -raw ecs_cluster_name) \
+  --services web api \
+  --query 'services[*].{Name:serviceName,Status:status,Running:runningCount}' \
+  --output table
+
+# Probar el endpoint del ALB
+ALB_URL=$(terraform output -raw alb_url)
+curl -s "http://${ALB_URL}" | head -20
+
+# Verificar comunicacion interna via Service Connect
+curl -s "http://${ALB_URL}/api"
+# Esperado: JSON del microservicio API
+
+# Comprobar que el parametro SSM esta correctamente configurado
+aws ssm get-parameter \
+  --name "/lab29/api-key" \
+  --with-decryption \
+  --query 'Parameter.{Name:Name,Type:Type}' \
+  --output table
+```
+
+---
+
+## Retos
+
+### Reto 1 — Microservicio Worker como Cliente Puro de Service Connect
 
 Ya existen dos servicios: `web` (servidor en puerto 80) y `api` (servidor en puerto 8080). Añade un tercer microservicio `worker` que actúe como **cliente puro** de Service Connect: consume el endpoint `http://api:8080` sin necesitar registrar un nombre DNS propio, lo que demuestra la diferencia entre servidor y cliente en la malla de servicios.
 
-### Requisitos
+**Requisitos**
 
 1. Crea un archivo `worker.tf` en `aws/` con los siguientes recursos:
    - `aws_cloudwatch_log_group` para `/ecs/lab29/worker`
@@ -606,18 +636,14 @@ Ya existen dos servicios: `web` (servidor en puerto 80) y `api` (servidor en pue
 4. Usa el mismo Security Group (`aws_security_group.ecs`) y subredes públicas que los demás servicios.
 5. Añade el output `worker_service_name` en `outputs.tf`.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `terraform plan` no modifica los servicios `web` ni `api` existentes — solo añade los recursos del worker.
 - `aws ecs describe-services --cluster lab29-cluster --services lab29-worker` muestra el servicio activo.
 - Desde el contenedor worker (`execute-command`), `wget -qO- http://api:8080/health` devuelve `{"status":"ok"}`.
 - Puedes explicar por qué el worker no necesita el bloque `service {}` dentro de `service_connect_configuration`.
 
-[Ver solución →](#4-solución-de-los-retos)
-
----
-
-## 3. Reto 2: ALB para Acceso Externo con Subredes Privadas
+### Reto 2 — ALB para Acceso Externo con Subredes Privadas
 
 Service Connect es excelente para comunicación **este-oeste** (entre microservicios), pero los usuarios externos necesitan acceder al servicio a través de Internet. La arquitectura de producción correcta coloca el ALB en subredes públicas y las tareas ECS en subredes **privadas**: las tareas no tienen IP pública y solo son alcanzables desde el ALB, no desde Internet directamente.
 
@@ -627,7 +653,7 @@ Internet → ALB (subred pública) → Tareas Web (subred privada) → API (subr
                                NAT Gateway (salida a Internet para pull de imágenes)
 ```
 
-### Requisitos
+**Requisitos**
 
 1. Crea un archivo `alb.tf` en `aws/` con los siguientes recursos:
    - Subredes privadas (una por AZ) con su tabla de rutas apuntando al NAT Gateway
@@ -643,7 +669,7 @@ Internet → ALB (subred pública) → Tareas Web (subred privada) → API (subr
 3. Actualiza el security group `ecs`: reemplaza la regla de puerto 80 desde `0.0.0.0/0` por una regla que solo admita tráfico desde el security group del ALB (`security_groups = [aws_security_group.alb.id]`).
 4. Añade a `outputs.tf` el output `alb_url` con la URL pública del ALB.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `terraform apply` completa sin errores.
 - `curl $(terraform output -raw alb_url)` devuelve la página HTML con las dos tarjetas.
@@ -651,15 +677,14 @@ Internet → ALB (subred pública) → Tareas Web (subred privada) → API (subr
 - Las tareas Web **no tienen IP pública** (`assign_public_ip = false`): solo son accesibles a través del ALB.
 - Puedes explicar por qué `target_type = "ip"` es obligatorio para Fargate (y no `instance`) y por qué el NAT Gateway es necesario en subredes privadas.
 
-[Ver solución →](#4-solución-de-los-retos)
-
 ---
 
-## 4. Solución de los Retos
+## Soluciones
 
-> Intenta resolver los retos antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — Microservicio Worker como Cliente Puro de Service Connect</strong></summary>
 
-### Solución Reto 1 — Microservicio Worker como Cliente Puro de Service Connect
+### Solución al Reto 1 — Microservicio Worker como Cliente Puro de Service Connect
 
 Crea el archivo `aws/worker.tf`:
 
@@ -817,7 +842,12 @@ exit
 aws logs tail /ecs/lab29/worker --log-stream-name-prefix worker/ --follow
 ```
 
-### Solución Reto 2 — ALB para Acceso Externo
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — ALB para Acceso Externo con Subredes Privadas</strong></summary>
+
+### Solución al Reto 2 — ALB para Acceso Externo con Subredes Privadas
 
 Crea el archivo `aws/alb.tf`:
 
@@ -1030,37 +1060,11 @@ curl $(terraform output -raw alb_url)
 # Debe devolver la página HTML con las dos tarjetas (Web + API via Service Connect)
 ```
 
----
-
-## Verificación final
-
-```bash
-# Verificar que el servicio ECS esta en RUNNING
-aws ecs describe-services \
-  --cluster $(terraform output -raw ecs_cluster_name) \
-  --services web api \
-  --query 'services[*].{Name:serviceName,Status:status,Running:runningCount}' \
-  --output table
-
-# Probar el endpoint del ALB
-ALB_URL=$(terraform output -raw alb_url)
-curl -s "http://${ALB_URL}" | head -20
-
-# Verificar comunicacion interna via Service Connect
-curl -s "http://${ALB_URL}/api"
-# Esperado: JSON del microservicio API
-
-# Comprobar que el parametro SSM esta correctamente configurado
-aws ssm get-parameter \
-  --name "/lab29/api-key" \
-  --with-decryption \
-  --query 'Parameter.{Name:Name,Type:Type}' \
-  --output table
-```
+</details>
 
 ---
 
-## 5. Limpieza
+## Limpieza
 
 ```bash
 # Desde lab29/aws/
@@ -1082,7 +1086,7 @@ aws ecr batch-delete-image \
 
 ---
 
-## 6. LocalStack
+## LocalStack
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
@@ -1090,7 +1094,7 @@ LocalStack Community soporta ECR, SSM e IAM completamente. ECS tiene soporte par
 
 ---
 
-## 7. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|

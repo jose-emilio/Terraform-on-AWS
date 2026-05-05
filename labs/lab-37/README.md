@@ -475,7 +475,9 @@ terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Historial de versiones con terraform_data input/output</summary>
+<summary><strong>Solución al Reto 1 — Historial de versiones con terraform_data input/output</strong></summary>
+
+### Solución al Reto 1 — Historial de versiones con terraform_data input/output
 
 Añade en `main.tf`:
 
@@ -570,7 +572,9 @@ en el siguiente plan.
 </details>
 
 <details>
-<summary>Reto 2 — Verificacion del despliegue con postcondition y check</summary>
+<summary><strong>Solución al Reto 2 — Verificación del despliegue con postcondition y check</strong></summary>
+
+### Solución al Reto 2 — Verificación del despliegue con postcondition y check
 
 **Paso 1 — Declarar el provider `http` en `providers.tf`**:
 

@@ -181,7 +181,7 @@ labs/lab34/
 
 ---
 
-## 1. Despliegue en AWS
+## Despliegue en AWS
 
 ```bash
 # Obtén el ID de cuenta para el nombre del bucket de estado
@@ -350,11 +350,13 @@ df -h /mnt/efs
 
 ---
 
-## 3. Reto 1: EFS File System Policy (cifrado en transito obligatorio)
+## Retos
+
+### Reto 1 — EFS File System Policy (cifrado en tránsito obligatorio)
 
 El EFS acepta conexiones NFS sin TLS por defecto. En entornos regulados es obligatorio cifrar los datos en tránsito. Una **File System Policy** (política de recursos del EFS) permite denegar todas las conexiones que no usen TLS, de forma similar a una bucket policy en S3.
 
-### Requisitos
+**Requisitos**
 
 1. Añade un `aws_efs_file_system_policy` que aplique al file system creado por el módulo.
 2. La política debe denegar cualquier acción EFS a cualquier principal si la conexión no usa TLS (`aws:SecureTransport = false`).
@@ -362,16 +364,12 @@ El EFS acepta conexiones NFS sin TLS por defecto. En entornos regulados es oblig
 
 > El recurso `aws_efs_file_system_policy` va en el **módulo raíz** (`aws/main.tf`) y referencia el file system mediante `module.efs_share.file_system_id`. No es necesario modificar el módulo `efs-share` para este reto.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws efs describe-file-system-policy --file-system-id "$EFS_ID"` muestra la política con `Effect: Deny` y condición `aws:SecureTransport`.
 - Un intento de montaje sin TLS (`-o notls`) desde la instancia falla con `access denied`.
 
-[Ver solución →](#4-solución-de-los-retos)
-
----
-
-## 3. Reto 2: Segundo Access Point para un equipo diferente
+### Reto 2 — Segundo Access Point para un equipo diferente
 
 El módulo `efs-share` gestiona el Access Point de la aplicación principal. Un segundo equipo necesita su propio espacio aislado en el mismo EFS con un UID/GID diferente y un directorio raíz propio.
 
@@ -384,20 +382,19 @@ El módulo `efs-share` gestiona el Access Point de la aplicación principal. Un 
 
 > El segundo Access Point referencia el file system del módulo mediante `module.efs_share.file_system_id`.
 
-### Criterios de éxito
+**Criterios de éxito**
 
 - `aws efs describe-access-points` muestra dos Access Points: uno con path `/app/data` (UID 1001) y otro con `/analytics/data` (UID 1002).
 - Puedes explicar por qué los dos Access Points garantizan que un proceso con UID 1001 no puede leer los ficheros creados por un proceso con UID 1002, aunque ambos usen el mismo EFS.
 
-[Ver solución →](#4-solución-de-los-retos)
-
 ---
 
-## 4. Solución de los Retos
+## Soluciones
 
-> Intenta resolver los retos antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — EFS File System Policy</strong></summary>
 
-### Solución Reto 1 — EFS File System Policy
+### Solución al Reto 1 — EFS File System Policy
 
 El recurso `aws_efs_file_system_policy` va en el **módulo raíz** (`aws/main.tf`). No es necesario modificar el módulo `efs-share` porque el file system ID está disponible como output (`module.efs_share.file_system_id`).
 
@@ -456,7 +453,12 @@ sudo mount -t nfs4 \
   "$EFS_ID".efs.us-east-1.amazonaws.com:/ /mnt/efs-notls
 ```
 
-### Solución Reto 2 — Segundo Access Point
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — Segundo Access Point para un equipo diferente</strong></summary>
+
+### Solución al Reto 2 — Segundo Access Point para un equipo diferente
 
 El segundo Access Point va en el **módulo raíz** (`aws/main.tf`) referenciando el file system del módulo. No se modifica `modules/efs-share` porque añadir un recurso allí afectaría a todos los usos futuros del módulo; un Access Point adicional es un requisito de este deployment concreto.
 
@@ -507,9 +509,11 @@ aws efs describe-access-points \
 
 El aislamiento entre Access Points es real a nivel de sistema de archivos POSIX: los ficheros creados por UID 1001 tienen `owner=1001` en los metadatos del EFS. Un proceso con UID 1002 que acceda al directorio `/app/data` recibirá `EACCES` porque los permisos `750` solo conceden acceso al propietario y su grupo — el kernel del cliente NFS aplica las reglas POSIX estándar.
 
+</details>
+
 ---
 
-## 5. Limpieza
+## Limpieza
 
 ```bash
 # Desde labs/lab34/aws/
@@ -521,7 +525,7 @@ terraform destroy
 
 ---
 
-## 6. LocalStack
+## LocalStack
 
 ```bash
 localstack start -d
@@ -536,7 +540,7 @@ Consulta [localstack/README.md](localstack/README.md) para las instrucciones com
 
 ---
 
-## 7. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|

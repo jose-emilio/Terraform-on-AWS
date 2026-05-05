@@ -1146,7 +1146,9 @@ mas granular y auditables.
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Añadir un cuarto entorno sin downtime</summary>
+<summary><strong>Solución al Reto 1 — Añadir un cuarto entorno sin downtime</strong></summary>
+
+### Solución al Reto 1 — Añadir un cuarto entorno sin downtime
 
 **Modificar `variables.tf`**:
 
@@ -1199,7 +1201,9 @@ terraform state list | grep hotfix
 </details>
 
 <details>
-<summary>Reto 2 — Desacoplar app/ de terraform_remote_state mediante SSM</summary>
+<summary><strong>Solución al Reto 2 — Desacoplar app/ de terraform_remote_state mediante SSM</strong></summary>
+
+### Solución al Reto 2 — Desacoplar app/ de terraform_remote_state mediante SSM
 
 **1. Añadir SSM parameters en `network/main.tf`**:
 
