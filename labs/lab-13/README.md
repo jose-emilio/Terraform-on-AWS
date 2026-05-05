@@ -301,7 +301,9 @@ aws ec2 describe-snapshots --snapshot-ids $SNAPSHOT_ID \
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Segunda CMK y Bucket Policy actualizada</summary>
+<summary><strong>Solución al Reto 1 — Segunda CMK y Bucket Policy actualizada</strong></summary>
+
+### Solución al Reto 1 — Segunda CMK y Bucket Policy actualizada
 
 **Por qué se necesita una segunda CMK y no solo un segundo alias**
 
@@ -396,7 +398,9 @@ resource "aws_s3_bucket_policy" "enforce_kms" {
 </details>
 
 <details>
-<summary>Reto 2 — Snapshot de EBS cifrado</summary>
+<summary><strong>Solución al Reto 2 — Snapshot de EBS cifrado</strong></summary>
+
+### Solución al Reto 2 — Snapshot de EBS cifrado
 
 **Qué hace un snapshot de EBS cifrado**
 

@@ -351,7 +351,9 @@ aws secretsmanager get-secret-value --secret-id "$SECRET" 2>&1 | head -3
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Rol de aplicación con acceso exclusivo al secreto</summary>
+<summary><strong>Solución al Reto 1 — Rol de aplicación con acceso exclusivo al secreto</strong></summary>
+
+### Solución al Reto 1 — Rol de aplicación con acceso exclusivo al secreto
 
 **Por qué dos capas: política inline + política de recurso**
 

@@ -924,10 +924,12 @@ aws iam get-role-policy \
 #    AccessDenied — eso prueba que el principio funciona.
 ```
 
-## Solución
+## Soluciones
 
 <details>
-<summary>Sustituir PowerUserAccess por una policy inline mínima</summary>
+<summary><strong>Solución al Reto — Sustituir PowerUserAccess por una policy de mínimo privilegio</strong></summary>
+
+### Solución al Reto — Sustituir PowerUserAccess por una policy de mínimo privilegio
 
 **Paso 1 — Eliminar el attachment de PowerUserAccess en `aws/main.tf`**:
 

@@ -346,7 +346,9 @@ aws iam simulate-principal-policy \
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Política inline S3 ListAllMyBuckets</summary>
+<summary><strong>Solución al Reto 1 — Política inline S3 ListAllMyBuckets</strong></summary>
+
+### Solución al Reto 1 — Política inline S3 ListAllMyBuckets
 
 ```hcl
 resource "aws_iam_role_policy" "ec2_s3_list" {
@@ -368,7 +370,9 @@ resource "aws_iam_role_policy" "ec2_s3_list" {
 </details>
 
 <details>
-<summary>Reto 2 — Permissions Boundary</summary>
+<summary><strong>Solución al Reto 2 — Permissions Boundary</strong></summary>
+
+### Solución al Reto 2 — Permissions Boundary
 
 ```hcl
 resource "aws_iam_policy" "boundary" {
