@@ -652,7 +652,9 @@ de ejecución frente al grupo de producción.
 ## Soluciones
 
 <details>
-<summary>Reto 1 — Notificaciones de despliegue por correo electrónico</summary>
+<summary><strong>Solución al Reto 1 — Notificaciones de despliegue por correo electrónico</strong></summary>
+
+### Solución al Reto 1 — Notificaciones de despliegue por correo electrónico
 
 ### Por qué no llegan notificaciones por defecto
 
@@ -787,7 +789,9 @@ output "deployments_topic_arn" {
 </details>
 
 <details>
-<summary>Reto 2 — Grupo de despliegue de desarrollo con estrategia all-at-once</summary>
+<summary><strong>Solución al Reto 2 — Grupo de despliegue de desarrollo con estrategia all-at-once</strong></summary>
+
+### Solución al Reto 2 — Grupo de despliegue de desarrollo con estrategia all-at-once
 
 ### La mecánica de `minimum_healthy_hosts`
 

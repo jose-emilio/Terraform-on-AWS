@@ -1431,9 +1431,7 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 - La condición usa `aws:ResourceTag/Component`, no `ec2:ResourceTag/Component` — ambas
   funcionan para EC2, pero `aws:` es el prefijo global recomendado por AWS
 
----
-
-## Reto 5 — Run Command a escala con SSM
+### Reto 5 — Run Command a escala con SSM
 
 Las instancias del ASG tienen el agente SSM activo gracias al rol IAM con la política
 `AmazonSSMManagedInstanceCore`. SSM Run Command permite ejecutar comandos en un
@@ -1566,10 +1564,10 @@ Salida esperada (`list-command-invocations`):
 +----------------------+-----------+
 |       Instance       |  Status   |
 +----------------------+-----------+
-|  i-0xxxxxxxxxxxxxxxxx |  Success  |
-|  i-0xxxxxxxxxxxxxxxxx |  Success  |
-|  i-0xxxxxxxxxxxxxxxxx |  Success  |
-|  i-0xxxxxxxxxxxxxxxxx |  Success  |
+|  i-0xxxxxxxxxxxxxxxxx |  Success |
+|  i-0xxxxxxxxxxxxxxxxx |  Success |
+|  i-0xxxxxxxxxxxxxxxxx |  Success |
+|  i-0xxxxxxxxxxxxxxxxx |  Success |
 +----------------------+-----------+
 ```
 
