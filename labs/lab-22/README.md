@@ -75,7 +75,7 @@ lab-22/
             └── outputs.tf
 ```
 
-## 1. Análisis del código
+## Análisis del código
 
 ### 1.1 El problema: enfoque monolítico
 
@@ -322,7 +322,7 @@ Ambos buckets comparten: bloqueo de acceso público, tags de proyecto, y protecc
 
 ---
 
-## 2. Despliegue
+## Despliegue
 
 ```bash
 cd labs/lab-22/aws
@@ -353,7 +353,7 @@ terraform output
 
 ---
 
-## 3. Verificación final
+## Verificación final
 
 ### 3.1 Verificar los buckets creados
 
@@ -426,7 +426,9 @@ Terraform se negará a destruir los buckets porque el módulo tiene `prevent_des
 
 ---
 
-## 4. Reto: Añadir regla de ciclo de vida para expiración de logs
+## Retos
+
+### Reto 1 — Añadir regla de ciclo de vida para expiración de logs
 
 **Situación**: El equipo de operaciones quiere que los objetos del bucket de logs se eliminen automáticamente después de 90 días para reducir costes de almacenamiento. El bucket de datos debe retener los objetos indefinidamente.
 
@@ -443,13 +445,37 @@ Terraform se negará a destruir los buckets porque el módulo tiene `prevent_des
 - `filter {}` vacío aplica la regla a todos los objetos del bucket
 - Verifica con: `aws s3api get-bucket-lifecycle-configuration --bucket <bucket>`
 
-La solución está en la [sección 5](#5-solución-del-reto).
+### Reto 2 — Cifrado con SSE-KMS para datos confidenciales
+
+**Situación**: El equipo de seguridad requiere que el bucket de datos críticos use cifrado **SSE-KMS** con una clave gestionada por el cliente (CMK), mientras que el bucket de logs puede usar el cifrado por defecto **SSE-S3** (más económico). El módulo debe soportar ambos escenarios de forma configurable.
+
+**Tu objetivo**:
+
+1. Crear una clave KMS (`aws_kms_key`) en el Root Module, dedicada al cifrado del bucket de datos
+2. Añadir una variable `kms_key_arn` al módulo `s3-bucket` con valor por defecto `null` (sin KMS)
+3. Crear un recurso `aws_s3_bucket_server_side_encryption_configuration` dentro del módulo que:
+   - Use `aws:kms` con la clave proporcionada si `kms_key_arn != null`
+   - Use `AES256` (SSE-S3) si `kms_key_arn` es null
+4. Pasar la clave KMS solo al bucket de datos
+5. Verificar con AWS CLI que cada bucket usa el tipo de cifrado correcto
+
+**Pistas**:
+- `aws_kms_key` necesita una `description` y opcionalmente `enable_key_rotation = true`
+- El recurso de cifrado usa un bloque `rule { apply_server_side_encryption_by_default { ... } }`
+- La clave de `sse_algorithm` es `"aws:kms"` o `"AES256"`
+- `kms_master_key_id` solo se necesita cuando `sse_algorithm = "aws:kms"`
+- Verifica con: `aws s3api get-bucket-encryption --bucket <bucket>`
 
 ---
 
-## 5. Solución del Reto
+## Soluciones
 
-### Paso 1: Nueva variable en `modules/s3-bucket/variables.tf`
+<details>
+<summary><strong>Solución al Reto 1 — Añadir regla de ciclo de vida para expiración de logs</strong></summary>
+
+### Solución al Reto 1 — Añadir regla de ciclo de vida para expiración de logs
+
+#### Paso 1: Nueva variable en `modules/s3-bucket/variables.tf`
 
 ```hcl
 variable "expiration_days" {
@@ -459,7 +485,7 @@ variable "expiration_days" {
 }
 ```
 
-### Paso 2: Recurso condicional en `modules/s3-bucket/main.tf`
+#### Paso 2: Recurso condicional en `modules/s3-bucket/main.tf`
 
 ```hcl
 resource "aws_s3_bucket_lifecycle_configuration" "this" {
@@ -481,7 +507,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
 
 `count = var.expiration_days > 0 ? 1 : 0` crea el recurso solo cuando se especifica un valor mayor que 0. Si `expiration_days` es 0 (default), el recurso no se crea en absoluto.
 
-### Paso 3: Invocar desde el Root Module
+#### Paso 3: Invocar desde el Root Module
 
 ```hcl
 module "logs_bucket" {
@@ -501,7 +527,7 @@ module "logs_bucket" {
 # data_bucket no pasa expiration_days → usa default = 0 → sin regla
 ```
 
-### Paso 4: Verificar
+#### Paso 4: Verificar
 
 ```bash
 terraform apply
@@ -534,34 +560,14 @@ aws s3api get-bucket-lifecycle-configuration \
 
 ---
 
-## 6. Reto 2: Cifrado con SSE-KMS para datos confidenciales
+</details>
 
-**Situación**: El equipo de seguridad requiere que el bucket de datos críticos use cifrado **SSE-KMS** con una clave gestionada por el cliente (CMK), mientras que el bucket de logs puede usar el cifrado por defecto **SSE-S3** (más económico). El módulo debe soportar ambos escenarios de forma configurable.
+<details>
+<summary><strong>Solución al Reto 2 — Cifrado con SSE-KMS para datos confidenciales</strong></summary>
 
-**Tu objetivo**:
+### Solución al Reto 2 — Cifrado con SSE-KMS para datos confidenciales
 
-1. Crear una clave KMS (`aws_kms_key`) en el Root Module, dedicada al cifrado del bucket de datos
-2. Añadir una variable `kms_key_arn` al módulo `s3-bucket` con valor por defecto `null` (sin KMS)
-3. Crear un recurso `aws_s3_bucket_server_side_encryption_configuration` dentro del módulo que:
-   - Use `aws:kms` con la clave proporcionada si `kms_key_arn != null`
-   - Use `AES256` (SSE-S3) si `kms_key_arn` es null
-4. Pasar la clave KMS solo al bucket de datos
-5. Verificar con AWS CLI que cada bucket usa el tipo de cifrado correcto
-
-**Pistas**:
-- `aws_kms_key` necesita una `description` y opcionalmente `enable_key_rotation = true`
-- El recurso de cifrado usa un bloque `rule { apply_server_side_encryption_by_default { ... } }`
-- La clave de `sse_algorithm` es `"aws:kms"` o `"AES256"`
-- `kms_master_key_id` solo se necesita cuando `sse_algorithm = "aws:kms"`
-- Verifica con: `aws s3api get-bucket-encryption --bucket <bucket>`
-
-La solución está en la [sección 7](#7-solución-del-reto-2).
-
----
-
-## 7. Solución del Reto 2
-
-### Paso 1: Clave KMS en el Root Module (`main.tf`)
+#### Paso 1: Clave KMS en el Root Module (`main.tf`)
 
 ```hcl
 resource "aws_kms_key" "data" {
@@ -579,7 +585,7 @@ resource "aws_kms_alias" "data" {
 }
 ```
 
-### Paso 2: Nueva variable en `modules/s3-bucket/variables.tf`
+#### Paso 2: Nueva variable en `modules/s3-bucket/variables.tf`
 
 ```hcl
 variable "kms_key_arn" {
@@ -589,7 +595,7 @@ variable "kms_key_arn" {
 }
 ```
 
-### Paso 3: Recurso de cifrado en `modules/s3-bucket/main.tf`
+#### Paso 3: Recurso de cifrado en `modules/s3-bucket/main.tf`
 
 ```hcl
 resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
@@ -612,7 +618,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
 > - **logs_bucket** (`kms_key_arn = null`): el módulo aplica `sse_algorithm = "AES256"`, lo que es **funcionalmente equivalente** al cifrado SSE-S3 que AWS ya aplica por defecto en cualquier bucket nuevo desde 2023. Lo que cambia es que ahora el cifrado es **explícito en el state**: `terraform plan` lo enseña, los auditores lo ven, y queda blindado frente a un futuro cambio del comportamiento por defecto de AWS.
 > - **data_bucket** (`kms_key_arn = aws_kms_key.data.arn`): cambia el cifrado **real**, pasa de SSE-S3 (default implícito) a SSE-KMS con una CMK gestionada por el cliente. Esto **sí** modifica el comportamiento — cada `GET` y `PUT` requiere ahora permisos `kms:Decrypt` / `kms:GenerateDataKey` además de los permisos S3.
 
-### Paso 4: Invocar desde el Root Module
+#### Paso 4: Invocar desde el Root Module
 
 ```hcl
 module "data_bucket" {
@@ -632,7 +638,7 @@ module "data_bucket" {
 # logs_bucket no pasa kms_key_arn → usa default = null → SSE-S3 (AES256)
 ```
 
-### Paso 5: Verificar
+#### Paso 5: Verificar
 
 ```bash
 terraform apply
@@ -679,9 +685,11 @@ En general: SSE-S3 es suficiente para la mayoría de casos. SSE-KMS es necesario
 >
 > O bien cancelar la eliminación pendiente desde la consola y reutilizar la clave (más complejo). Para entornos de laboratorio, `deletion_window_in_days = 7` es lo razonable.
 
+</details>
+
 ---
 
-## 8. Limpieza
+## Limpieza
 
 Dado que el módulo tiene `prevent_destroy = true`, antes de destruir debes desactivar la protección temporalmente:
 
@@ -711,7 +719,7 @@ Si vas a seguir usando el módulo, revierte el cambio a `prevent_destroy = true`
 
 ---
 
-## 9. LocalStack
+## LocalStack
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 

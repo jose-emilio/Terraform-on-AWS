@@ -66,7 +66,7 @@ lab-20/
         └── test_init.sh         <- Instalación del SSM Agent
 ```
 
-## 1. Análisis del código
+## Análisis del código
 
 ### 1.1 Arquitectura con inspección y egress centralizados
 
@@ -276,7 +276,7 @@ Para producción, una configuración más razonable sería subir `max_aggregatio
 
 ---
 
-## 2. Despliegue
+## Despliegue
 
 ```bash
 cd labs/lab-20/aws
@@ -318,7 +318,7 @@ terraform output
 
 ---
 
-## 3. Verificación final
+## Verificación final
 
 ### 3.1 Transit Gateway y attachments
 
@@ -583,7 +583,9 @@ Verás filas con `pktDst` apuntando a IPs públicas (resolvers DNS, `checkip.ama
 
 ---
 
-## 4. Reto: Añadir una tercera client-vpc
+## Retos
+
+### Reto 1 — Añadir una tercera client-vpc
 
 **Situación**: El equipo de desarrollo necesita una nueva VPC (`client-c`) para un proyecto piloto. Debe integrarse en la topología existente con las mismas restricciones: todo el tráfico pasa por inspection, y la salida a Internet se centraliza en egress.
 
@@ -607,13 +609,37 @@ Verás filas con `pktDst` apuntando a IPs públicas (resolvers DNS, `checkip.ama
 - Las rutas de retorno en egress son necesarias tanto en la tabla pública (para el NAT GW) como en cada tabla privada
 - La instancia de test debe fijar `private_ip = cidrhost(aws_subnet.client_c["private-1"].cidr_block, 10)` para que coincida con el `10.20.10.10` que se pinga desde client-a, igual que se hace con `test_client_a` y `test_client_b`
 
-La solución está en la [sección 5](#5-solucion-del-reto).
+### Reto 2 — Aislamiento entre clientes
+
+**Situación**: El equipo de cumplimiento requiere que las VPCs de clientes sean **completamente independientes** entre sí. Cada client debe poder acceder a Internet (via inspection → egress), pero **no** debe poder ver ni alcanzar el tráfico de otros clients. Un ping de client-a a client-b debe fallar.
+
+Actualmente, client-a puede hacer ping a client-b porque inspection-rt tiene las rutas propagadas de ambos clients. Cuando client-a envía tráfico a `10.19.x.x`, pasa por inspection, y inspection-rt sabe devolver el paquete a client-b.
+
+**Tu objetivo**:
+
+1. Eliminar las propagaciones de client-a y client-b en `inspection-rt` (quitar `client_a_to_inspection` y `client_b_to_inspection`)
+2. Mantener la ruta por defecto `0.0.0.0/0 → egress` en `inspection-rt` para que la salida a Internet siga funcionando
+3. Verificar que el ping de client-a a client-b **falla** (timeout)
+4. Verificar que el curl a Internet desde client-a **sigue funcionando**
+5. Comprobar en los Flow Logs de inspection que el tráfico ICMP entre clients aparece como REJECT
+
+**Pistas**:
+- Sin las rutas propagadas de clients en `inspection-rt`, cuando inspection reenvía el paquete al TGW, inspection-rt no tiene ruta a `10.19.0.0/16`. Solo tiene `0.0.0.0/0 → egress`, así que el paquete va a egress, que tampoco sabe llegar a client-b directamente → el paquete se descarta
+- Pero si eliminas las propagaciones, el tráfico de retorno de Internet (egress → inspection → client) también se pierde. Necesitas una solución alternativa
+- La clave es que `egress-rt` **sí** tiene las propagaciones de clients (para las rutas de retorno del NAT). El tráfico de retorno de Internet llega a egress y egress-rt sabe reenviarlo directamente a los clients
+- Por tanto, puedes cambiar el flujo de retorno: en vez de `egress → inspection → client`, el retorno va `egress → client` directamente (egress-rt tiene las rutas propagadas)
+- Solo el tráfico de **ida** pasa por inspection; el de retorno de Internet vuelve directo por egress-rt
 
 ---
 
-## 5. Solución del Reto
+## Soluciones
 
-### Paso 1: Nueva variable
+<details>
+<summary><strong>Solución al Reto 1 — Añadir una tercera client-vpc</strong></summary>
+
+### Solución al Reto 1 — Añadir una tercera client-vpc
+
+#### Paso 1: Nueva variable
 
 En `variables.tf`, añadir:
 
@@ -625,7 +651,7 @@ variable "client_c_cidr" {
 }
 ```
 
-### Paso 2: VPC, subredes y tabla de rutas
+#### Paso 2: VPC, subredes y tabla de rutas
 
 Añadir en `main.tf` la VPC con el mismo patrón que client-a y client-b:
 
@@ -677,7 +703,7 @@ resource "aws_route" "client_c_default" {
 }
 ```
 
-### Paso 3: TGW attachment y asociacion a client-rt
+#### Paso 3: TGW attachment y asociacion a client-rt
 
 ```hcl
 resource "aws_ec2_transit_gateway_vpc_attachment" "client_c" {
@@ -698,7 +724,7 @@ resource "aws_ec2_transit_gateway_route_table_association" "client_c" {
 }
 ```
 
-### Paso 4: Propagar rutas de retorno en inspection-rt y egress-rt
+#### Paso 4: Propagar rutas de retorno en inspection-rt y egress-rt
 
 ```hcl
 resource "aws_ec2_transit_gateway_route_table_propagation" "client_c_to_inspection" {
@@ -712,7 +738,7 @@ resource "aws_ec2_transit_gateway_route_table_propagation" "client_c_to_egress" 
 }
 ```
 
-### Paso 5: Rutas de retorno en egress
+#### Paso 5: Rutas de retorno en egress
 
 Añadir `client_c` al mapa de `egress_public_to_clients` y `egress_private_to_clients`, o crear rutas adicionales:
 
@@ -739,7 +765,7 @@ resource "aws_route" "egress_private_to_client_c" {
 }
 ```
 
-### Paso 6: Security Group e instancia de test en client-c
+#### Paso 6: Security Group e instancia de test en client-c
 
 > **Por qué este paso es imprescindible:** sin un host que escuche en `10.20.10.10`, el `ping` de la verificación se pierde aunque toda la red esté bien configurada — el plumbing TGW + rutas + propagaciones llega correctamente a la subred privada de client-c, pero allí no hay nadie que responda. Hay que crear (a) el Security Group de client-c con las reglas ICMP equivalentes a las de `test_client_a` / `test_client_b` y (b) la instancia EC2 de test fijando `private_ip = 10.20.10.10`.
 
@@ -811,7 +837,7 @@ output "test_instance_client_c_private_ip" {
 
 > **Nota sobre el SG de client-a:** los Security Groups de AWS son **stateful** — la respuesta ICMP de `test-client-c` vuelve automáticamente al `test-client-a` que originó la conexión, aunque el SG de client-a no incluya `var.client_c_cidr` en su lista de ingress. Por eso este paso solo crea el SG de client-c y no toca los existentes. Si quisieras que client-c **inicie** ping hacia client-a (dirección inversa), entonces sí tendrías que añadir `var.client_c_cidr` al ingress ICMP de `test_client_a` (y de `test_client_b` si aplica).
 
-### Paso 7: Verificar
+#### Paso 7: Verificar
 
 ```bash
 terraform plan
@@ -857,34 +883,12 @@ curl -s --max-time 5 https://checkip.amazonaws.com
 exit
 ```
 
----
+</details>
 
-## 6. Reto 2: Aislamiento entre clientes
+<details>
+<summary><strong>Solución al Reto 2 — Aislamiento entre clientes</strong></summary>
 
-**Situación**: El equipo de cumplimiento requiere que las VPCs de clientes sean **completamente independientes** entre sí. Cada client debe poder acceder a Internet (via inspection → egress), pero **no** debe poder ver ni alcanzar el tráfico de otros clients. Un ping de client-a a client-b debe fallar.
-
-Actualmente, client-a puede hacer ping a client-b porque inspection-rt tiene las rutas propagadas de ambos clients. Cuando client-a envía tráfico a `10.19.x.x`, pasa por inspection, y inspection-rt sabe devolver el paquete a client-b.
-
-**Tu objetivo**:
-
-1. Eliminar las propagaciones de client-a y client-b en `inspection-rt` (quitar `client_a_to_inspection` y `client_b_to_inspection`)
-2. Mantener la ruta por defecto `0.0.0.0/0 → egress` en `inspection-rt` para que la salida a Internet siga funcionando
-3. Verificar que el ping de client-a a client-b **falla** (timeout)
-4. Verificar que el curl a Internet desde client-a **sigue funcionando**
-5. Comprobar en los Flow Logs de inspection que el tráfico ICMP entre clients aparece como REJECT
-
-**Pistas**:
-- Sin las rutas propagadas de clients en `inspection-rt`, cuando inspection reenvía el paquete al TGW, inspection-rt no tiene ruta a `10.19.0.0/16`. Solo tiene `0.0.0.0/0 → egress`, así que el paquete va a egress, que tampoco sabe llegar a client-b directamente → el paquete se descarta
-- Pero si eliminas las propagaciones, el tráfico de retorno de Internet (egress → inspection → client) también se pierde. Necesitas una solución alternativa
-- La clave es que `egress-rt` **sí** tiene las propagaciones de clients (para las rutas de retorno del NAT). El tráfico de retorno de Internet llega a egress y egress-rt sabe reenviarlo directamente a los clients
-- Por tanto, puedes cambiar el flujo de retorno: en vez de `egress → inspection → client`, el retorno va `egress → client` directamente (egress-rt tiene las rutas propagadas)
-- Solo el tráfico de **ida** pasa por inspection; el de retorno de Internet vuelve directo por egress-rt
-
-La solución está en la [sección 7](#7-solucion-del-reto-2).
-
----
-
-## 7. Solución del Reto 2
+### Solución al Reto 2 — Aislamiento entre clientes
 
 Antes de tocar el código conviene visualizar lo que va a cambiar. Hay dos rutas (ida y vuelta) y dos escenarios (inter-VPC vs Internet). El objetivo es **bloquear el inter-VPC** sin romper la salida a Internet:
 
@@ -915,7 +919,7 @@ Dos puntos clave para entender por qué basta con el blackhole:
 1. **Las rutas blackhole `/16` ganan a `0.0.0.0/0 → egress`**: TGW evalúa por especificidad, así que el tráfico inter-VPC se descarta en `inspection-rt` antes de llegar a la ruta por defecto. El tráfico a Internet (cuyo destino *no* coincide con ningún `/16` blackhole) sí cae en `0.0.0.0/0 → egress`.
 2. **`egress-rt` mantiene las propagaciones**: el retorno de Internet (egress → client) usa `egress-rt`, no `inspection-rt`. El asimetría es intencional — solo *ida* a Internet pasa por inspection; el *retorno* va directo por egress.
 
-### Paso 1: Eliminar propagaciones de clients en inspection-rt
+#### Paso 1: Eliminar propagaciones de clients en inspection-rt
 
 Eliminar las propagaciones de **todos** los clients en `main.tf` (incluyendo client-c si completaste el Reto 1):
 
@@ -944,7 +948,7 @@ Eliminar las propagaciones de **todos** los clients en `main.tf` (incluyendo cli
 >
 > El resto de dependencias se mantienen: `egress_private_to_client_c` sigue siendo necesario para la salida a Internet desde client-c.
 
-### Paso 2: Añadir rutas blackhole en inspection-rt
+#### Paso 2: Añadir rutas blackhole en inspection-rt
 
 Sin las propagaciones, el tráfico inter-VPC caería en `0.0.0.0/0 → egress`, y como egress-rt tiene las rutas propagadas de los clients, el paquete llegaría igualmente al destino — saltándose la inspección en el camino de vuelta. Las rutas blackhole descartan explícitamente el tráfico hacia los CIDRs de los clients.
 
@@ -971,7 +975,7 @@ resource "aws_ec2_transit_gateway_route" "blackhole_clients" {
 
 Las rutas blackhole tienen mayor prioridad que la ruta por defecto `0.0.0.0/0 → egress` porque son más específicas (`/16` vs `/0`). El tráfico hacia cualquier CIDR de client se descarta antes de llegar a la ruta por defecto. Al usar `for_each` sobre una lista, añadir un nuevo client al aislamiento es tan simple como agregar su CIDR a `var.client_cidrs`.
 
-### Paso 3: Verificar el plan
+#### Paso 3: Verificar el plan
 
 ```bash
 terraform plan
@@ -981,7 +985,7 @@ terraform plan
 terraform apply
 ```
 
-### Paso 4: Verificar aislamiento
+#### Paso 4: Verificar aislamiento
 
 ```bash
 INSTANCE_A=$(terraform output -raw test_instance_client_a_id)
@@ -1001,7 +1005,7 @@ curl -s --max-time 5 https://checkip.amazonaws.com
 exit
 ```
 
-### Paso 5: Verificar el contenido de `inspection-rt`
+#### Paso 5: Verificar el contenido de `inspection-rt`
 
 **Objetivo:** confirmar a nivel del TGW que el cambio se aplicó correctamente — es decir, que la tabla `inspection-rt` tiene exactamente lo que esperamos:
 
@@ -1082,7 +1086,7 @@ aws ec2 get-transit-gateway-route-table-propagations \
 
 Si aún aparece algún attachment de tipo `vpc` (los de `client-a/b/c`), es que el Paso 1 se quedó a medias y el `apply` no destruyó el recurso `aws_ec2_transit_gateway_route_table_propagation.client_*_to_inspection`.
 
-### Paso 6: Verificar el blackhole en TGW Flow Logs
+#### Paso 6: Verificar el blackhole en TGW Flow Logs
 
 Los TGW Flow Logs (sección 1.7) registran el plano del Transit Gateway, no el de las VPC, así que **sí capturan los paquetes descartados por rutas `blackhole`** — al contrario que los VPC Flow Logs, que solo ven tráfico que atraviesa ENI reales.
 
@@ -1161,9 +1165,11 @@ Las rutas blackhole (`/16`) tienen mayor especificidad que la ruta por defecto (
 
 > **Nota:** En producción, AWS Network Firewall en la inspection-vpc sería el encargado de aplicar políticas de acceso entre VPCs de forma granular, permitiendo algunos flujos y bloqueando otros según reglas de negocio.
 
+</details>
+
 ---
 
-## 8. Limpieza
+## Limpieza
 
 ```bash
 terraform destroy

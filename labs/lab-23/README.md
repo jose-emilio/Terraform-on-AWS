@@ -80,7 +80,7 @@ lab-23/
         └── safe-network/
 ```
 
-## 1. Análisis del código
+## Análisis del código
 
 ### 1.1 Arquitectura del laboratorio
 
@@ -360,7 +360,7 @@ El Root Module es limpio y declarativo: define **qué** quiere (una red segura, 
 
 ---
 
-## 2. Despliegue
+## Despliegue
 
 ```bash
 cd labs/lab-23/aws
@@ -408,7 +408,7 @@ Nota que la contraseña **no aparece** en los outputs gracias a `sensitive = tru
 
 ---
 
-## 3. Verificación final
+## Verificación final
 
 ### 3.1 Probar que las validaciones rechazan valores inválidos
 
@@ -502,7 +502,9 @@ terraform plan \
 
 ---
 
-## 4. Reto: Precondicion que valide el puerto segun el motor
+## Retos
+
+### Reto 1 — Precondición que valide el puerto según el motor
 
 **Situación**: El equipo de DBA ha reportado errores de conexión porque los desarrolladores configuran motores de base de datos con puertos incorrectos (por ejemplo, MySQL en el puerto 5432 de PostgreSQL). Quieren que el módulo `db-config` rechace configuraciones donde el puerto no coincida con el motor.
 
@@ -521,13 +523,33 @@ terraform plan \
 - El `error_message` puede interpolar variables para ser más descriptivo
 - Recuerda que `precondition` se evalúa **antes** de crear/actualizar el recurso
 
-La solución está en la [sección 5](#5-solución-del-reto).
+### Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados
+
+**Situación**: El equipo de plataforma quiere crear varios buckets corporativos de una sola vez usando el módulo `validated-bucket`, cada uno con su propia configuración. En lugar de duplicar bloques `module`, quieren definir todos los buckets en una sola variable de tipo `map(object)` y usar `for_each` sobre el módulo.
+
+**Tu objetivo**:
+
+1. Añadir una variable `extra_buckets` de tipo `map(object({...}))` en el Root Module con campos: `purpose` (string) y `force_destroy` (optional, bool, default true)
+2. Añadir una `validation` que verifique que **todas** las claves del mapa comienzan con el prefijo `empresa-` (ya que serán los nombres de los buckets)
+3. Invocar el módulo `validated-bucket` con `for_each` sobre la variable, pasando cada clave como `bucket_name`
+4. Probar con un mapa de 2 buckets: `empresa-logs-<ACCOUNT_ID>` y `empresa-backups-<ACCOUNT_ID>`
+
+**Pistas**:
+- `alltrue()` combinada con `[for k, v in var.extra_buckets : can(regex("^empresa-", k))]` valida todas las claves
+- `for_each = var.extra_buckets` en el bloque `module` itera sobre el mapa
+- `each.key` es el nombre del bucket, `each.value` es el objeto con la configuración
+- El módulo ya tiene su propia validación de regex, así que la del Root Module es una capa adicional
 
 ---
 
-## 5. Solución del Reto
+## Soluciones
 
-### Paso 1: Precondición en el recurso del módulo
+<details>
+<summary><strong>Solución al Reto 1 — Precondición que valide el puerto según el motor</strong></summary>
+
+### Solución al Reto 1 — Precondición que valide el puerto según el motor
+
+#### Paso 1: Precondición en el recurso del módulo
 
 En `modules/db-config/main.tf`:
 
@@ -560,7 +582,7 @@ resource "aws_ssm_parameter" "db_port" {
 
 > **Alternativa más concisa:** la versión con un mapa `local` es más mantenible que un `if/else` encadenado. Para añadir un nuevo motor (`oracle = 1521`, `mssql = 1433`), basta con extender el mapa — no hay que tocar la condición. La validación con `contains([...], engine)` ya cubrió en `variables.tf` que `engine` esté en la lista permitida, así que el lookup `local.default_db_ports[engine]` es seguro.
 
-### Paso 2: Probar configuración incoherente
+#### Paso 2: Probar configuración incoherente
 
 ```bash
 terraform plan \
@@ -572,7 +594,7 @@ terraform plan \
 #   Usa 3306 para mysql/mariadb o 5432 para postgres.
 ```
 
-### Paso 3: Probar configuración correcta
+#### Paso 3: Probar configuración correcta
 
 ```bash
 terraform apply \
@@ -582,7 +604,7 @@ terraform apply \
 # Apply complete! Resources: ... added
 ```
 
-### Reflexión: ¿validation, precondition o postcondition?
+#### Reflexión: ¿validation, precondition o postcondition?
 
 | Escenario | Mecanismo | Razón |
 |---|---|---|
@@ -594,30 +616,14 @@ terraform apply \
 
 ---
 
-## 6. Reto 2: Variable de tipo `map(object)` para múltiples buckets validados
+</details>
 
-**Situación**: El equipo de plataforma quiere crear varios buckets corporativos de una sola vez usando el módulo `validated-bucket`, cada uno con su propia configuración. En lugar de duplicar bloques `module`, quieren definir todos los buckets en una sola variable de tipo `map(object)` y usar `for_each` sobre el módulo.
+<details>
+<summary><strong>Solución al Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados</strong></summary>
 
-**Tu objetivo**:
+### Solución al Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados
 
-1. Añadir una variable `extra_buckets` de tipo `map(object({...}))` en el Root Module con campos: `purpose` (string) y `force_destroy` (optional, bool, default true)
-2. Añadir una `validation` que verifique que **todas** las claves del mapa comienzan con el prefijo `empresa-` (ya que serán los nombres de los buckets)
-3. Invocar el módulo `validated-bucket` con `for_each` sobre la variable, pasando cada clave como `bucket_name`
-4. Probar con un mapa de 2 buckets: `empresa-logs-<ACCOUNT_ID>` y `empresa-backups-<ACCOUNT_ID>`
-
-**Pistas**:
-- `alltrue()` combinada con `[for k, v in var.extra_buckets : can(regex("^empresa-", k))]` valida todas las claves
-- `for_each = var.extra_buckets` en el bloque `module` itera sobre el mapa
-- `each.key` es el nombre del bucket, `each.value` es el objeto con la configuración
-- El módulo ya tiene su propia validación de regex, así que la del Root Module es una capa adicional
-
-La solución está en la [sección 7](#7-solución-del-reto-2).
-
----
-
-## 7. Solución del Reto 2
-
-### Paso 1: Variable con validación en el Root Module (`variables.tf`)
+#### Paso 1: Variable con validación en el Root Module (`variables.tf`)
 
 ```hcl
 variable "extra_buckets" {
@@ -638,7 +644,7 @@ variable "extra_buckets" {
 
 `alltrue()` evalúa una lista de booleanos y devuelve `true` solo si **todos** son `true`. La comprensión `[for k, _ in var.extra_buckets : ...]` itera sobre las claves del mapa.
 
-### Paso 2: Módulo con `for_each` en el Root Module (`main.tf`)
+#### Paso 2: Módulo con `for_each` en el Root Module (`main.tf`)
 
 ```hcl
 module "extra_buckets" {
@@ -654,7 +660,7 @@ module "extra_buckets" {
 }
 ```
 
-### Paso 3: Output en el Root Module (`outputs.tf`)
+#### Paso 3: Output en el Root Module (`outputs.tf`)
 
 ```hcl
 output "extra_bucket_ids" {
@@ -663,7 +669,7 @@ output "extra_bucket_ids" {
 }
 ```
 
-### Paso 4: Invocar con 2 buckets
+#### Paso 4: Invocar con 2 buckets
 
 `-var` interpreta su valor como **HCL**, no como JSON. La sintaxis correcta para un `map(object)` con claves dinámicas (que contienen `${ACCOUNT_ID}`) es más legible si se pasa por archivo `.tfvars` o se construye con `printf`:
 
@@ -698,7 +704,7 @@ terraform apply \
 
 > **Nota:** la sintaxis HCL para mapas usa `=` (no `:`), claves entre comillas dobles y valores object con `{ campo = "valor" }`. No mezclar con sintaxis JSON (`":"`) — Terraform rechazará el `-var` con un error de parseo.
 
-### Paso 5: Verificar
+#### Paso 5: Verificar
 
 ```bash
 # Listar todos los buckets empresa-
@@ -724,9 +730,11 @@ En esta solución, la validación ocurre en dos niveles:
 - La validación del módulo es más estricta (regex completa) y protege contra invocaciones desde otros Root Modules
 - En producción, el módulo puede publicarse en un registry y ser usado por equipos que **no** tienen la validación del Root Module
 
+</details>
+
 ---
 
-## 8. Limpieza
+## Limpieza
 
 ```bash
 terraform destroy \
@@ -738,7 +746,7 @@ terraform destroy \
 
 ---
 
-## 9. LocalStack
+## LocalStack
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 

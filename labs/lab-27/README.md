@@ -142,7 +142,7 @@ La plantilla `user_data.tftpl` vive en la raiz de `lab27/` y es compartida por a
 
 ---
 
-## 1. Despliegue en AWS Real
+## Despliegue en AWS Real
 
 ### 1.1 Codigo Terraform
 
@@ -501,7 +501,38 @@ Confirma que las variables `${env}`, `${app_name}` y `${db_endpoint}` fueron sus
 
 ---
 
-## 2. Reto: Restricción de AMI por Entorno
+## Verificación final
+
+```bash
+# Obtener la IP pública de la instancia
+PUBLIC_IP=$(terraform output -raw public_ip)
+
+# Probar el servidor web
+curl -s "http://${PUBLIC_IP}"
+
+# Verificar que IMDSv2 está activo (requiere token)
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=lab27" \
+  --query 'Reservations[*].Instances[*].MetadataOptions.HttpTokens' \
+  --output text
+# Esperado: required
+
+# Verificar el IAM Instance Profile asignado
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=lab27" \
+  --query 'Reservations[*].Instances[*].IamInstanceProfile.Arn' \
+  --output text
+
+# Conectarse via SSM (sin SSH ni claves)
+INSTANCE_ID=$(terraform output -raw instance_id)
+aws ssm start-session --target "${INSTANCE_ID}"
+```
+
+---
+
+## Retos
+
+### Reto 1 — Restricción de AMI por Entorno
 
 El equipo de seguridad exige que en producción solo se usen AMIs con un nombre que contenga la palabra `minimal` (imágenes sin paquetes innecesarios), mientras que en desarrollo se permite cualquier AMI de Amazon Linux 2023.
 
@@ -515,21 +546,50 @@ El equipo de seguridad exige que en producción solo se usen AMIs con un nombre 
 
 4. Verifica que `terraform plan -var='env=prod'` falla si el filtro no contiene `minimal`, y que `terraform plan -var='env=prod' -var='ami_name_filter=al2023-ami-minimal-2023.*-arm64'` funciona correctamente.
 
-### Criterios de Éxito
+**Criterios de Éxito**
 
 - En `dev`, el plan funciona con el filtro por defecto sin cambios.
 - En `prod`, el plan falla con un mensaje de error claro si el filtro no contiene `minimal`.
 - El data source `aws_ami` usa la variable en lugar de un valor fijo.
 
-[Ver solución →](#6-solucion-del-reto-restriccion-de-ami)
+### Reto 2 — Política IAM de Mínimo Privilegio para S3
+
+El rol IAM actual solo tiene la política `AmazonSSMManagedInstanceCore`. El equipo necesita que la instancia pueda leer objetos de un bucket S3 específico (p. ej. para descargar configuraciones), pero **sin** otorgar acceso a todos los buckets de la cuenta.
+
+**Tu objetivo:**
+
+1. Añade una variable `config_bucket_name` de tipo `string` con valor por defecto `"corp-lab27-config"`.
+
+2. Crea un `data "aws_iam_policy_document"` que otorgue permisos `s3:GetObject` y `s3:ListBucket` **únicamente** sobre el bucket `var.config_bucket_name` y sus objetos.
+
+3. Crea un recurso `aws_iam_policy` con el documento generado y asócialo al rol existente con `aws_iam_role_policy_attachment`.
+
+4. Añade un output `s3_policy_arn` que exponga el ARN de la política creada.
+
+5. Verifica con `terraform plan` que se crean 2 recursos nuevos (la política y el attachment) sin modificar los existentes.
+
+**Pistas**
+
+- El ARN de un bucket S3 es `arn:aws:s3:::nombre-del-bucket` y el de sus objetos `arn:aws:s3:::nombre-del-bucket/*`.
+- `s3:ListBucket` se aplica al bucket; `s3:GetObject` se aplica a los objetos (`/*`).
+- Usa dos bloques `statement` separados en el policy document, uno para cada nivel de recurso.
+
+**Criterios de Éxito**
+
+- El plan muestra exactamente `2 to add` (la policy y el attachment).
+- Los recursos existentes (rol, instance profile, instancia) no se modifican.
+- La política solo permite `s3:GetObject` y `s3:ListBucket` sobre el bucket especificado, no sobre `*`.
 
 ---
 
-## 3. Solución del Reto: Restricción de AMI
+## Soluciones
 
-> Intenta resolver el reto antes de leer esta sección.
+<details>
+<summary><strong>Solución al Reto 1 — Restricción de AMI por Entorno</strong></summary>
 
-### Paso 1 — Añadir la variable `ami_name_filter` en `variables.tf`
+### Solución al Reto 1 — Restricción de AMI por Entorno
+
+#### Paso 1 — Añadir la variable `ami_name_filter` en `variables.tf`
 
 ```hcl
 variable "ami_name_filter" {
@@ -539,7 +599,7 @@ variable "ami_name_filter" {
 }
 ```
 
-### Paso 2 — Añadir la validación cruzada
+#### Paso 2 — Añadir la validación cruzada
 
 Terraform no permite validaciones que referencien otras variables dentro de un bloque `variable`. La alternativa es usar un bloque `check` o una `locals` con `validation` mediante un recurso `null_resource` o un `precondition`. La forma más limpia en Terraform 1.5+ es un bloque `check`:
 
@@ -567,7 +627,7 @@ data "aws_ami" "al2023" {
 }
 ```
 
-### Paso 3 — Actualizar el data source
+#### Paso 3 — Actualizar el data source
 
 Sustituye el valor fijo del filtro `name` por la variable:
 
@@ -593,7 +653,7 @@ data "aws_ami" "al2023" {
 }
 ```
 
-### Verificación
+#### Verificación
 
 ```bash
 # Dev: funciona con el filtro por defecto
@@ -607,45 +667,14 @@ terraform plan -var='env=prod'
 terraform plan -var='env=prod' -var='ami_name_filter=al2023-ami-minimal-2023.*-arm64'
 ```
 
----
+</details>
 
-## 4. Reto Adicional: Política IAM de Mínimo Privilegio para S3
+<details>
+<summary><strong>Solución al Reto 2 — Política IAM de Mínimo Privilegio para S3</strong></summary>
 
-El rol IAM actual solo tiene la política `AmazonSSMManagedInstanceCore`. El equipo necesita que la instancia pueda leer objetos de un bucket S3 específico (p. ej. para descargar configuraciones), pero **sin** otorgar acceso a todos los buckets de la cuenta.
+### Solución al Reto 2 — Política IAM de Mínimo Privilegio para S3
 
-**Tu objetivo:**
-
-1. Añade una variable `config_bucket_name` de tipo `string` con valor por defecto `"corp-lab27-config"`.
-
-2. Crea un `data "aws_iam_policy_document"` que otorgue permisos `s3:GetObject` y `s3:ListBucket` **únicamente** sobre el bucket `var.config_bucket_name` y sus objetos.
-
-3. Crea un recurso `aws_iam_policy` con el documento generado y asócialo al rol existente con `aws_iam_role_policy_attachment`.
-
-4. Añade un output `s3_policy_arn` que exponga el ARN de la política creada.
-
-5. Verifica con `terraform plan` que se crean 2 recursos nuevos (la política y el attachment) sin modificar los existentes.
-
-### Pistas
-
-- El ARN de un bucket S3 es `arn:aws:s3:::nombre-del-bucket` y el de sus objetos `arn:aws:s3:::nombre-del-bucket/*`.
-- `s3:ListBucket` se aplica al bucket; `s3:GetObject` se aplica a los objetos (`/*`).
-- Usa dos bloques `statement` separados en el policy document, uno para cada nivel de recurso.
-
-### Criterios de Éxito
-
-- El plan muestra exactamente `2 to add` (la policy y el attachment).
-- Los recursos existentes (rol, instance profile, instancia) no se modifican.
-- La política solo permite `s3:GetObject` y `s3:ListBucket` sobre el bucket especificado, no sobre `*`.
-
-[Ver solución →](#8-solucion-del-reto-adicional-politica-s3)
-
----
-
-## 5. Solución del Reto Adicional: Política S3
-
-> Intenta resolver el reto antes de leer esta sección.
-
-### Paso 1 — Variable en `variables.tf`
+#### Paso 1 — Variable en `variables.tf`
 
 ```hcl
 variable "config_bucket_name" {
@@ -655,7 +684,7 @@ variable "config_bucket_name" {
 }
 ```
 
-### Paso 2 — Policy document y recursos en `main.tf`
+#### Paso 2 — Policy document y recursos en `main.tf`
 
 ```hcl
 data "aws_iam_policy_document" "s3_read" {
@@ -688,7 +717,7 @@ resource "aws_iam_role_policy_attachment" "s3_read" {
 }
 ```
 
-### Paso 3 — Output en `outputs.tf`
+#### Paso 3 — Output en `outputs.tf`
 
 ```hcl
 output "s3_policy_arn" {
@@ -711,38 +740,11 @@ aws iam list-attached-role-policies --role-name corp-lab27-ec2-role
 
 La política resultante solo permite lectura sobre el bucket específico. A diferencia de usar la política gestionada `AmazonS3ReadOnlyAccess` (que da acceso a todos los buckets), esta política sigue el principio de mínimo privilegio.
 
----
-
-## Verificación final
-
-```bash
-# Obtener la IP pública de la instancia
-PUBLIC_IP=$(terraform output -raw public_ip)
-
-# Probar el servidor web
-curl -s "http://${PUBLIC_IP}"
-
-# Verificar que IMDSv2 está activo (requiere token)
-aws ec2 describe-instances \
-  --filters "Name=tag:Project,Values=lab27" \
-  --query 'Reservations[*].Instances[*].MetadataOptions.HttpTokens' \
-  --output text
-# Esperado: required
-
-# Verificar el IAM Instance Profile asignado
-aws ec2 describe-instances \
-  --filters "Name=tag:Project,Values=lab27" \
-  --query 'Reservations[*].Instances[*].IamInstanceProfile.Arn' \
-  --output text
-
-# Conectarse via SSM (sin SSH ni claves)
-INSTANCE_ID=$(terraform output -raw instance_id)
-aws ssm start-session --target "${INSTANCE_ID}"
-```
+</details>
 
 ---
 
-## 6. Limpieza
+## Limpieza
 
 Desde el directorio `lab27/aws/`:
 
@@ -752,7 +754,7 @@ terraform destroy
 
 ---
 
-## 7. LocalStack
+## LocalStack
 
 Este laboratorio puede ejecutarse integramente en LocalStack para validar la sintaxis y la estructura de los recursos. Consulta [localstack/README.md](localstack/README.md) para las instrucciones de despliegue local.
 
@@ -760,7 +762,7 @@ Este laboratorio puede ejecutarse integramente en LocalStack para validar la sin
 
 ---
 
-## 8. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|

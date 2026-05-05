@@ -72,7 +72,7 @@ lab-25/
     └── README.md                              <- Limitaciones de testing en LocalStack
 ```
 
-## 1. Análisis del código
+## Análisis del código
 
 ### 1.1 Arquitectura del laboratorio
 
@@ -299,7 +299,7 @@ El Reto 1 (sección 4) lo aplica para verificar que la validación de `environme
 
 ---
 
-## 2. Ejecución de los tests
+## Ejecución de los tests
 
 ### 2.1 Inicializar (sin backend)
 
@@ -364,7 +364,7 @@ Muestra los detalles del plan/apply de cada `run`, incluyendo los outputs y los 
 
 ---
 
-## 3. Análisis estático
+## Análisis estático
 
 El análisis estático complementa los tests de Terraform escaneando el código HCL en busca de vulnerabilidades **sin ejecutar nada**.
 
@@ -489,7 +489,9 @@ Ejecutar en este orden permite detectar problemas lo antes posible ("shift left"
 
 ---
 
-## 4. Reto: Test unitario que verifica que las validaciones rechazan inputs invalidos
+## Retos
+
+### Reto 1 — Test unitario que verifica que las validaciones rechazan inputs inválidos
 
 **Situación**: El módulo `tagged-bucket` tiene validaciones en `bucket_name` y `environment`. Quieres escribir un test que verifique que Terraform **rechaza** valores inválidos, sin necesidad de conectarse a AWS.
 
@@ -506,13 +508,32 @@ Ejecutar en este orden permite detectar problemas lo antes posible ("shift left"
 - `command = plan` es suficiente — las validaciones se evalúan antes de contactar con AWS
 - El nombre del bucket se genera en el Root Module como `${project}-${suffix}-${account_id}`, pero la validación está en el módulo
 
-La solución está en la [sección 5](#5-solución-del-reto).
+### Reto 2 — Test de integración que verifica el bloqueo de acceso público
+
+**Situación**: El módulo `tagged-bucket` incluye un `aws_s3_bucket_public_access_block`. Quieres verificar con un test de integración que el bucket realmente tiene bloqueado el acceso público en AWS, no solo en el código.
+
+**Tu objetivo**:
+
+1. Añadir un output `public_access_block` al módulo `tagged-bucket` que exponga los 4 atributos del bloqueo de acceso público
+2. Propagar ese output a través del Root Module
+3. Crear un nuevo archivo `tests/integration_security.tftest.hcl`
+4. Usar `command = apply` para crear el bucket real y verificar con `assert` que las cuatro opciones de bloqueo están en `true`
+
+**Pistas**:
+- El output puede ser un objeto con los 4 campos: `block_public_acls`, `block_public_policy`, `ignore_public_acls`, `restrict_public_buckets`
+- Accede a los atributos del recurso: `aws_s3_bucket_public_access_block.this.block_public_acls`
+- En el test, referencia con `output.public_access_block["block_public_acls"]`
 
 ---
 
-## 5. Solución del Reto
+## Soluciones
 
-### Archivo `tests/unit_validations.tftest.hcl`
+<details>
+<summary><strong>Solución al Reto 1 — Test unitario que verifica que las validaciones rechazan inputs inválidos</strong></summary>
+
+### Solución al Reto 1 — Test unitario que verifica que las validaciones rechazan inputs inválidos
+
+#### Archivo `tests/unit_validations.tftest.hcl`
 
 ```hcl
 mock_provider "aws" {
@@ -558,7 +579,7 @@ run "accepts_valid_environment" {
 }
 ```
 
-### Verificar
+#### Verificar
 
 ```bash
 terraform test -filter=tests/unit_validations.tftest.hcl
@@ -576,7 +597,7 @@ Success! 2 passed, 0 failed.
 
 El test `rejects_invalid_environment` **pasa** porque `expect_failures = [var.environment]` le dice a Terraform: "espero que esta variable falle su validación". Si la validación NO fallara (es decir, si aceptara `"invalid"`), **el test fallaría** — alertándonos de que la validación está rota.
 
-### Reflexión: testear el camino satisfactorio y el fallido
+#### Reflexión: testear el camino satisfactorio y el fallido
 
 | Tipo de test | Qué verifica | Sin `expect_failures` |
 |---|---|---|
@@ -589,29 +610,14 @@ Ambos son necesarios:
 
 ---
 
-## 6. Reto 2: Test de integración que verifica el bloqueo de acceso público
+</details>
 
-**Situación**: El módulo `tagged-bucket` incluye un `aws_s3_bucket_public_access_block`. Quieres verificar con un test de integración que el bucket realmente tiene bloqueado el acceso público en AWS, no solo en el código.
+<details>
+<summary><strong>Solución al Reto 2 — Test de integración que verifica el bloqueo de acceso público</strong></summary>
 
-**Tu objetivo**:
+### Solución al Reto 2 — Test de integración que verifica el bloqueo de acceso público
 
-1. Añadir un output `public_access_block` al módulo `tagged-bucket` que exponga los 4 atributos del bloqueo de acceso público
-2. Propagar ese output a través del Root Module
-3. Crear un nuevo archivo `tests/integration_security.tftest.hcl`
-4. Usar `command = apply` para crear el bucket real y verificar con `assert` que las cuatro opciones de bloqueo están en `true`
-
-**Pistas**:
-- El output puede ser un objeto con los 4 campos: `block_public_acls`, `block_public_policy`, `ignore_public_acls`, `restrict_public_buckets`
-- Accede a los atributos del recurso: `aws_s3_bucket_public_access_block.this.block_public_acls`
-- En el test, referencia con `output.public_access_block["block_public_acls"]`
-
-La solución está en la [sección 7](#7-solución-del-reto-2).
-
----
-
-## 7. Solución del Reto 2
-
-### Paso 1: Añadir output al módulo `tagged-bucket`
+#### Paso 1: Añadir output al módulo `tagged-bucket`
 
 En `modules/tagged-bucket/outputs.tf` — añadir el bloque sin tocar los outputs existentes:
 
@@ -629,7 +635,7 @@ output "public_access_block" {
 
 > **Cambio retro-compatible:** este Paso solo **añade** un output nuevo, no modifica ni elimina los existentes (`bucket_id`, `bucket_arn`, `effective_tags`). Los consumidores del módulo que ya usan los outputs anteriores no se ven afectados, así que se puede mergear sin ciclo de migración.
 
-### Paso 2: Propagar en el Root Module
+#### Paso 2: Propagar en el Root Module
 
 En `outputs.tf`:
 
@@ -640,7 +646,7 @@ output "public_access_block" {
 }
 ```
 
-### Paso 3: Archivo de test
+#### Paso 3: Archivo de test
 
 ```hcl
 # tests/integration_security.tftest.hcl
@@ -681,7 +687,7 @@ run "deploy_and_verify_public_access" {
 }
 ```
 
-### Paso 4: Verificar
+#### Paso 4: Verificar
 
 ```bash
 terraform test -filter=tests/integration_security.tftest.hcl
@@ -696,7 +702,7 @@ tests/integration_security.tftest.hcl... pass
 Success! 1 passed, 0 failed.
 ```
 
-### Reflexión: outputs como contrato testeable
+#### Reflexión: outputs como contrato testeable
 
 En vez de usar un data source auxiliar para consultar el estado real, exponemos los atributos de seguridad como **outputs del módulo**. Esto tiene ventajas:
 
@@ -705,9 +711,11 @@ En vez de usar un data source auxiliar para consultar el estado real, exponemos 
 - **Reutilizable**: cualquier consumidor del módulo puede verificar programáticamente que el bloqueo está activo
 - **Funciona con mock**: el output también está disponible en tests unitarios con `mock_provider`
 
+</details>
+
 ---
 
-## 8. Resumen de comandos
+## Resumen de comandos
 
 ```bash
 # Ejecutar los tests unitarios (sin AWS)
@@ -732,7 +740,7 @@ trivy config modules/tagged-bucket/
 
 ---
 
-## 9. Limpieza
+## Limpieza
 
 `terraform test` destruye automáticamente los recursos que crea. **No necesitas hacer limpieza manual** de los tests.
 
@@ -746,7 +754,7 @@ terraform destroy
 
 ---
 
-## 10. LocalStack
+## LocalStack
 
 Los tests unitarios con `mock_provider` **no necesitan LocalStack ni AWS** — funcionan en cualquier entorno.
 

@@ -53,7 +53,7 @@ lab-21/
     └── localstack.s3.tfbackend  <- Backend completo para LocalStack
 ```
 
-## 1. Análisis del código
+## Análisis del código
 
 ### 1.1 Arquitectura del laboratorio
 
@@ -172,7 +172,7 @@ Ambas opciones deben estar habilitadas para que Route 53 Private Hosted Zones fu
 
 ---
 
-## 2. Despliegue
+## Despliegue
 
 ```bash
 cd labs/lab-21/aws
@@ -200,7 +200,7 @@ terraform output
 
 ---
 
-## 3. Verificación final
+## Verificación final
 
 ### 3.1 Zona Hospedada Privada
 
@@ -288,7 +288,9 @@ Esto confirma que la zona es **estrictamente privada** — los nombres solo exis
 
 ---
 
-## 4. Reto: Ampliar la zona con nuevos registros y comparar tipos
+## Retos
+
+### Reto 1 — Ampliar la zona con nuevos registros y comparar tipos
 
 **Situación**: El equipo de desarrollo necesita registros DNS internos adicionales para sus microservicios. Quieren entender las diferencias prácticas entre registros A, CNAME y Alias dentro de la zona privada.
 
@@ -300,18 +302,40 @@ Esto confirma que la zona es **estrictamente privada** — los nombres solo exis
    - `web.app.internal` (Alias → ALB): resuelve directo a IP en una consulta
    - `api.app.internal` (A → IP fija): resuelve directo a IP en una consulta
    - `api-lb.app.internal` (CNAME → ALB DNS): resuelve en dos pasos (CNAME + resolución del target)
+
 **Pistas**:
 - No puedes tener un CNAME y un A para el mismo nombre — usa nombres diferentes (`api` vs `api-lb`)
 - `dig +short` muestra solo la respuesta, `dig` completo muestra la sección ANSWER con el tipo de registro
 - Un CNAME en el apex del dominio (`app.internal`) no está permitido — solo se puede en subdominios
 
-La solución está en la [sección 5](#5-solucion-del-reto).
+### Reto 2 — Delegación de subdominio a otra zona privada
+
+**Situación**: El equipo de base de datos quiere gestionar sus propios registros DNS bajo `db.app.internal` de forma independiente, sin depender del equipo de plataforma que administra la zona `app.internal`. Necesitan una zona privada delegada donde puedan crear registros como `primary.db.app.internal` y `replica.db.app.internal` autónomamente.
+
+**Tu objetivo**:
+
+1. Crear una segunda Zona Hospedada Privada para el subdominio `db.app.internal`, asociada a la misma VPC
+2. Eliminar el registro A `db.app.internal` de la zona padre (no puede coexistir un A y un NS para el mismo nombre)
+3. En la zona padre (`app.internal`), crear un registro NS que delegue `db.app.internal` a los nameservers de la zona hija
+4. Crear registros A en la zona hija: `primary.db.app.internal` → IP privada de la instancia db, y `replica.db.app.internal` → otra IP (puede ser ficticia como `10.17.10.20`)
+5. Verificar desde la instancia de test que `primary.db.app.internal` y `replica.db.app.internal` resuelven correctamente con `dig`, y que `db.app.internal` ya no resuelve (el registro A fue eliminado y la delegación NS solo aplica a subdominios)
+
+**Pistas**:
+- La zona hija tiene sus propios nameservers (atributo `name_servers` del recurso `aws_route53_zone`)
+- El registro NS en la zona padre debe apuntar a esos nameservers exactos
+- Ambas zonas deben estar asociadas a la misma VPC
+- La delegación permite que cada equipo gestione su subdominio con permisos IAM independientes
 
 ---
 
-## 5. Solución del Reto
+## Soluciones
 
-### Paso 1: Registro A directo
+<details>
+<summary><strong>Solución al Reto 1 — Ampliar la zona con nuevos registros y comparar tipos</strong></summary>
+
+### Solución al Reto 1 — Ampliar la zona con nuevos registros y comparar tipos
+
+#### Paso 1: Registro A directo
 
 ```hcl
 resource "aws_route53_record" "api" {
@@ -323,7 +347,7 @@ resource "aws_route53_record" "api" {
 }
 ```
 
-### Paso 2: Registro CNAME hacia el ALB
+#### Paso 2: Registro CNAME hacia el ALB
 
 ```hcl
 resource "aws_route53_record" "api_lb" {
@@ -335,7 +359,7 @@ resource "aws_route53_record" "api_lb" {
 }
 ```
 
-### Paso 3: Comparar los tres tipos desde la instancia de test
+#### Paso 3: Comparar los tres tipos desde la instancia de test
 
 ```bash
 aws ssm start-session --target $(terraform output -raw test_instance_id)
@@ -376,33 +400,14 @@ exit
 
 La diferencia clave: el CNAME requiere **resolver dos nombres** (el alias y luego el target), aunque el resolutor moderno de Route 53 normalmente devuelve ambos registros en una sola consulta para ahorrar latencia. El registro **Alias** no necesita ese paso intermedio porque Route 53 sabe que el target es un recurso AWS y devuelve directamente la(s) IP(s) en la respuesta. Además, el CNAME **expone el nombre DNS del ALB** al cliente, mientras que el Alias lo oculta — útil si quieres cambiar de ALB sin tocar a los consumidores.
 
----
+</details>
 
-## 6. Reto 2: Delegación de subdominio a otra zona privada
+<details>
+<summary><strong>Solución al Reto 2 — Delegación de subdominio a otra zona privada</strong></summary>
 
-**Situación**: El equipo de base de datos quiere gestionar sus propios registros DNS bajo `db.app.internal` de forma independiente, sin depender del equipo de plataforma que administra la zona `app.internal`. Necesitan una zona privada delegada donde puedan crear registros como `primary.db.app.internal` y `replica.db.app.internal` autónomamente.
+### Solución al Reto 2 — Delegación de subdominio a otra zona privada
 
-**Tu objetivo**:
-
-1. Crear una segunda Zona Hospedada Privada para el subdominio `db.app.internal`, asociada a la misma VPC
-2. Eliminar el registro A `db.app.internal` de la zona padre (no puede coexistir un A y un NS para el mismo nombre)
-3. En la zona padre (`app.internal`), crear un registro NS que delegue `db.app.internal` a los nameservers de la zona hija
-4. Crear registros A en la zona hija: `primary.db.app.internal` → IP privada de la instancia db, y `replica.db.app.internal` → otra IP (puede ser ficticia como `10.17.10.20`)
-5. Verificar desde la instancia de test que `primary.db.app.internal` y `replica.db.app.internal` resuelven correctamente con `dig`, y que `db.app.internal` ya no resuelve (el registro A fue eliminado y la delegación NS solo aplica a subdominios)
-
-**Pistas**:
-- La zona hija tiene sus propios nameservers (atributo `name_servers` del recurso `aws_route53_zone`)
-- El registro NS en la zona padre debe apuntar a esos nameservers exactos
-- Ambas zonas deben estar asociadas a la misma VPC
-- La delegación permite que cada equipo gestione su subdominio con permisos IAM independientes
-
-La solución está en la [sección 7](#7-solucion-del-reto-2).
-
----
-
-## 7. Solución del Reto 2
-
-### Paso 1: Zona hija para db.app.internal
+#### Paso 1: Zona hija para db.app.internal
 
 ```hcl
 resource "aws_route53_zone" "db" {
@@ -418,7 +423,7 @@ resource "aws_route53_zone" "db" {
 }
 ```
 
-### Paso 2: Eliminar el registro A de db.app.internal en la zona padre
+#### Paso 2: Eliminar el registro A de db.app.internal en la zona padre
 
 El registro A `db.app.internal` creado en el laboratorio base entra en conflicto con la delegación — no puede existir un registro A y un NS para el mismo nombre. Eliminar o comentar el recurso `aws_route53_record.db` de `main.tf`:
 
@@ -442,7 +447,7 @@ El registro A `db.app.internal` creado en el laboratorio base entra en conflicto
 > }
 > ```
 
-### Paso 3: Registro NS en la zona padre (delegación)
+#### Paso 3: Registro NS en la zona padre (delegación)
 
 ```hcl
 resource "aws_route53_record" "db_delegation" {
@@ -456,7 +461,7 @@ resource "aws_route53_record" "db_delegation" {
 
 Este registro le dice al resolutor DNS de la VPC: "para cualquier consulta bajo `db.app.internal`, pregunta a los nameservers de la zona hija".
 
-### Paso 4: Registros en la zona hija
+#### Paso 4: Registros en la zona hija
 
 ```hcl
 resource "aws_route53_record" "db_primary" {
@@ -476,7 +481,7 @@ resource "aws_route53_record" "db_replica" {
 }
 ```
 
-### Paso 5: Verificar
+#### Paso 5: Verificar
 
 ```bash
 terraform apply
@@ -519,9 +524,11 @@ exit
 
 La delegación permite que cada equipo gestione su subdominio con políticas IAM independientes, reduciendo el riesgo de que un equipo modifique registros de otro.
 
+</details>
+
 ---
 
-## 8. Limpieza
+## Limpieza
 
 ```bash
 terraform destroy
@@ -531,7 +538,7 @@ terraform destroy
 
 ---
 
-## 9. LocalStack
+## LocalStack
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 

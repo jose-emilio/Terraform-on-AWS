@@ -80,7 +80,7 @@ lab-26/
     └── README.md                                      <- Notas sobre LocalStack
 ```
 
-## 1. Análisis del código
+## Análisis del código
 
 ### 1.1 Arquitectura del laboratorio
 
@@ -264,7 +264,7 @@ source = "git::https://github.com/<org>/terraform-aws-secure-bucket.git"
 
 ---
 
-## 2. Despliegue
+## Despliegue
 
 ### 2.1 Instalar herramientas
 
@@ -440,7 +440,7 @@ terraform destroy
 
 ---
 
-## 3. Verificación final
+## Verificación final
 
 ### 3.1 Verificar terraform-docs
 
@@ -605,7 +605,9 @@ git checkout -- main.tf
 
 ---
 
-## 4. Reto: Crear un CHANGELOG y simular un release con breaking change
+## Retos
+
+### Reto 1 — Crear un CHANGELOG y simular un release con breaking change
 
 **Situación**: Has publicado `v1.0.0` del módulo en el sandbox (sección 3.3). Ahora, como mantenedor del módulo, necesitas añadir una nueva funcionalidad (variable `expiration_days`) y luego hacer un breaking change (renombrar `bucket_name` a `name`). Quieres seguir el flujo correcto de versionado semántico.
 
@@ -627,17 +629,39 @@ git checkout -- main.tf
 - El `moved {}` en variables no existe — el renombrado de variable requiere que el consumidor cambie su código (por eso es MAJOR)
 - `git tag -a v1.1.0 -m "feat: add expiration_days"` crea un tag anotado
 
-La solución está en la [sección 5](#5-solución-del-reto).
+### Reto 2 — Automatizar la validación de ejemplos con `terraform test`
+
+**Situación**: Los ejemplos en `/examples` son documentación viva, pero nadie verifica que sigan funcionando cuando el módulo cambia. Quieres crear un test que valide automáticamente ambos ejemplos.
+
+> **Dónde se hace este reto:** igual que el Reto 1, **dentro del sandbox** (`/tmp/secure-bucket-sandbox`). Los tests son un artefacto del repo del módulo: validan su contrato y viajan con él en cada release. Mantenerlos en el sandbox conserva el "rol de mantenedor" iniciado en el Reto 1.
+
+**Tu objetivo**:
+
+1. Crear un directorio `tests/` dentro del módulo (en el sandbox)
+2. Crear un test `examples_basic.tftest.hcl` que use `module { source = "./examples/basic" }` para ejecutar el ejemplo básico
+3. Crear un test `examples_advanced.tftest.hcl` que ejecute el ejemplo avanzado
+4. Verificar que ambos pasan con `terraform test`
+
+**Pistas**:
+- El `run` puede usar `module { source = "./examples/basic" }` para ejecutar un ejemplo como si fuera un módulo
+- Los outputs del ejemplo están disponibles como `output.<name>` dentro del `run`
+- Usa `command = apply` para crear los recursos reales (se destruyen automáticamente)
+- Los ejemplos ya tienen `force_destroy = true` para facilitar la limpieza
 
 ---
 
-## 5. Solución del Reto
+## Soluciones
+
+<details>
+<summary><strong>Solución al Reto 1 — Crear un CHANGELOG y simular un release con breaking change</strong></summary>
+
+### Solución al Reto 1 — Crear un CHANGELOG y simular un release con breaking change
 
 > Todos los pasos del 1 al 5 se ejecutan **dentro del sandbox** (`cd /tmp/secure-bucket-sandbox`). Solo el paso 6 (migración del consumer) toca el repo del curso.
 
-### Paso 1: Crear CHANGELOG.md
+#### Paso 1: Crear CHANGELOG.md
 
-Asegúrate de estar en el sandbox:
+
 
 ```bash
 cd /tmp/secure-bucket-sandbox
@@ -683,7 +707,7 @@ Este proyecto usa [Versionado Semántico](https://semver.org/lang/es/).
 - Documentación automatizada con terraform-docs.
 ```
 
-### Paso 2: Añadir `expiration_days` (v1.1.0)
+#### Paso 2: Añadir `expiration_days` (v1.1.0)
 
 En `modules/secure-bucket/variables.tf`:
 
@@ -713,7 +737,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
 }
 ```
 
-### Paso 3: Tag v1.1.0
+#### Paso 3: Tag v1.1.0
 
 Sigues en el sandbox. El primer `git commit` casi seguro fallará en `terraform_docs` porque la nueva variable `expiration_days` aún no aparece en el bloque auto-generado del `README.md`. Es el flujo normal "intento 1 falla → re-staging → intento 2 pasa":
 
@@ -750,7 +774,7 @@ git tag -a v1.1.0 -m "feat: add expiration_days variable (optional, default 0)"
 
 > **Nota:** este patrón "fallo → re-add → re-commit" se repite cada vez que un cambio en `.tf` impacta a la documentación generada. En el Paso 5 (rename de variable) ocurrirá lo mismo.
 
-### Paso 4: Renombrar `bucket_name` → `name` (v2.0.0)
+#### Paso 4: Renombrar `bucket_name` → `name` (v2.0.0)
 
 En `modules/secure-bucket/variables.tf`, renombrar la variable **y actualizar la referencia en la validación**:
 
@@ -814,7 +838,7 @@ grep -rn "bucket_name" modules/secure-bucket/ || echo "OK: ninguna referencia en
 >
 > **Nota 2:** El `consumer/main.tf` del repo del curso **todavía** usa `bucket_name = ...`, y eso es correcto en este momento — su `?ref` apunta a `v1.0.0`/`v1.1.0`, donde la variable aún se llama así. La migración del consumer al nuevo tag se hace en el Paso 6.
 
-### Paso 5: Tag v2.0.0
+#### Paso 5: Tag v2.0.0
 
 Sigues en el sandbox. Igual que en el Paso 3, el primer commit fallará en `terraform_docs` (la tabla del README aún tiene `bucket_name`, hay que regenerarla con `name`):
 
@@ -843,7 +867,7 @@ git tag -l "v*"
 git log --oneline --decorate
 ```
 
-### Paso 6: Migrar el consumer al nuevo tag (repo del curso)
+#### Paso 6: Migrar el consumer al nuevo tag (repo del curso)
 
 Hasta aquí todo era trabajo del **mantenedor del módulo** en el sandbox. Ahora cambia el sombrero al **equipo consumidor**: ellos ven `v2.0.0` publicado, leen el `CHANGELOG.md` que dice "BREAKING: rename `bucket_name` → `name`" y aplican la migración en su código.
 
@@ -899,32 +923,12 @@ git checkout -- main.tf
 
 Regla simple: **si el consumidor tiene que cambiar su código, es MAJOR**.
 
----
+</details>
 
-## 6. Reto 2: Automatizar la validación de ejemplos con `terraform test`
+<details>
+<summary><strong>Solución al Reto 2 — Automatizar la validación de ejemplos con `terraform test`</strong></summary>
 
-**Situación**: Los ejemplos en `/examples` son documentación viva, pero nadie verifica que sigan funcionando cuando el módulo cambia. Quieres crear un test que valide automáticamente ambos ejemplos.
-
-> **Dónde se hace este reto:** igual que el Reto 1, **dentro del sandbox** (`/tmp/secure-bucket-sandbox`). Los tests son un artefacto del repo del módulo: validan su contrato y viajan con él en cada release. Mantenerlos en el sandbox conserva el "rol de mantenedor" iniciado en el Reto 1.
-
-**Tu objetivo**:
-
-1. Crear un directorio `tests/` dentro del módulo (en el sandbox)
-2. Crear un test `examples_basic.tftest.hcl` que use `module { source = "./examples/basic" }` para ejecutar el ejemplo básico
-3. Crear un test `examples_advanced.tftest.hcl` que ejecute el ejemplo avanzado
-4. Verificar que ambos pasan con `terraform test`
-
-**Pistas**:
-- El `run` puede usar `module { source = "./examples/basic" }` para ejecutar un ejemplo como si fuera un módulo
-- Los outputs del ejemplo están disponibles como `output.<name>` dentro del `run`
-- Usa `command = apply` para crear los recursos reales (se destruyen automáticamente)
-- Los ejemplos ya tienen `force_destroy = true` para facilitar la limpieza
-
-La solución está en la [sección 7](#7-solución-del-reto-2).
-
----
-
-## 7. Solución del Reto 2
+### Solución al Reto 2 — Automatizar la validación de ejemplos con `terraform test`
 
 > Todos los pasos se ejecutan **dentro del sandbox**:
 >
@@ -932,7 +936,7 @@ La solución está en la [sección 7](#7-solución-del-reto-2).
 > cd /tmp/secure-bucket-sandbox
 > ```
 
-### Paso 1: Crear los archivos de test
+#### Paso 1: Crear los archivos de test
 
 En `modules/secure-bucket/tests/examples_basic.tftest.hcl`:
 
@@ -987,7 +991,7 @@ run "advanced_example_works" {
 }
 ```
 
-### Paso 2: Ejecutar
+#### Paso 2: Ejecutar
 
 `terraform test` se invoca **desde la raíz del módulo** (donde están los `.tf` y la carpeta `examples/`). El `init` descarga los providers necesarios para los ejemplos:
 
@@ -1014,7 +1018,7 @@ tests/examples_basic.tftest.hcl... pass
 Success! 2 passed, 0 failed.
 ```
 
-### Paso 3: Integrar `terraform test` en el pipeline de pre-commit
+#### Paso 3: Integrar `terraform test` en el pipeline de pre-commit
 
 `pre-commit-terraform` no incluye un hook `terraform_test` ya hecho. Para engancharlo, se añade un **hook local** al `.pre-commit-config.yaml` del sandbox.
 
@@ -1079,9 +1083,11 @@ git push
 
 Cada ejemplo cubierto por un test es una garantía menos de que un consumidor va a encontrarse con un módulo roto.
 
+</details>
+
 ---
 
-## 8. Limpieza
+## Limpieza
 
 Si desplegaste los ejemplos manualmente:
 
@@ -1108,7 +1114,7 @@ rm -rf /tmp/secure-bucket-sandbox
 
 ---
 
-## 9. LocalStack
+## LocalStack
 
 Los ejemplos `basic` y `advanced` funcionan con LocalStack (S3 está completamente soportado en Community). Los hooks de pre-commit y terraform-docs no necesitan ningún proveedor.
 

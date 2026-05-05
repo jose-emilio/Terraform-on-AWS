@@ -79,7 +79,7 @@ lab-24/
     └── README.md                            <- Explicación (RDS no disponible)
 ```
 
-## 1. Análisis del código
+## Análisis del código
 
 ### 1.1 Arquitectura del laboratorio
 
@@ -265,7 +265,7 @@ Todo lo demás (VPC, subredes, security groups, cifrado, protección, subnet gro
 
 ---
 
-## 2. Despliegue
+## Despliegue
 
 ```bash
 cd labs/lab-24/aws
@@ -299,7 +299,7 @@ terraform output
 
 ---
 
-## 3. Verificación final
+## Verificación final
 
 ### 3.1 Verificar la VPC y subredes
 
@@ -374,7 +374,9 @@ La contraseña fue generada automáticamente por RDS — ningún humano la eligi
 
 ---
 
-## 4. Reto: Refactorizacion con `moved {}` — Renombrar sin destruir
+## Retos
+
+### Reto 1 — Refactorización con `moved {}` — Renombrar sin destruir
 
 **Situación**: El equipo de arquitectura ha decidido renombrar el módulo interno `module.vpc` a `module.network` dentro del wrapper para alinearse con la nomenclatura del resto de módulos corporativos. El cambio debe ser transparente: **la VPC existente no se destruye ni se recrea**.
 
@@ -391,13 +393,34 @@ La contraseña fue generada automáticamente por RDS — ningún humano la eligi
 - `terraform plan` debe mostrar algo como: `module.vpc has moved to module.network`
 - Si ves recursos marcados para destruir y recrear, algo está mal en las referencias
 
-La solución está en la [sección 5](#5-solución-del-reto).
+### Reto 2 — Añadir parameter group con estándares de seguridad
+
+**Situación**: El equipo de seguridad requiere que todas las bases de datos MySQL tengan habilitado `require_secure_transport` (forzar conexiones SSL) y `log_bin_trust_function_creators` desactivado. Estos parámetros deben estar hardcoded en el wrapper, igual que el cifrado y la protección contra borrado.
+
+**Tu objetivo**:
+
+1. Crear un `aws_db_parameter_group` dentro del wrapper con los parámetros de seguridad
+2. Pasar el parameter group al módulo RDS usando `parameter_group_name`
+3. Desactivar la creación del parameter group interno del módulo RDS (`create_db_parameter_group = false`)
+4. Verificar con AWS CLI que los parámetros están aplicados
+
+**Pistas**:
+- El `family` del parameter group para MySQL 8.0 es `"mysql8.0"`
+- `require_secure_transport = "1"` fuerza SSL
+- `log_bin_trust_function_creators = "0"` desactiva la creación de funciones inseguras
+- El módulo RDS acepta `parameter_group_name` como input y `create_db_parameter_group = false` para no crear uno interno
+- Después de aplicar, verifica con: `aws rds describe-db-parameters --db-parameter-group-name <name> --query 'Parameters[?ParameterName==\`require_secure_transport\`]'`
 
 ---
 
-## 5. Solución del Reto
+## Soluciones
 
-### Paso 1: Renombrar el módulo y añadir `moved {}`
+<details>
+<summary><strong>Solución al Reto 1 — Refactorización con `moved {}`</strong></summary>
+
+### Solución al Reto 1 — Refactorización con `moved {}`
+
+#### Paso 1: Renombrar el módulo y añadir `moved {}`
 
 En `modules/corporate-rds/main.tf`:
 
@@ -419,7 +442,7 @@ module "network" {                           # Antes: module "vpc"
 }
 ```
 
-### Paso 2: Actualizar todas las referencias en `main.tf`
+#### Paso 2: Actualizar todas las referencias en `main.tf`
 
 En `modules/corporate-rds/main.tf` hay **4 referencias** a `module.vpc.*` que hay que cambiar a `module.network.*`. Antes de empezar, lista las que tienes para no dejar ninguna olvidada:
 
@@ -478,7 +501,7 @@ grep -nE "module\.vpc\." modules/corporate-rds/main.tf
 
 > **Nota:** las referencias a `aws_security_group.rds.id`, `var.db_*`, `local.*` y `data.aws_availability_zones` **no cambian** — solo se renombra el módulo VPC, no los demás recursos.
 
-### Paso 3: Actualizar los outputs en `outputs.tf`
+#### Paso 3: Actualizar los outputs en `outputs.tf`
 
 En `modules/corporate-rds/outputs.tf` hay **5 referencias** más a `module.vpc.*` que también hay que migrar (los outputs `db_*` apuntan a `module.rds`, no a la VPC, y NO se tocan):
 
@@ -522,7 +545,7 @@ grep -rnE "module\.vpc\." modules/corporate-rds/
 # (sin salida = las 9 referencias totales migradas: 4 en main.tf + 5 en outputs.tf)
 ```
 
-### Paso 4: Re-ejecutar `terraform init`
+#### Paso 4: Re-ejecutar `terraform init`
 
 Al renombrar un módulo que usa `source` del Registry, Terraform **necesita re-registrar el módulo con su nuevo nombre local**: el código fuente descargado del Registry se cachea en `.terraform/modules/<nombre-local>/`, así que el path cambia de `.terraform/modules/vpc/` a `.terraform/modules/network/`. Si saltas este paso, el siguiente `plan` falla inmediatamente con:
 
@@ -544,7 +567,7 @@ terraform init \
 
 > **`init` es obligatorio aquí.** El cambio que hiciste en Paso 1 (renombrar `module "vpc"` → `module "network"`) toca la **interfaz de carga de módulos**, no solo el código. Sin `init` el plan ni siquiera arranca; con `init` Terraform descarga (o más bien, copia desde la caché) el módulo bajo el nuevo nombre y queda listo para evaluar el `moved {}`.
 
-### Paso 5: Verificar el `moved {}` con `plan`
+#### Paso 5: Verificar el `moved {}` con `plan`
 
 Ahora sí, comprueba que el rename se traduce en un `moved` y no en una destrucción:
 
@@ -602,7 +625,7 @@ Plan: 0 to add, 0 to change, 0 to destroy.
 >
 > Tras corregir lo que aplique, **vuelve a ejecutar `terraform plan`**. Solo cuando veas `has moved to` (no `destroyed`/`created`) está seguro continuar al apply.
 
-### Paso 6: Aplicar y eliminar el bloque `moved {}` después
+#### Paso 6: Aplicar y eliminar el bloque `moved {}` después
 
 Una vez que el `plan` muestra solo `has moved to` sin cambios reales, ejecuta el `apply` para que Terraform **persista las nuevas direcciones en el state**:
 
@@ -653,33 +676,14 @@ terraform plan
 3. Es **reproducible** — funciona en todos los entornos (dev, staging, prod)
 4. Es **seguro** — `terraform plan` muestra el resultado antes de aplicar
 
----
+</details>
 
-## 6. Reto 2: Añadir parameter group con estándares de seguridad
+<details>
+<summary><strong>Solución al Reto 2 — Añadir parameter group con estándares de seguridad</strong></summary>
 
-**Situación**: El equipo de seguridad requiere que todas las bases de datos MySQL tengan habilitado `require_secure_transport` (forzar conexiones SSL) y `log_bin_trust_function_creators` desactivado. Estos parámetros deben estar hardcoded en el wrapper, igual que el cifrado y la protección contra borrado.
+### Solución al Reto 2 — Añadir parameter group con estándares de seguridad
 
-**Tu objetivo**:
-
-1. Crear un `aws_db_parameter_group` dentro del wrapper con los parámetros de seguridad
-2. Pasar el parameter group al módulo RDS usando `parameter_group_name`
-3. Desactivar la creación del parameter group interno del módulo RDS (`create_db_parameter_group = false`)
-4. Verificar con AWS CLI que los parámetros están aplicados
-
-**Pistas**:
-- El `family` del parameter group para MySQL 8.0 es `"mysql8.0"`
-- `require_secure_transport = "1"` fuerza SSL
-- `log_bin_trust_function_creators = "0"` desactiva la creación de funciones inseguras
-- El módulo RDS acepta `parameter_group_name` como input y `create_db_parameter_group = false` para no crear uno interno
-- Después de aplicar, verifica con: `aws rds describe-db-parameters --db-parameter-group-name <name> --query 'Parameters[?ParameterName==\`require_secure_transport\`]'`
-
-La solución está en la [sección 7](#7-solución-del-reto-2).
-
----
-
-## 7. Solución del Reto 2
-
-### Paso 1: Parameter group en el wrapper
+#### Paso 1: Parameter group en el wrapper
 
 En `modules/corporate-rds/main.tf`, añadir antes del módulo RDS:
 
@@ -719,7 +723,7 @@ resource "aws_db_parameter_group" "corporate" {
 }
 ```
 
-### Paso 2: Pasar al módulo RDS
+#### Paso 2: Pasar al módulo RDS
 
 ```hcl
 module "rds" {
@@ -733,7 +737,7 @@ module "rds" {
 }
 ```
 
-### Paso 3: Verificar
+#### Paso 3: Verificar
 
 ```bash
 terraform apply
@@ -757,7 +761,7 @@ aws rds describe-db-parameters \
 # log_bin_trust_function_creators = 0
 ```
 
-### Reflexión: capas de seguridad en el wrapper
+#### Reflexión: capas de seguridad en el wrapper
 
 Después de los dos retos, el wrapper corporativo impone 6 estándares de seguridad:
 
@@ -772,9 +776,11 @@ Después de los dos retos, el wrapper corporativo impone 6 estándares de seguri
 
 Ninguno de estos puede ser desactivado por los equipos de producto. Si necesitan una excepción, deben solicitarla al equipo de plataforma, que puede crear una variante del wrapper o añadir un flag controlado.
 
+</details>
+
 ---
 
-## 8. Limpieza
+## Limpieza
 
 El wrapper tiene **`deletion_protection = true`** hardcoded ([`modules/corporate-rds/main.tf`](aws/modules/corporate-rds/main.tf), bloque `module "rds"`). Si intentas `terraform destroy` directamente, AWS rechaza la operación con `Cannot delete protected DB instance`. Es **intencional** — borrar una base de datos requiere un paso deliberado, no un `terraform destroy` accidental.
 
@@ -816,7 +822,7 @@ Si después de destruir vas a volver a desplegar el lab (o reutilizar el wrapper
 
 ---
 
-## 9. LocalStack
+## LocalStack
 
 RDS **no está disponible** en LocalStack Community Edition. Este laboratorio requiere una cuenta de AWS real.
 
