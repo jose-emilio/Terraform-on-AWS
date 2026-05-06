@@ -72,10 +72,6 @@ lab-20/
 
 ![Hub-and-Spoke con TGW: 4 VPCs (clients, inspection, egress) + 3 route tables + RAM share](arch/diagrama.svg)
 
-> Fuente editable: [`diagrama.drawio`](diagrama.drawio) — abrir con la extensión
-> [Draw.io Integration](https://marketplace.visualstudio.com/items?itemName=hediet.vscode-drawio)
-> de VS Code o en [app.diagrams.net](https://app.diagrams.net).
-
 Cuatro VPCs conectadas al TGW. El tráfico se segmenta mediante **tres tablas de rutas del TGW** que fuerzan todo el tráfico a pasar por inspection antes de llegar a su destino o a Internet.
 
 **Flujo de tráfico resumido:**

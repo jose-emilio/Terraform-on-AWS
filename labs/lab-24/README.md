@@ -83,38 +83,7 @@ lab-24/
 
 ### 1.1 Arquitectura del laboratorio
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Root Module                                  │
-│                                                                      │
-│  module "corporate_rds" {                                            │
-│    source       = "./modules/corporate-rds"                          │
-│    db_engine    = "mysql"                                            │
-│    db_name      = "appdb"                                            │
-│    ...                                                               │
-│  }                                                                   │
-└──────────────────────────────┬───────────────────────────────────────┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                    modules/corporate-rds/ (Wrapper)                  │
-│                                                                      │
-│  ┌────────────────────────────┐   ┌──────────────────────────────┐   │
-│  │ module "vpc"               │   │ module "rds"                 │   │
-│  │ terraform-aws-modules/vpc  │──►│ terraform-aws-modules/rds    │   │
-│  │                            │   │                              │   │
-│  │ vpc_id ─────────────────┐  │   │ storage_encrypted = true ⬅   │   │
-│  │ database_subnet_group   │  │   │deletion_protection = true⬅   │   │
-│  │ private_subnets_cidr    │  │   │ publicly_accessible = false⬅ │   │
-│  └─────────────────────────┤──┘   └──────────────────────────────┘   │
-│                            │                                         │
-│  ┌─────────────────────────▼──┐   ⬅ = Hardcoded (no overridable)     │
-│  │ aws_security_group "rds"   │                                      │
-│  │ Ingress: solo desde        │                                      │
-│  │ subredes privadas          │                                      │
-│  └────────────────────────────┘                                      │
-└──────────────────────────────────────────────────────────────────────┘
-```
+![Wrapper corporate-rds que compone los módulos públicos VPC y RDS del Registry con compliance hardcoded](arch/diagrama.svg)
 
 El wrapper contiene tres componentes:
 1. **Módulo público VPC**: crea la red completa (VPC, subredes, NAT Gateway, route tables)

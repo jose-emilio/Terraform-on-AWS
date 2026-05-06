@@ -75,6 +75,15 @@ lab-22/
             └── outputs.tf
 ```
 
+## Arquitectura
+
+![Comparación lado a lado: enfoque monolítico (recursos hardcoded) vs módulo s3-bucket reutilizable invocado N veces](arch/diagrama.svg)
+
+El diagrama contrasta los dos enfoques que estudiamos en este lab:
+
+- **Izquierda (antes):** dos `aws_s3_bucket` declarados inline en el root, con tags inconsistentes (`Env` vs `Environment`), sin `lifecycle.prevent_destroy`, sin `aws_s3_bucket_public_access_block` y sin versionado. Cada bucket nuevo obliga a duplicar y editar el bloque entero.
+- **Derecha (después):** un único módulo `s3-bucket` (tríada `main.tf` + `variables.tf` + `outputs.tf`) con valores por defecto seguros (`enable_versioning = true`, `force_destroy = false`, `prevent_destroy`, public access block). El root invoca el módulo dos veces con parámetros distintos para `logs_bucket` y `data_bucket`. Cambios al módulo se propagan automáticamente a todas las invocaciones.
+
 ## Análisis del código
 
 ### 1.1 El problema: enfoque monolítico

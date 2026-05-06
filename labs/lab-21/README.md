@@ -57,28 +57,7 @@ lab-21/
 
 ### 1.1 Arquitectura del laboratorio
 
-```
-                    VPC (10.17.0.0/16)
-                    ┌─────────────────────────────────────┐
-                    │                                     │
-                    │   Route 53 Private Hosted Zone      │
-                    │   app.internal                      │
-                    │   ┌────────────────────────────┐    │
-                    │   │ web.app.internal → ALB     │    │
-                    │   │ db.app.internal  → 10.17.x │    │
-                    │   └────────────────────────────┘    │
-                    │                                     │
-                    │   ┌──────────┐    ┌──────────┐      │
-                    │   │ EC2 web  │    │ EC2 test │      │
-                    │   │ (httpd)  │    │ (nslookup│      │
-                    │   └────┬─────┘    │  dig)    │      │
-                    │        │          └──────────┘      │
-                    │        │                            │
-                    │   ┌────▼─────┐                      │
-                    │   │   ALB    │                      │
-                    │   └──────────┘                      │
-                    └─────────────────────────────────────┘
-```
+![Route 53 Private Hosted Zone + ALB + EC2 db/test, demostrando que la zona NO resuelve desde Internet](arch/diagrama.svg)
 
 Una VPC con:
 - Una **Zona Hospedada Privada** `app.internal` asociada a la VPC
