@@ -545,6 +545,77 @@ LocalStack emula VPC Peering a nivel de API pero no ejecuta tráfico real. El ob
 
 ---
 
+## Optimización opcional — Centralizar los endpoints SSM en vpc-app
+
+> **Nota:** esta optimización **no está integrada en el lab por razones
+> pedagógicas** (el foco es peering y la no transitividad; añadir Route 53
+> Private Hosted Zones diluiría el mensaje). Se documenta aquí como referencia
+> para entornos de producción.
+
+El lab despliega 6 VPC Interface Endpoints (3 servicios SSM × 2 VPCs sin
+Internet, en 2 AZs cada uno) con un coste de ~86,40 USD/mes. En producción es
+habitual **centralizar los endpoints en una única VPC "shared services"** y
+compartirlos vía peering, lo que reduce el coste a la mitad y simplifica la
+gestión.
+
+### Por qué no funciona "directo"
+
+Los Interface Endpoints tienen `private_dns_enabled = true`, que hace que
+*dentro de su VPC* el dominio `ssm.us-east-1.amazonaws.com` resuelva a la IP
+privada de la ENI. **Esa anulación de DNS es por VPC** y no se propaga por
+peering: si vpc-db hace `dig ssm.us-east-1.amazonaws.com`, recibe la IP
+*pública* del servicio AWS e intenta salir a Internet (que no tiene). El flag
+`allow_remote_vpc_dns_resolution = true` del peering tampoco lo arregla — solo
+afecta a DNS internos del par (hostnames de instancias, RDS, etc.), no al
+override del private DNS de los Interface Endpoints.
+
+### Patrón canónico (4 piezas)
+
+1. **3 Interface Endpoints solo en vpc-app**, con `private_dns_enabled = false`.
+2. **3 Route 53 Private Hosted Zones** (`ssm.us-east-1.amazonaws.com`,
+   `ssmmessages.us-east-1.amazonaws.com`, `ec2messages.us-east-1.amazonaws.com`),
+   cada una con un registro A *alias* hacia el DNS regional del endpoint
+   correspondiente.
+3. **Asociar las 3 PHZ a las 3 VPCs** (`aws_route53_zone_association` para
+   vpc-db y vpc-c; vpc-app entra por defecto al crearse la zona).
+4. **SG del endpoint** que permite HTTPS (443) desde los 3 CIDRs
+   (`var.app_cidr`, `var.db_cidr`, `var.c_cidr`).
+
+Flujo desde vpc-db:
+
+```
+dig ssm.us-east-1.amazonaws.com
+  → PHZ asociada a vpc-db → IP privada del endpoint en vpc-app (10.15.x.y)
+
+TCP 443 a 10.15.x.y
+  → ruta 10.15.0.0/16 → peering app-db → endpoint en vpc-app → AWS SSM
+```
+
+### Comparativa de coste
+
+| | Setup actual | Centralizado con PHZ |
+|---|---:|---:|
+| Endpoints (3 servicios × 2 AZs × 0.01 USD/h × 720 h) | 6 × 2 × 7,20 = **86,40 USD/mes** | 3 × 2 × 7,20 = **43,20 USD/mes** |
+| Route 53 PHZ ($0,50/zona-mes) | $0 | 3 × $0,50 = **1,50 USD/mes** |
+| **Total** | **86,40 USD/mes** | **44,70 USD/mes** |
+
+Ahorro: ~48 % (~42 USD/mes). A escala (más VPCs spoke), el ahorro se
+multiplica linealmente porque solo crece el número de asociaciones PHZ —
+no el número de endpoints.
+
+### Por qué se documenta pero no se aplica al lab
+
+- El lab tiene un objetivo pedagógico claro: **demostrar la no transitividad
+  del peering**. Centralizar endpoints añade Route 53 PHZ + asociaciones
+  + SG con múltiples CIDRs, conceptos que merecen un lab propio.
+- El patrón de endpoints duplicados también es válido en producción cuando
+  cada VPC pertenece a un dominio de seguridad distinto y no se quiere
+  exponer la VPC central al tráfico de los spokes.
+- Como ejercicio personal, el alumno motivado puede convertir esta nota en
+  un refactor — todo el código necesario está listado arriba.
+
+---
+
 ## Buenas prácticas aplicadas
 
 - **CIDR no solapantes entre VPCs**: el VPC Peering no funciona si los bloques CIDR de las VPCs se solapan. Planificar el espacio de direccionamiento desde el principio evita tener que redesplegar toda la infraestructura de red.
