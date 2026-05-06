@@ -1,4 +1,4 @@
-# Laboratorio 9 — LocalStack: Gestión de Entornos con Workspaces
+# Laboratorio 09 — LocalStack: Gestión de Entornos con Workspaces
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
@@ -16,7 +16,7 @@ Al finalizar este laboratorio serás capaz de:
 - Entender la diferencia entre `check` (informativo) y `precondition` (obligatorio)
 - Usar archivos `.tfvars` por entorno para separar la configuración de las variables
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado
 - Laboratorio 01 completado (entorno configurado)
@@ -111,7 +111,7 @@ resource "aws_vpc" "main" {
 ## Estructura del Laboratorio
 
 ```
-lab09/
+lab-09/
 ├── aws/
 │   ├── providers.tf      # Requiere Terraform >= 1.10
 │   ├── variables.tf      # region, is_prod
@@ -162,7 +162,7 @@ localstack status
 El flujo es idéntico a la sección AWS real:
 
 ```bash
-# Desde lab09/localstack/
+# Desde lab-09/localstack/
 terraform fmt
 terraform init -backend-config=localstack.s3.tfbackend
 

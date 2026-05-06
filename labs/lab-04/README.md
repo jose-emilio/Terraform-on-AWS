@@ -1,4 +1,4 @@
-# Laboratorio 4 — Orquestación de Identidades y Gestión de Ciclo de Vida
+# Laboratorio 04 — Orquestación de Identidades y Gestión de Ciclo de Vida
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -20,7 +20,7 @@ Al finalizar este laboratorio serás capaz de:
 - Aplicar `lifecycle { create_before_destroy = true }` para actualizaciones sin downtime
 - Construir outputs de auditoría con expresiones `for`
 
-## Requisitos Previos
+## Requisitos previos
 
 - Laboratorio 01 completado (entorno configurado)
 - Laboratorio 02 completado (flujo básico de Terraform)

@@ -10,5 +10,5 @@ terraform {
 
 # El provider lee las credenciales del perfil "default" de ~/.aws/credentials
 provider "aws" {
-  region = "us-east-1"
+  region = var.region
 }

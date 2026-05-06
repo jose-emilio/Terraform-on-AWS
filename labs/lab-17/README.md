@@ -32,7 +32,7 @@ Configurar la conectividad de salida a Internet priorizando la **alta disponibil
 
 > **Regla FinOps:** Usa NAT Gateway × 3 en producción (alta disponibilidad sin mantenimiento), Instancia NAT × 3 en dev/sandbox (ahorro ~62%), y **siempre** VPC Endpoints para servicios de AWS de alto volumen (S3, DynamoDB).
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

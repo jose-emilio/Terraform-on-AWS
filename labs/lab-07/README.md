@@ -1,4 +1,4 @@
-# Laboratorio 7 — Backend Remoto Profesional en AWS
+# Laboratorio 07 — Backend Remoto Profesional en AWS
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -21,8 +21,9 @@ Al finalizar este laboratorio serás capaz de:
 - Ejecutar `terraform init` para migrar un estado local existente al backend remoto
 - Entender por qué el state locking es crítico en entornos de equipo
 
-## Requisitos Previos
+## Requisitos previos
 
+- **Terraform >= 1.10** instalado
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 
 ---

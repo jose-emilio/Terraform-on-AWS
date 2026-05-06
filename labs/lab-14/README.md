@@ -25,7 +25,7 @@ introduzca en ningún momento.
 
 ## Requisitos previos
 
-- Terraform ≥ 1.5 instalado.
+- **Terraform >= 1.10** instalado.
 - AWS CLI configurado con perfil `default`.
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 

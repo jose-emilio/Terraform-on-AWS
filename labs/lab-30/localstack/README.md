@@ -5,7 +5,7 @@
 
 Este documento describe cómo ejecutar el laboratorio 30 contra LocalStack. El código Terraform de `localstack/` es equivalente al de `aws/` con las adaptaciones necesarias para los servicios disponibles en LocalStack Community.
 
-## Requisitos Previos
+## Requisitos previos
 
 - LocalStack en ejecución: `localstack start -d`
 - Terraform >= 1.10

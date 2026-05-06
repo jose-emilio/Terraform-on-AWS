@@ -20,7 +20,7 @@ Al finalizar este laboratorio serás capaz de:
 - Implementar un script de bootstrap dinámico usando `templatefile()` para inyectar variables de Terraform en el `user_data` de la instancia
 - Crear Security Groups granulares usando los recursos individuales de reglas
 
-## Requisitos Previos
+## Requisitos previos
 
 - Laboratorio 01 completado (entorno configurado)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

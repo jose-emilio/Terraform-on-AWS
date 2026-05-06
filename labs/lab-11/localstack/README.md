@@ -5,7 +5,7 @@
 
 Esta guía adapta el lab11 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia reside en cómo se simula el drift y cómo se accede al bucket S3 de estado.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - lab02/localstack desplegado (crea bucket `terraform-state-labs`)

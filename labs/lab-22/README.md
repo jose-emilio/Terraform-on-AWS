@@ -33,7 +33,7 @@ Transformar un recurso S3 "hardcoded" en un componente flexible y profesional me
 | Protección | Olvidar `lifecycle` en alguna copia | Incluido por defecto en el módulo |
 | Testing | Difícil de probar aislado | Se puede testear el módulo por separado |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

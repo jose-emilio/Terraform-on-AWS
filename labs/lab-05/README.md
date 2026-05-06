@@ -1,4 +1,4 @@
-# Laboratorio 5 — Configuración Dinámica y Plantillas de Sistema
+# Laboratorio 05 — Configuración Dinámica y Plantillas de Sistema
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -20,7 +20,7 @@ Al finalizar este laboratorio serás capaz de:
 - Generar archivos de configuración con lógica condicional usando `%{if}` y `%{for}`
 - Combinar maps de tags con `merge()`
 
-## Requisitos Previos
+## Requisitos previos
 
 - Laboratorio 01 completado (entorno configurado)
 ---

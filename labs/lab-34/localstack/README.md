@@ -5,7 +5,7 @@
 
 Este documento describe cómo ejecutar el laboratorio 34 contra LocalStack. Los recursos EFS (file system, mount targets, access points) y EC2/EBS funcionan en Community con las limitaciones indicadas. DLM no está disponible en Community.
 
-## Requisitos Previos
+## Requisitos previos
 
 - LocalStack en ejecución: `localstack start -d`
 - Terraform >= 1.10

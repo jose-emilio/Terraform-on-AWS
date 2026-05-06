@@ -25,10 +25,10 @@ administradores de la llave (que gestionan su ciclo de vida) de las aplicaciones
 
 ## Requisitos previos
 
-- Terraform ≥ 1.5 instalado.
+- **Terraform >= 1.10** instalado.
 - AWS CLI configurado con perfil `default`.
 - Permisos IAM sobre KMS, S3 y EC2 (EBS).
-- Bucket de estado creado en el lab02.
+- Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 
 ## Arquitectura
 

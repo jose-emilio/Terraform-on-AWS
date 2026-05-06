@@ -5,7 +5,7 @@
 
 Esta guia adapta el lab18 para ejecutarse integramente en LocalStack. Las diferencias principales son que **ELBv2 (ALB) no esta disponible** en LocalStack Community (requiere licencia de pago) y que **no hay trafico de red real**, por lo que no se puede verificar el bloqueo efectivo de la NACL ni consultar Flow Logs con datos reales. El objetivo es validar la estructura de Terraform (Security Groups, NACLs, Flow Logs).
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)

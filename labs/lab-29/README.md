@@ -21,7 +21,7 @@ Al finalizar este laboratorio serás capaz de:
 - Implementar autenticación basada en header entre microservicios: el servicio Web adjunta `X-API-Key` en cada `proxy_pass` al API; el microservicio API usa un bloque `map{}` de nginx generado en tiempo de arranque para validar el header sin exponer el secreto en configuración estática
 - Habilitar el Deployment Circuit Breaker con `rollback = true` para revertir automáticamente si los nuevos contenedores fallan el health check durante un despliegue
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

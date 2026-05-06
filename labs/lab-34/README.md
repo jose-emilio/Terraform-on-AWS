@@ -25,7 +25,7 @@ Al finalizar este laboratorio serás capaz de:
 - Configurar el Security Group del EFS para permitir TCP 2049 exclusivamente desde el Security Group de las instancias EC2
 - Implementar un `aws_efs_access_point` con `posix_user` y `root_directory` para aislar los datos de una aplicación
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

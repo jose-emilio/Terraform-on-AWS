@@ -1,4 +1,4 @@
-# Laboratorio 7b — HCP Terraform como Backend Remoto
+# Laboratorio 07b — HCP Terraform como Backend Remoto
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 

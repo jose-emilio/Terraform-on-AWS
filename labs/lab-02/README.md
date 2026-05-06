@@ -1,4 +1,4 @@
-# Laboratorio 2 — Primer despliegue en AWS: bucket S3 con versionado y cifrado
+# Laboratorio 02 — Primer despliegue en AWS: bucket S3 con versionado y cifrado
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -22,7 +22,7 @@ Al finalizar este laboratorio serás capaz de:
 - Usar outputs para exponer información del recurso creado
 - Verificar el estado de la infraestructura desde Terraform y desde AWS CLI
 
-## Requisitos Previos
+## Requisitos previos
 
 - Laboratorio 01 completado (entorno configurado)
 ---

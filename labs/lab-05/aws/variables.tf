@@ -1,3 +1,9 @@
+variable "region" {
+  description = "Region de AWS donde se desplegaran los recursos."
+  type        = string
+  default     = "us-east-1"
+}
+
 # Parámetros del entorno inyectados en la plantilla de User Data y en el
 # archivo de configuración local generado con directivas %{if}.
 variable "env" {

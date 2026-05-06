@@ -1,4 +1,4 @@
-# Laboratorio 8 — LocalStack: Refactorización Declarativa y Adopción de Infraestructura
+# Laboratorio 08 — LocalStack: Refactorización Declarativa y Adopción de Infraestructura
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
@@ -15,7 +15,7 @@ Al finalizar este laboratorio serás capaz de:
 - Retirar un recurso de la gestión de Terraform sin eliminarlo con `removed { lifecycle { destroy = false } }`
 - Entender cuándo usar cada primitiva y sus diferencias con los comandos imperativos equivalentes
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado
 - Laboratorio 01 completado (entorno configurado)
@@ -108,7 +108,7 @@ El comando clásico `terraform state rm <addr>` elimina el recurso del estado si
 ## Estructura del Laboratorio
 
 ```
-lab08/
+lab-08/
 ├── aws/
 │   ├── providers.tf   # Requiere Terraform >= 1.10
 │   ├── variables.tf   # Nombre del bucket a importar
@@ -171,7 +171,7 @@ aws --profile localstack s3 mb s3://lab8-import-local
 **Paso 3** — Inicializa y genera la configuración:
 
 ```bash
-# Desde lab08/localstack/
+# Desde lab-08/localstack/
 terraform fmt
 terraform init
 terraform plan -generate-config-out=generated.tf

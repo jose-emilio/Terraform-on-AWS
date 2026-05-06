@@ -5,7 +5,7 @@
 
 Esta guia adapta el lab19 para ejecutarse integramente en LocalStack. LocalStack emula VPC Peering a nivel de API pero **no ejecuta trafico real**. El objetivo es validar la estructura de Terraform: VPCs, peerings, rutas bidireccionales y Security Groups.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)

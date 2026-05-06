@@ -22,7 +22,7 @@ Aprender a detectar y gestionar el **drift de infraestructura** (divergencia ent
 | **Versioning S3** | Cada `terraform apply` genera una nueva versión del `.tfstate`; permite restaurar versiones anteriores |
 | **Disaster Recovery 3-2-1** | 3 copias, 2 medios distintos, 1 offsite — el S3 con versioning proporciona la copia offsite |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

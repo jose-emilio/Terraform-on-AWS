@@ -21,7 +21,7 @@ Al finalizar este laboratorio serás capaz de:
 - Definir rutas con `aws_apigatewayv2_route` usando placeholders de path (`{id}`) que se exponen en el evento Lambda como `pathParameters`
 - Configurar `aws_lambda_permission` con `source_arn` acotado al `execution_arn` de la API para que solo esa API pueda invocar la función
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

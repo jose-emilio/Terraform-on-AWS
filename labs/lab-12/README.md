@@ -25,10 +25,10 @@ Las credenciales estáticas (Access Key ID + Secret Access Key) son el vector de
 
 ## Requisitos previos
 
-- Terraform ≥ 1.5 instalado.
+- **Terraform >= 1.10** instalado.
 - AWS CLI configurado con perfil `default`.
 - Plugin SSM para la AWS CLI: `aws ssm start-session` disponible.
-- Bucket de estado creado en el lab02.
+- Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 
 ## Arquitectura
 

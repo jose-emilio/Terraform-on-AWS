@@ -31,7 +31,7 @@ Crear módulos que validen los datos antes de intentar crear infraestructura en 
 | `postcondition` en recurso | Después del apply | `self` (atributos reales del recurso) | Verificar lo que AWS realmente asignó |
 | `check` block (Terraform 1.5+) | Después del apply | Todo | Validaciones no bloqueantes (warnings) |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

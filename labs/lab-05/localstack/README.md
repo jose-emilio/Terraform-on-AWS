@@ -1,11 +1,11 @@
-# Laboratorio 5 — LocalStack: Configuración Dinámica y Plantillas de Sistema
+# Laboratorio 05 — LocalStack: Configuración Dinámica y Plantillas de Sistema
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
 Esta guía adapta el lab05 para ejecutarse íntegramente en LocalStack. La configuración es idéntica a la de AWS real. `aws_key_pair`, `aws_launch_template` y `local_file` están soportados por LocalStack. Solo cambia el `providers.tf`.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - Par de claves SSH generado (`~/.ssh/id_rsa.pub`)

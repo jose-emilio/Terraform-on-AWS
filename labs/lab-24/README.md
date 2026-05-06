@@ -34,7 +34,7 @@ Crear un módulo "wrapper" que orqueste módulos públicos del Terraform Registr
 | Flexibilidad | Total | Limitada por diseño |
 | Auditoría | Revisar cada equipo | Revisar un solo módulo |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

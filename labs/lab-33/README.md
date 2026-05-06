@@ -23,7 +23,7 @@ Al finalizar este laboratorio serás capaz de:
 - Definir una `aws_s3_bucket_lifecycle_configuration` con transición a Glacier y expiración para versiones actuales y no actuales
 - Crear un `aws_vpc_endpoint` de tipo Gateway para S3 y asociar una bucket policy con la condición `aws:sourceVpce` que restringe el acceso al endpoint
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

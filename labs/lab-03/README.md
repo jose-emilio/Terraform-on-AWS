@@ -1,4 +1,4 @@
-# Laboratorio 3 — Infraestructura Parametrizada y Dinámica
+# Laboratorio 03 — Infraestructura Parametrizada y Dinámica
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -19,7 +19,7 @@ Al finalizar este laboratorio serás capaz de:
 - Implementar bloques `dynamic` para generar recursos repetitivos desde una lista
 - Aplicar `terraform fmt` para mantener el estilo estándar de la comunidad
 
-## Requisitos Previos
+## Requisitos previos
 
 - Laboratorio 01 completado (entorno configurado)
 - Laboratorio 02 completado (flujo básico de Terraform)

@@ -5,7 +5,7 @@
 
 Esta guía adapta el lab23 para ejecutarse íntegramente en LocalStack. Los tres módulos (`safe-network`, `validated-bucket`, `db-config`) funcionan igual que en AWS real. Las validaciones, precondiciones y postcondiciones son evaluadas por el motor de Terraform, no por el proveedor, por lo que funcionan idénticamente. La diferencia principal es que `db-config` usa SSM SecureString en lugar de Secrets Manager.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)

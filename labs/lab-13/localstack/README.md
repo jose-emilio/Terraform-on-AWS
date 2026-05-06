@@ -22,10 +22,10 @@ sin necesidad de una cuenta de AWS.
 | Volumen EBS cifrado | **Omitido** — EBS no está disponible en LocalStack Community |
 | Política de bucket con `StringNotEqualsIfExists` | **Omitida** — condición no implementada en LocalStack Community |
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack CLI instalado y Docker en ejecución.
-- Terraform ≥ 1.5.
+- **Terraform >= 1.10**.
 - AWS CLI con perfil configurado para LocalStack (`AWS_ENDPOINT_URL`).
 
 ## Despliegue

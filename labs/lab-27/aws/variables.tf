@@ -1,3 +1,9 @@
+variable "region" {
+  description = "Region de AWS donde se desplegaran los recursos."
+  type        = string
+  default     = "us-east-1"
+}
+
 # Entorno de despliegue: controla el hardening del script de bootstrap
 # y el tipo de instancia seleccionado.
 variable "env" {

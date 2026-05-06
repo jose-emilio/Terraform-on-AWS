@@ -22,10 +22,10 @@ sin necesidad de una cuenta de AWS.
 La verificación de credenciales temporales requiere AWS real.
 Este entorno cubre únicamente la creación y validación de los recursos IAM.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack CLI instalado y Docker en ejecución.
-- Terraform ≥ 1.5.
+- **Terraform >= 1.10**.
 
 ## Despliegue
 

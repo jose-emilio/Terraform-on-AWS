@@ -26,7 +26,7 @@ Al finalizar este laboratorio serás capaz de:
 - Desplegar un `aws_launch_template` + `aws_autoscaling_group` con target tracking scaling
 - Observar el cambio de AZ de la primaria en la aplicación web antes y después de un failover
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

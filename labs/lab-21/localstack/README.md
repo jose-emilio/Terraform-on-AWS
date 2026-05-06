@@ -5,7 +5,7 @@
 
 Esta guía adapta el lab21 para ejecutarse íntegramente en LocalStack. LocalStack emula Route 53 a nivel de API pero **no ejecuta resolución DNS real** desde las instancias EC2 emuladas. Además, **ELBv2 (ALB / NLB) sigue siendo una funcionalidad de pago** en LocalStack — está incluida en los planes Base y Ultimate, pero no en Community Edition ni en el nuevo plan gratuito Hobby (vigente desde marzo 2026). Por eso este lab sustituye el registro Alias del ALB por un registro A con la IP privada de la instancia web. El objetivo es validar la estructura de Terraform; para verificar la resolución DNS real con `nslookup` / `dig` usa la versión `aws/`.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)

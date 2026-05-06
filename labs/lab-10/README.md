@@ -21,7 +21,7 @@ Al finalizar este laboratorio serás capaz de:
 - Verificar experimentalmente que un error o destrucción en la capa de cómputo no afecta el estado de la capa de red
 - Aplicar la convención de backends S3 separados por capa (AWS real) y backends locales por directorio (LocalStack)
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

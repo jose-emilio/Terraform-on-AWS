@@ -1,4 +1,4 @@
-# Laboratorio 1 — Primeros Pasos: Terraform, AWS CLI y LocalStack
+# Laboratorio 01 — Primeros Pasos: Terraform, AWS CLI y LocalStack
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -10,7 +10,7 @@
 
 Guía de instalación y configuración de las herramientas necesarias para trabajar con **Infraestructura como Código (IaC)** usando Terraform en Linux, con soporte para AWS real y LocalStack como emulador local.
 
-## Requisitos Previos
+## Requisitos previos
 
 - Sistema operativo Linux (Ubuntu / Debian / Mint)
 - Acceso a terminal con permisos `sudo`

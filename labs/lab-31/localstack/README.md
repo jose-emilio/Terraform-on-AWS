@@ -5,7 +5,7 @@
 
 Este documento describe cómo ejecutar el laboratorio 31 contra LocalStack. El código Terraform de `localstack/` es una versión reducida respecto a `aws/`: **API Gateway v2 no está disponible en LocalStack Community** (requiere licencia Pro) y se ha eliminado del `main.tf`. Los recursos disponibles — Lambda Layer, Lambda Function, IAM y CloudWatch Logs — funcionan completamente y permiten verificar los mecanismos clave del laboratorio (`archive_file`, `source_code_hash`, Layer).
 
-## Requisitos Previos
+## Requisitos previos
 
 - LocalStack en ejecución: `localstack start -d`
 - Terraform >= 1.10

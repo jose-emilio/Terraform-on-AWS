@@ -31,7 +31,7 @@ Preparar un módulo Terraform para ser consumido por otros equipos con garantía
 | Terraform Registry | Search, docs auto, versionado | Solo GitHub público (o TFE/HCP) | Open source, HCP Terraform |
 | S3/GCS bucket | Control total, privado | Manual, sin versionado integrado | Casos especiales |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Git configurado
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

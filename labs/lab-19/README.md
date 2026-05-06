@@ -36,7 +36,7 @@ Establecer un túnel privado entre dos VPCs independientes para permitir la comu
 
 > **Regla práctica:** Usa VPC Peering para 2-3 VPCs con conectividad simple y directa. A partir de 4+ VPCs, o si necesitas transitividad, inspección centralizada o conectividad híbrida, usa Transit Gateway (lab20).
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

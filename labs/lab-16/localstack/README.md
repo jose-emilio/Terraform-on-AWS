@@ -5,7 +5,7 @@
 
 Esta guía adapta el lab16 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia reside en la configuración del provider y el backend.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)

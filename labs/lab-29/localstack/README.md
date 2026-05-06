@@ -5,7 +5,7 @@
 
 Este documento describe cómo ejecutar el laboratorio 29 contra LocalStack. El código Terraform es el mismo que en `aws/`; solo cambia la configuración del provider.
 
-## Requisitos Previos
+## Requisitos previos
 
 - LocalStack en ejecución: `localstack start -d`
 - Terraform >= 1.10

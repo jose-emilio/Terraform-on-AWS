@@ -22,7 +22,7 @@ Implementar el plano maestro de una VPC profesional utilizando **funciones de c�
 | **Multi-AZ** | Distribución de recursos en múltiples zonas de disponibilidad para alta disponibilidad |
 | **RFC 1918** | Rangos de IP privados: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

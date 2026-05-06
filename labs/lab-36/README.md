@@ -26,7 +26,7 @@ Al finalizar este laboratorio serás capaz de:
 - Usar `aws_sns_topic` como destino de notificaciones de alarmas
 - Medir y visualizar la diferencia de latencia entre cache hit (~2 ms) y cache miss (~50 ms)
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

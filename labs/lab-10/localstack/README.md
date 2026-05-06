@@ -18,7 +18,7 @@ El concepto de aislamiento de estados es idéntico en ambos casos: dos proyectos
 
 ---
 
-## Prerrequisitos
+## Requisitos previos
 
 ```bash
 localstack status   # LocalStack debe estar en ejecución

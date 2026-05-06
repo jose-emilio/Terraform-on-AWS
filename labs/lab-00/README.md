@@ -1,4 +1,4 @@
-# Laboratorio 0 — Entorno de Desarrollo Remoto con VSCode en EC2
+# Laboratorio 00 — Entorno de Desarrollo Remoto con VSCode en EC2
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -10,7 +10,7 @@
 
 En este laboratorio preliminar lanzarás manualmente una instancia EC2 con **Amazon Linux 2023 (ARM64)** e instalarás **code-server** para usar VSCode como IDE remoto desde el navegador de tu máquina local. Esto te permitirá trabajar en los laboratorios del curso directamente desde la nube.
 
-## Requisitos Previos
+## Requisitos previos
 
 - Cuenta de AWS con permisos para crear instancias EC2 y Security Groups
 - Acceso a la consola de AWS ([console.aws.amazon.com](https://console.aws.amazon.com))

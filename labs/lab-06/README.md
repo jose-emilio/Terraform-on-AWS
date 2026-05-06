@@ -1,4 +1,4 @@
-# Laboratorio 6 — Auditoría Dinámica y Conectividad Externa
+# Laboratorio 06 — Auditoría Dinámica y Conectividad Externa
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -23,7 +23,7 @@ Al finalizar este laboratorio serás capaz de:
 - Generar un reporte de auditoría exportable con `templatefile()` y `local_file` (provider `hashicorp/local`)
 - Proteger información sensible en outputs con `sensitive = true`
 
-## Requisitos Previos
+## Requisitos previos
 
 - Laboratorio 01 completado (entorno configurado)
 ---

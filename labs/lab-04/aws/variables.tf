@@ -1,3 +1,9 @@
+variable "region" {
+  description = "Region de AWS donde se desplegaran los recursos."
+  type        = string
+  default     = "us-east-1"
+}
+
 # Map de usuarios IAM a crear. La clave es el nombre de usuario (each.key)
 # y el valor contiene los metadatos que se asignarán como tags.
 variable "iam_users" {

@@ -21,7 +21,7 @@ Implementar un sistema de nombres interno (`.internal`) sin necesidad de un domi
 | **VPC DNS Resolution** | `enable_dns_support = true` activa el resolutor DNS de AWS en la VPC (servidor `169.254.169.253`). `enable_dns_hostnames = true` asigna nombres DNS públicos a las instancias con IP pública |
 | **Split-horizon DNS** | Patrón donde un mismo nombre resuelve a IPs diferentes según desde donde se consulte: IP privada dentro de la VPC, IP pública desde Internet (requiere zona pública adicional) |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

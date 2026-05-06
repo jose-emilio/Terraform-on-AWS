@@ -21,7 +21,7 @@ Al finalizar este laboratorio serás capaz de:
 - Activar Container Insights en el cluster ECS con el bloque `setting { name = "containerInsights", value = "enabled" }`
 - Crear un `aws_cloudwatch_metric_alarm` sobre `CPUUtilization` con `evaluation_periods = 2` para evitar falsas alarmas por picos momentáneos, y enrutar notificaciones a un `aws_sns_topic`
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

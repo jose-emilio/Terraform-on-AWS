@@ -1,3 +1,9 @@
+variable "region" {
+  description = "Region de AWS donde se desplegaran los recursos."
+  type        = string
+  default     = "us-east-1"
+}
+
 # Valor del tag Env usado para localizar la VPC, subredes e instancias.
 # Modificar este valor permite reutilizar la configuración en otros entornos.
 variable "target_env" {

@@ -1,4 +1,4 @@
-# Laboratorio 8 — Refactorización Declarativa y Adopción de Infraestructura
+# Laboratorio 08 — Refactorización Declarativa y Adopción de Infraestructura
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -20,7 +20,7 @@ Al finalizar este laboratorio serás capaz de:
 - Retirar un recurso de la gestión de Terraform sin eliminarlo con `removed { lifecycle { destroy = false } }`
 - Entender cuándo usar cada primitiva y sus diferencias con los comandos imperativos equivalentes
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado
 - Laboratorio 01 completado (entorno configurado)

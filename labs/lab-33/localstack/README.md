@@ -5,7 +5,7 @@
 
 Este documento describe cómo ejecutar el laboratorio 33 contra LocalStack. Los recursos S3 (bucket, public access block, versionado, lifecycle configuration) funcionan plenamente en Community. KMS y la condición de VPC endpoint tienen soporte parcial.
 
-## Requisitos Previos
+## Requisitos previos
 
 - LocalStack en ejecución: `localstack start -d`
 - Terraform >= 1.10

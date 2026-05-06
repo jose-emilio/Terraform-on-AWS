@@ -39,7 +39,7 @@ Centralizar la interconectividad de múltiples VPCs mediante un **Transit Gatewa
 
 > **Regla práctica:** Usa VPC Peering para 2-3 VPCs con conectividad simple. Usa Transit Gateway a partir de 4+ VPCs, cuando necesites transitividad, inspección centralizada o conectividad híbrida (VPN/Direct Connect).
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

@@ -21,7 +21,7 @@ Al finalizar este laboratorio serás capaz de:
 - Dimensionar correctamente el `visibility_timeout_seconds` de SQS respecto al `timeout` de Lambda para evitar reprocesamientos accidentales
 - Distinguir cuándo actúan las Lambda Destinations (invocación asíncrona directa) vs cuándo actúa la DLQ (path de Event Source Mapping)
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

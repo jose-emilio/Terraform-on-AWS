@@ -1,3 +1,9 @@
+variable "region" {
+  description = "Region de AWS donde se desplegaran los recursos."
+  type        = string
+  default     = "us-east-1"
+}
+
 # Configuración principal de la red. Agrupa en un objeto los parámetros
 # relacionados para pasarlos como una unidad y validarlos de forma centralizada.
 variable "network_config" {

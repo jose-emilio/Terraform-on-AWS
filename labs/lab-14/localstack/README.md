@@ -29,7 +29,7 @@ El hardening del backend con KMS requiere AWS real para validarse correctamente.
 ## Requisitos previos
 
 - LocalStack CLI instalado y Docker en ejecución.
-- Terraform ≥ 1.5.
+- **Terraform >= 1.10**.
 - AWS CLI configurado para LocalStack:
 
 ```bash

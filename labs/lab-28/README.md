@@ -20,7 +20,7 @@ Al finalizar este laboratorio serás capaz de:
 - Aplicar una política de Target Tracking basada en CPU media al 50% para escalar automáticamente
 - Implementar un bloque `instance_refresh` con `min_healthy_percentage = 90` para actualizar la flota sin caída de servicio
 
-## Requisitos Previos
+## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir

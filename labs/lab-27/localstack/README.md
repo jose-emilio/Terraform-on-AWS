@@ -5,7 +5,7 @@
 
 Esta guía adapta el lab27 para ejecutarse íntegramente en LocalStack. La configuración es idéntica a la de AWS real: data source `aws_ami`, IAM Instance Profile, Security Group e instancia EC2 con IMDSv2. Sólo cambia el `providers.tf`.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - AWS CLI configurado para LocalStack:

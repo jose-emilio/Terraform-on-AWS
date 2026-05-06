@@ -1,11 +1,11 @@
-# Laboratorio 2 — LocalStack: Bucket S3 como Backend de Estado
+# Laboratorio 02 — LocalStack: Bucket S3 como Backend de Estado
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
 Esta guía adapta el lab02 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia reside en la configuración del provider para redirigir las llamadas al endpoint local.
 
-## Prerrequisitos
+## Requisitos previos
 
 - LocalStack corriendo: `localstack start -d`
 - AWS CLI configurado para LocalStack:

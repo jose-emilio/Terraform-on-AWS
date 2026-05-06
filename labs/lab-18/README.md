@@ -37,7 +37,7 @@ El tráfico atraviesa **cuatro capas independientes** antes de llegar a la aplic
 
 > **Defensa en profundidad:** Las NACLs actúan como primera línea (bloqueo de IPs conocidas, rango de puertos). Los Security Groups actúan como segunda línea (referencia por identidad, no por IP). Ambas capas se complementan.
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas

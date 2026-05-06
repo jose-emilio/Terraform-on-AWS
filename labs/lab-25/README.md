@@ -31,7 +31,7 @@ Validar la estabilidad y el comportamiento de un módulo Terraform mediante el *
 | **Integration test** | ~30s+ | Mínimo | Que los recursos se crean en AWS | `terraform test` + `command = apply` |
 | **Idempotencia** | ~60s+ | Mínimo | Que el apply es estable (sin drifts) | `terraform test` + apply/plan |
 
-## Prerrequisitos
+## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas
