@@ -1,4 +1,4 @@
-# Laboratorio 29: Microservicios con ECS Fargate y Malla de Servicios
+# Laboratorio 29 — Microservicios con ECS Fargate y Malla de Servicios
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -23,8 +23,8 @@ Al finalizar este laboratorio serás capaz de:
 
 ## Requisitos Previos
 
-- Terraform >= 1.5 instalado
-- Laboratorio 2 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
+- **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
+- Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - Perfil AWS con permisos sobre VPC, ECR, ECS, SSM, IAM y CloudWatch Logs
 - Docker instalado (para hacer push de imágenes a ECR en la sección opcional)
 - LocalStack en ejecución (para la sección de LocalStack)
@@ -186,7 +186,7 @@ Sin el Circuit Breaker, un despliegue con un contenedor defectuoso (imagen incor
 lab29/
 ├── aws/
 │   ├── aws.s3.tfbackend   # Parámetros del backend S3 (sin bucket)
-│   ├── providers.tf       # Backend S3, Terraform >= 1.5, provider AWS
+│   ├── providers.tf       # Backend S3, Terraform >= 1.10, provider AWS
 │   ├── variables.tf       # region, project, vpc_cidr, desired_count, container_image, api_key
 │   ├── main.tf            # VPC, ECR, SSM, IAM, ECS Cluster, 2 Task Definitions, 2 Servicios ECS
 │   ├── outputs.tf         # ECR URL, cluster, web/api service, SSM, namespace, logs
@@ -205,7 +205,7 @@ lab29/
 
 ## Despliegue en AWS Real
 
-### 1.1 Arquitectura
+### Arquitectura
 
 ```
 Navegador
@@ -243,7 +243,7 @@ ECR: lab29/api (IMMUTABLE)
   └── Lifecycle Policy: mantener ≤ 10 imágenes
 ```
 
-### 1.2 Código Terraform
+### Código Terraform
 
 **`aws/main.tf`** — Fragmentos clave:
 
@@ -372,7 +372,7 @@ resource "aws_security_group" "ecs" {
 }
 ```
 
-### 1.3 Inicialización y despliegue
+### Inicialización y despliegue
 
 ```bash
 export BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
@@ -403,7 +403,7 @@ web_service_name          = "lab29-web"
 web_task_definition_arn   = "arn:aws:ecs:us-east-1:...:task-definition/lab29-web:1"
 ```
 
-### 1.4 Verificar los servicios y el flujo Web→API
+### Verificar los servicios y el flujo Web→API
 
 **Paso 1** — Comprueba que ambos servicios están estables:
 
@@ -492,7 +492,7 @@ aws logs tail /ecs/lab29/api --log-stream-name-prefix api/ --follow
 aws logs tail /ecs/lab29/web --log-stream-name-prefix service-connect-web/ --follow
 ```
 
-### 1.5 Verificar ECR y la política de limpieza
+### Verificar ECR y la política de limpieza
 
 **Paso 1** — Autentica Docker contra ECR:
 
@@ -526,7 +526,7 @@ aws ecr get-lifecycle-policy --repository-name lab29/api \
   --query 'lifecyclePolicyText' --output text | python3 -m json.tool
 ```
 
-### 1.6 Demostrar el Deployment Circuit Breaker
+### Demostrar el Deployment Circuit Breaker
 
 Provoca un despliegue fallido cambiando la imagen a una que no existe para observar el rollback automático.
 
@@ -594,24 +594,34 @@ Cuando el Circuit Breaker dispara verás en los eventos (orden cronológico inve
 ## Verificación final
 
 ```bash
-# Verificar que el servicio ECS esta en RUNNING
+CLUSTER=$(terraform output -raw ecs_cluster_name)
+WEB_SERVICE=$(terraform output -raw web_service_name)
+API_SERVICE=$(terraform output -raw api_service_name)
+
+# Verificar que ambos servicios ECS están en RUNNING
 aws ecs describe-services \
-  --cluster $(terraform output -raw ecs_cluster_name) \
-  --services web api \
-  --query 'services[*].{Name:serviceName,Status:status,Running:runningCount}' \
+  --cluster "$CLUSTER" \
+  --services "$WEB_SERVICE" "$API_SERVICE" \
+  --query 'services[*].{Name:serviceName,Status:status,Desired:desiredCount,Running:runningCount}' \
   --output table
 
-# Probar el endpoint del ALB
-ALB_URL=$(terraform output -raw alb_url)
-curl -s "http://${ALB_URL}" | head -20
+# Probar el servicio Web vía la IP pública de una de sus tareas
+WEB_TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$WEB_SERVICE" --query 'taskArns[0]' --output text)
+PRIVATE_IP=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$WEB_TASK" \
+  --query 'tasks[0].containers[0].networkInterfaces[0].privateIpv4Address' --output text)
+WEB_IP=$(aws ec2 describe-network-interfaces \
+  --filters "Name=private-ip-address,Values=$PRIVATE_IP" \
+  --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
 
-# Verificar comunicacion interna via Service Connect
-curl -s "http://${ALB_URL}/api"
-# Esperado: JSON del microservicio API
+curl -s "http://${WEB_IP}/" | head -20
+# Esperado: HTML con las dos tarjetas (Web + API via Service Connect)
 
-# Comprobar que el parametro SSM esta correctamente configurado
+curl -s "http://${WEB_IP}/api-data"
+# Esperado: JSON del microservicio API (proxy_pass + X-API-Key)
+
+# Comprobar que el parámetro SSM está correctamente configurado
 aws ssm get-parameter \
-  --name "/lab29/api-key" \
+  --name "$(terraform output -raw ssm_parameter_name)" \
   --with-decryption \
   --query 'Parameter.{Name:Name,Type:Type}' \
   --output table
@@ -852,29 +862,6 @@ aws logs tail /ecs/lab29/worker --log-stream-name-prefix worker/ --follow
 Crea el archivo `aws/alb.tf`:
 
 ```hcl
-resource "aws_security_group" "alb" {
-  name        = "${var.project}-alb-sg"
-  description = "Permite trafico HTTP desde Internet al ALB"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "HTTP desde Internet"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = merge(local.tags, { Name = "${var.project}-alb-sg" })
-}
-
 # ── Subredes privadas ─────────────────────────────────────────────────────────
 # Las tareas ECS se mueven aquí: sin IP pública, solo accesibles desde el ALB.
 # Usamos los CIDRs x.x.10.x, x.x.11.x (distintos de los públicos x.x.1.x, x.x.2.x).

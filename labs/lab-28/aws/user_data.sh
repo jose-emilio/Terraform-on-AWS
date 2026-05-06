@@ -10,7 +10,7 @@ TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
   http://169.254.169.254/latest/meta-data/instance-type)
 LAUNCH=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
 
-# Instala Apache (httpd) y mod_headers
+# Instala Apache (httpd); mod_headers viene incluido por defecto en AL2023
 dnf install -y httpd
 
 # Escucha en el puerto 8080 (destino del ALB)

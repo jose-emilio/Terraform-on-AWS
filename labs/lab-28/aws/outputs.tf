@@ -22,3 +22,8 @@ output "private_subnet_ids" {
   description = "IDs de las subredes privadas donde se despliegan las instancias del ASG"
   value       = aws_subnet.private[*].id
 }
+
+output "target_group_arn" {
+  description = "ARN del Target Group del ALB (usado en la verificación final)"
+  value       = aws_lb_target_group.web.arn
+}

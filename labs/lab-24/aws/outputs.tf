@@ -48,3 +48,10 @@ output "db_deletion_protection" {
   description = "Confirmación: protección contra borrado"
   value       = module.corporate_rds.db_deletion_protection
 }
+
+# --- Security group ---
+
+output "security_group_id" {
+  description = "ID del security group de RDS"
+  value       = module.corporate_rds.security_group_id
+}

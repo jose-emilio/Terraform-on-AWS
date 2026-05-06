@@ -74,7 +74,7 @@ lab-25/
 
 ## Análisis del código
 
-### 1.1 Arquitectura del laboratorio
+### Arquitectura del laboratorio
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -101,7 +101,7 @@ Tres archivos de test que verifican el mismo módulo desde ángulos diferentes:
 2. **Integration**: ¿El recurso se crea en AWS?
 3. **Idempotencia**: ¿El segundo plan está limpio?
 
-### 1.2 El módulo bajo test: `tagged-bucket`
+### El módulo bajo test: `tagged-bucket`
 
 ```hcl
 # modules/tagged-bucket/main.tf
@@ -132,7 +132,7 @@ El módulo tiene lógica testeable:
 - **Etiquetado**: `merge()` combina tags por defecto con tags del llamador
 - **Validaciones**: `bucket_name` debe cumplir regex, `environment` debe estar en una lista
 
-### 1.3 Unit test — `mock_provider` y `command = apply`
+### Unit test — `mock_provider` y `command = apply`
 
 ```hcl
 # tests/unit_naming.tftest.hcl
@@ -172,12 +172,12 @@ run "bucket_name_follows_convention" {
 Puntos clave:
 - **`command = apply`** (no `plan`): con `mock_provider`, el apply es simulado — no crea recursos reales y se ejecuta en ~2 segundos. Usamos `apply` en vez de `plan` porque atributos computados como `bucket.id` solo están disponibles después del apply, incluso con mocks
 - **`variables {}`**: sobreescribe las variables del Root Module para este test
-- **`output.bucket_id`**: referencia un output del Root Module. Con `plan` y mock, los valores conocidos en tiempo de plan (como `bucket = var.bucket_name`) sí están disponibles
+- **`output.bucket_id`**: referencia un output del Root Module. Tras el apply simulado, los outputs ya están resueltos y se pueden usar en los `assert`
 - **`assert`**: si `condition` es `false`, el test falla con `error_message`
 
 Se pueden definir múltiples `assert` en el mismo `run` y múltiples `run` en el mismo archivo.
 
-### 1.4 Integration test — `command = apply` real
+### Integration test — `command = apply` real
 
 ```hcl
 # tests/integration.tftest.hcl
@@ -232,7 +232,7 @@ Diferencias con el unit test:
 - **Limpieza automática**: `terraform test` destruye los recursos al finalizar el archivo de test (no del run).
 - **`variables {}` a nivel de archivo**: se comparten entre todos los `run` del archivo (ojo: cada `run` puede sobreescribirlas con su propio bloque `variables {}`).
 
-### 1.5 Test de idempotencia — Apply + Plan
+### Test de idempotencia — Apply + Plan
 
 ```hcl
 # tests/idempotency.tftest.hcl
@@ -269,7 +269,7 @@ Si el módulo es idempotente, el plan no mostrará cambios y los outputs serán 
 
 **`run.initial_deploy.bucket_id`** referencia el output del run anterior. Esto permite comparar valores entre ejecuciones.
 
-### 1.6 `expect_failures` — Probar el camino fallido
+### `expect_failures` — Probar el camino fallido
 
 `assert` verifica que algo es **cierto**. Su contraparte es `expect_failures`, que verifica que **una validación o precondition falla** intencionalmente. Es la forma de testear el "camino infeliz" de un módulo: comprobar que las validaciones rechazan inputs malos.
 
@@ -295,13 +295,13 @@ Diferencias clave con `assert`:
 | Comprueba... | el camino satisfactorio | el camino fallido |
 | Si la condición/validación pasa | el test pasa | el test **falla** |
 
-El Reto 1 (sección 4) lo aplica para verificar que la validación de `environment` rechaza valores inválidos.
+El Reto 1 (más abajo) lo aplica para verificar que la validación de `environment` rechaza valores inválidos.
 
 ---
 
 ## Ejecución de los tests
 
-### 2.1 Inicializar (sin backend)
+### Inicializar (sin backend)
 
 ```bash
 cd labs/lab-25/aws
@@ -314,7 +314,7 @@ terraform init -backend=false
 >
 > **Tiempo del primer `init`:** la primera vez tarda 5–15 segundos descargando el provider AWS (`hashicorp/aws`). En ejecuciones posteriores se sirve desde la caché local (`.terraform/providers/`) y es prácticamente instantáneo.
 
-### 2.2 Ejecutar todos los tests
+### Ejecutar todos los tests
 
 ```bash
 terraform test
@@ -345,7 +345,7 @@ tests/unit_naming.tftest.hcl... pass
 Success! 7 passed, 0 failed.
 ```
 
-### 2.3 Ejecutar solo los tests unitarios (sin AWS)
+### Ejecutar solo los tests unitarios (sin AWS)
 
 ```bash
 # Filtrar por archivo de test
@@ -354,7 +354,7 @@ terraform test -filter=tests/unit_naming.tftest.hcl
 
 Esto ejecuta **solo** el test con `mock_provider`. No necesita credenciales de AWS ni genera costes. Ideal para CI/CD en las primeras etapas del pipeline.
 
-### 2.4 Modo verbose
+### Modo verbose
 
 ```bash
 terraform test -verbose
@@ -368,7 +368,7 @@ Muestra los detalles del plan/apply de cada `run`, incluyendo los outputs y los 
 
 El análisis estático complementa los tests de Terraform escaneando el código HCL en busca de vulnerabilidades **sin ejecutar nada**.
 
-### 3.1 Instalación de checkov
+### Instalación de checkov
 
 ```bash
 pip install checkov
@@ -377,7 +377,7 @@ pip install checkov
 pipx install checkov
 ```
 
-### 3.2 Ejecutar checkov sobre el módulo
+### Ejecutar checkov sobre el módulo
 
 ```bash
 checkov -d modules/tagged-bucket/ --framework terraform
@@ -414,7 +414,7 @@ Check: CKV2_AWS_62: "Ensure S3 buckets should have event notifications enabled"
 
 Las cinco comprobaciones que fallan corresponden a buenas prácticas que el módulo no implementa intencionadamente para mantener la docencia (`access logging`, `cross-region replication`, cifrado con `KMS`, `lifecycle` y `event notifications`). Es un buen ejemplo de cómo `checkov` complementa a los tests funcionales: los `.tftest.hcl` verifican el contrato del módulo, mientras que el análisis estático señala buenas prácticas adicionales que el equipo decide adoptar (o suprimir explícitamente con `--skip-check`).
 
-### 3.3 Alternativa: Trivy
+### Alternativa: Trivy
 
 Instalación oficial según el sistema operativo (ver [docs](https://trivy.dev/docs/latest/getting-started/installation/)):
 
@@ -476,12 +476,12 @@ AWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key.
 
 Trivy reporta menos hallazgos que `checkov` porque aplica un catálogo de reglas más reducido y centrado en severidad. Ambos son complementarios: `checkov` da más cobertura, `trivy` clasifica por severidad (`LOW`/`MEDIUM`/`HIGH`/`CRITICAL`), útil para fijar umbrales de fallo en CI (por ejemplo `--severity HIGH,CRITICAL`).
 
-### 3.4 Pipeline recomendado
+### Pipeline recomendado
 
 ```
 1. checkov/trivy     →  Análisis estático (0s, $0)
-2. terraform test    →  Unit tests con mock_provider (~2s, $0)
-   -filter=unit_*
+2. terraform test -filter=tests/unit_naming.tftest.hcl
+                     →  Unit tests con mock_provider (~2s, $0)
 3. terraform test    →  Integration + idempotencia (~60s, coste mínimo)
 ```
 
@@ -560,7 +560,21 @@ run "rejects_invalid_environment" {
   expect_failures = [var.environment]
 }
 
-# --- Test 2: Entorno válido es aceptado ---
+# --- Test 2: bucket_suffix con mayúsculas es rechazado por el módulo ---
+
+run "rejects_uppercase_bucket_suffix" {
+  command = plan
+
+  variables {
+    project_name  = "myapp"
+    bucket_suffix = "DATA"   # genera "myapp-DATA-123456789012", inválido por la regex
+    environment   = "lab"
+  }
+
+  expect_failures = [module.bucket.var.bucket_name]
+}
+
+# --- Test 3: Entorno válido es aceptado ---
 
 run "accepts_valid_environment" {
   command = apply
@@ -588,11 +602,12 @@ terraform test -filter=tests/unit_validations.tftest.hcl
 ```
 tests/unit_validations.tftest.hcl... in progress
   run "rejects_invalid_environment"... pass
+  run "rejects_uppercase_bucket_suffix"... pass
   run "accepts_valid_environment"... pass
 tests/unit_validations.tftest.hcl... tearing down
 tests/unit_validations.tftest.hcl... pass
 
-Success! 2 passed, 0 failed.
+Success! 3 passed, 0 failed.
 ```
 
 El test `rejects_invalid_environment` **pasa** porque `expect_failures = [var.environment]` le dice a Terraform: "espero que esta variable falle su validación". Si la validación NO fallara (es decir, si aceptara `"invalid"`), **el test fallaría** — alertándonos de que la validación está rota.

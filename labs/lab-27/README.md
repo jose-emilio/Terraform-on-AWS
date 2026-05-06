@@ -1,4 +1,4 @@
-# Laboratorio 27: Cimientos de EC2: Despliegue Dinamico y Seguro
+# Laboratorio 27 — Cimientos de EC2: Despliegue Dinámico y Seguro
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,13 +8,13 @@
 
 ## Visión general
 
-En este laboratorio aprovisionaras un servidor web EC2 profesional utilizando busquedas dinamicas de AMI, un IAM Instance Profile para evitar credenciales estaticas, IMDSv2 obligatorio para prevenir ataques SSRF y un script de bootstrap dinamico generado con `templatefile()`. El resultado es una instancia que sigue las mejores practicas de seguridad de AWS desde su creacion.
+En este laboratorio aprovisionarás un servidor web EC2 profesional utilizando búsquedas dinámicas de AMI, un IAM Instance Profile para evitar credenciales estáticas, IMDSv2 obligatorio para prevenir ataques SSRF y un script de bootstrap dinámico generado con `templatefile()`. El resultado es una instancia que sigue las mejores prácticas de seguridad de AWS desde su creación.
 
 ## Objetivos de Aprendizaje
 
-Al finalizar este laboratorio seras capaz de:
+Al finalizar este laboratorio serás capaz de:
 
-- Usar el data source `aws_ami` con filtros para obtener la AMI mas reciente de Amazon Linux 2023 de forma agnóstica a la región
+- Usar el data source `aws_ami` con filtros para obtener la AMI más reciente de Amazon Linux 2023 de forma agnóstica a la región
 - Crear un IAM Instance Profile con un rol que permita gestión via SSM Session Manager, eliminando la necesidad de Access Keys estáticas
 - Forzar el uso de IMDSv2 (`http_tokens = "required"`) para blindar la instancia contra ataques SSRF
 - Implementar un script de bootstrap dinámico usando `templatefile()` para inyectar variables de Terraform en el `user_data` de la instancia
@@ -22,7 +22,9 @@ Al finalizar este laboratorio seras capaz de:
 
 ## Requisitos Previos
 
-- Laboratorio 1 completado (entorno configurado)
+- Laboratorio 01 completado (entorno configurado)
+- Laboratorio 02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` (usado como backend de tfstate)
+- **Terraform >= 1.10** (necesario para `use_lockfile` en el backend S3)
 ---
 
 ## Conceptos Clave
@@ -43,15 +45,15 @@ data "aws_ami" "al2023" {
 }
 ```
 
-- `most_recent = true`: de todas las AMIs que coincidan con los filtros, selecciona la mas reciente.
-- `owners = ["amazon"]`: restringe la busqueda a AMIs oficiales de Amazon, evitando imagenes de terceros potencialmente inseguras.
-- `filter`: cada bloque `filter` aplica un criterio adicional. Los filtros son acumulativos (AND logico).
+- `most_recent = true`: de todas las AMIs que coincidan con los filtros, selecciona la más reciente.
+- `owners = ["amazon"]`: restringe la búsqueda a AMIs oficiales de Amazon, evitando imágenes de terceros potencialmente inseguras.
+- `filter`: cada bloque `filter` aplica un criterio adicional. Los filtros son acumulativos (AND lógico).
 
 La referencia `data.aws_ami.al2023.id` devuelve el ID de la AMI seleccionada, que puede variar entre regiones y con el tiempo conforme Amazon publica nuevas versiones.
 
 ### IAM Instance Profile
 
-Un **Instance Profile** es el contenedor que permite asociar un rol IAM a una instancia EC2. Sin el, la instancia no tiene identidad IAM y cualquier operacion con la API de AWS requeriria Access Keys estaticas (una mala practica de seguridad).
+Un **Instance Profile** es el contenedor que permite asociar un rol IAM a una instancia EC2. Sin él, la instancia no tiene identidad IAM y cualquier operación con la API de AWS requeriría Access Keys estáticas (una mala práctica de seguridad).
 
 ```hcl
 resource "aws_iam_instance_profile" "ec2" {
@@ -95,7 +97,7 @@ locals {
 ```
 
 Dentro del archivo `.tftpl`:
-- `${variable}` para interpolacion simple
+- `${variable}` para interpolación simple
 - `%{ if condicion }...%{ endif }` para condicionales
 - `%{ for item in lista }...%{ endfor }` para iteraciones
 
@@ -125,7 +127,7 @@ El resultado (`data.aws_iam_policy_document.ec2_assume_role.json`) se pasa direc
 lab27/
 ├── user_data.tftpl      # Plantilla de bash compartida por ambos entornos
 ├── aws/
-│   ├── aws.s3.tfbackend # Parametros del backend S3 (sin bucket)
+│   ├── aws.s3.tfbackend # Parámetros del backend S3 (sin bucket)
 │   ├── providers.tf     # Bloque terraform{} con backend S3 y provider{}
 │   ├── variables.tf     # env, app_name, db_endpoint, instance_type
 │   ├── main.tf          # data aws_ami, IAM role/profile, SG, instancia EC2
@@ -133,18 +135,18 @@ lab27/
 └── localstack/
     ├── README.md        # Instrucciones de despliegue local
     ├── providers.tf     # Endpoints apuntando a LocalStack
-    ├── variables.tf     # Identico al de aws/
-    ├── main.tf          # Identico al de aws/
-    └── outputs.tf       # Identico al de aws/
+    ├── variables.tf     # Idéntico al de aws/
+    ├── main.tf          # Idéntico al de aws/
+    └── outputs.tf       # Idéntico al de aws/
 ```
 
-La plantilla `user_data.tftpl` vive en la raiz de `lab27/` y es compartida por ambos entornos mediante `path.module/../user_data.tftpl`.
+La plantilla `user_data.tftpl` vive en la raíz de `lab27/` y es compartida por ambos entornos mediante `path.module/../user_data.tftpl`.
 
 ---
 
 ## Despliegue en AWS Real
 
-### 1.1 Codigo Terraform
+### Código Terraform
 
 **`user_data.tftpl`**
 
@@ -153,18 +155,18 @@ La plantilla `user_data.tftpl` vive en la raiz de `lab27/` y es compartida por a
 # Generado por Terraform — entorno: ${env}
 set -euo pipefail
 
-# Configuracion del entorno
+# Configuración del entorno
 echo "ENV=${env}" >> /etc/environment
 echo "APP_NAME=${app_name}" >> /etc/environment
 echo "DB_ENDPOINT=${db_endpoint}" >> /etc/environment
 
-# Actualizacion del sistema
+# Actualización del sistema
 dnf update -y
 
-# Instalacion de servidor web
+# Instalación de servidor web
 dnf install -y httpd
 
-# Pagina de verificacion con datos inyectados desde Terraform
+# Página de verificación con datos inyectados desde Terraform
 cat <<'INNEREOF' > /var/www/html/index.html
 <!DOCTYPE html>
 <html>
@@ -181,7 +183,7 @@ INNEREOF
 systemctl enable --now httpd
 
 %{ if env == "prod" ~}
-# Hardening adicional solo en produccion
+# Hardening adicional solo en producción
 sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 systemctl restart sshd
 %{ endif ~}
@@ -238,7 +240,7 @@ variable "instance_type" {
 **`aws/main.tf`**
 
 ```hcl
-# ─── Data Source: AMI dinamica ───────────────────────────────────────────────
+# ─── Data Source: AMI dinámica ───────────────────────────────────────────────
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -323,7 +325,7 @@ resource "aws_vpc_security_group_egress_rule" "all" {
   description       = "Todo el trafico saliente"
 }
 
-# ─── User Data dinamico ─────────────────────────────────────────────────────
+# ─── User Data dinámico ─────────────────────────────────────────────────────
 locals {
   user_data = templatefile("${path.module}/../user_data.tftpl", {
     env         = var.env
@@ -404,7 +406,7 @@ output "security_group_id" {
 }
 ```
 
-### 1.2 Despliegue
+### Despliegue
 
 Desde el directorio `lab27/aws/`:
 
@@ -422,12 +424,12 @@ terraform apply
 
 El estado se almacena en `s3://<BUCKET>/lab27/terraform.tfstate` usando el bucket creado en el lab02.
 
-Durante el `plan`, presta atencion a:
+Durante el `plan`, presta atención a:
 
 - **`data.aws_ami.al2023`**: Terraform consulta la API de EC2 y muestra la AMI seleccionada. Esto ocurre en la fase de plan, no durante el apply.
 - **`user_data_rendered`**: el output muestra el script ya renderizado con los valores reales, permitiendo verificar que `templatefile()` inyectó las variables correctamente.
 
-### 1.3 Verificación
+### Verificación
 
 Al finalizar `terraform apply`:
 
@@ -489,7 +491,7 @@ curl http://$(terraform output -raw public_ip)
 aws ssm start-session --target $(terraform output -raw instance_id)
 ```
 
-### 1.4 Verificar el User Data renderizado
+### Verificar el User Data renderizado
 
 El output `user_data_rendered` permite inspeccionar el script que recibió la instancia:
 
@@ -607,7 +609,7 @@ Terraform no permite validaciones que referencien otras variables dentro de un b
 check "ami_filter_prod" {
   assert {
     condition     = var.env != "prod" || strcontains(var.ami_name_filter, "minimal")
-    error_message = "En produccion, ami_name_filter debe contener 'minimal' para cumplir con la politica de seguridad."
+    error_message = "En producción, ami_name_filter debe contener 'minimal' para cumplir con la politica de seguridad."
   }
 }
 ```
@@ -621,7 +623,7 @@ data "aws_ami" "al2023" {
   lifecycle {
     precondition {
       condition     = var.env != "prod" || strcontains(var.ami_name_filter, "minimal")
-      error_message = "En produccion, ami_name_filter debe contener 'minimal'."
+      error_message = "En producción, ami_name_filter debe contener 'minimal'."
     }
   }
 }
@@ -661,7 +663,7 @@ terraform plan
 
 # Prod sin minimal: falla
 terraform plan -var='env=prod'
-# Error: En produccion, ami_name_filter debe contener 'minimal'...
+# Error: En producción, ami_name_filter debe contener 'minimal'...
 
 # Prod con minimal: funciona
 terraform plan -var='env=prod' -var='ami_name_filter=al2023-ami-minimal-2023.*-arm64'
@@ -680,7 +682,7 @@ terraform plan -var='env=prod' -var='ami_name_filter=al2023-ami-minimal-2023.*-a
 variable "config_bucket_name" {
   type        = string
   default     = "corp-lab27-config"
-  description = "Nombre del bucket S3 con configuraciones de la aplicacion."
+  description = "Nombre del bucket S3 con configuraciones de la aplicación."
 }
 ```
 
@@ -756,7 +758,7 @@ terraform destroy
 
 ## LocalStack
 
-Este laboratorio puede ejecutarse integramente en LocalStack para validar la sintaxis y la estructura de los recursos. Consulta [localstack/README.md](localstack/README.md) para las instrucciones de despliegue local.
+Este laboratorio puede ejecutarse íntegramente en LocalStack para validar la sintaxis y la estructura de los recursos. Consulta [localstack/README.md](localstack/README.md) para las instrucciones de despliegue local.
 
 >  **Limitación:** dado que LocalStack simula la instancia EC2 sin ejecutarla realmente, el User Data no se ejecuta y la página web no estará accesible. Las verificaciones de IMDSv2, Instance Profile y AMI se validan a nivel de API.
 

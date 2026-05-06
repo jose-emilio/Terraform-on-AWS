@@ -37,7 +37,7 @@ Preparar un módulo Terraform para ser consumido por otros equipos con garantía
 - **Terraform >= 1.10** (necesario para `use_lockfile` en el backend S3 del consumer)
 - AWS CLI configurado con credenciales válidas (para los ejemplos)
 - Herramientas opcionales (se instalan durante el lab):
-  - `terraform-docs` >= 0.18
+  - `terraform-docs` >= 0.23
   - `pre-commit` >= 3.0
 
 ```bash
@@ -82,7 +82,7 @@ lab-26/
 
 ## Análisis del código
 
-### 1.1 Arquitectura del laboratorio
+### Arquitectura del laboratorio
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -102,7 +102,7 @@ lab-26/
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 El módulo: `secure-bucket`
+### El módulo: `secure-bucket`
 
 El módulo tiene todas las buenas prácticas de seguridad activables:
 
@@ -138,7 +138,7 @@ resource "aws_s3_bucket_logging" "this" {
 
 El bloqueo de acceso público está **siempre activado** (no configurable). El cifrado, versionado y logging son opcionales con valores por defecto seguros.
 
-### 1.3 Documentación automatizada — `terraform-docs`
+### Documentación automatizada — `terraform-docs`
 
 El README del módulo tiene marcadores especiales:
 
@@ -180,7 +180,7 @@ sort:
 
 **¿Por qué `mode: inject`?** Permite mantener contenido manual (ejemplos de uso, explicaciones) fuera de los marcadores, mientras que las tablas se regeneran automáticamente. Si usaras `mode: replace`, perdería todo el contenido manual.
 
-### 1.4 Catálogo de ejemplos
+### Catálogo de ejemplos
 
 ```
 examples/
@@ -209,7 +209,7 @@ Los ejemplos sirven para:
 - **Onboarding rápido**: copiar-pegar → funciona
 - **Cobertura**: el ejemplo avanzado ejercita todas las opciones del módulo
 
-### 1.5 Pre-commit — Pipeline local
+### Pre-commit — Pipeline local
 
 ```yaml
 # .pre-commit-config.yaml
@@ -238,7 +238,7 @@ git commit -m "feat: add logging"
 
 Si algún hook falla, el commit se rechaza. El desarrollador debe corregir el problema y volver a intentar. Esto garantiza que **todo commit tiene código formateado, documentación actualizada y sin vulnerabilidades conocidas**.
 
-### 1.6 Versionado semántico y Git tags
+### Versionado semántico y Git tags
 
 ```
 v1.0.0 ── Release inicial
@@ -266,7 +266,7 @@ source = "git::https://github.com/<org>/terraform-aws-secure-bucket.git"
 
 ## Despliegue
 
-### 2.1 Instalar herramientas
+### Instalar herramientas
 
 **terraform-docs:**
 
@@ -284,7 +284,7 @@ brew install terraform-docs
 # Linux sin gestor de paquetes — descarga del binario oficial
 # Importante: ejecútalo desde un directorio temporal (/tmp). El tar.gz incluye
 # un README.md que, extraído en otra ubicación, sobreescribiría archivos.
-TFDOCS_VERSION=v0.19.0
+TFDOCS_VERSION=v0.23.0
 cd /tmp
 curl -sSLo terraform-docs.tar.gz \
   "https://terraform-docs.io/dl/${TFDOCS_VERSION}/terraform-docs-${TFDOCS_VERSION}-linux-amd64.tar.gz"
@@ -294,7 +294,7 @@ rm -f terraform-docs.tar.gz README.md LICENSE
 cd -
 ```
 
-Otras opciones: `go install github.com/terraform-docs/terraform-docs@v0.22.0` si tienes Go, o el paquete oficial vía [terraform-docs.io](https://terraform-docs.io/user-guide/installation/).
+Otras opciones: `go install github.com/terraform-docs/terraform-docs@v0.23.0` si tienes Go, o el paquete oficial vía [terraform-docs.io](https://terraform-docs.io/user-guide/installation/).
 
 **pre-commit:**
 
@@ -310,13 +310,13 @@ Verificar instalación:
 
 ```bash
 terraform-docs version
-# v0.22.0
+# v0.23.0
 
 pre-commit --version
 # pre-commit 3.x.x
 ```
 
-### 2.2 Generar documentación
+### Generar documentación
 
 ```bash
 cd labs/lab-26/aws/modules/secure-bucket
@@ -329,7 +329,7 @@ terraform-docs markdown table \
 
 Verifica que el README del módulo ahora tiene las tablas de variables y outputs entre los marcadores `<!-- BEGIN_TF_DOCS -->` y `<!-- END_TF_DOCS -->`.
 
-### 2.3 Configurar pre-commit
+### Configurar pre-commit
 
 `pre-commit install` engancha los hooks al repositorio Git **donde se encuentre el `cd`**. Si lo ejecutas dentro de `labs/lab-26/aws`, Git localiza el repo padre (el del curso) y los hooks dispararían en cada commit a cualquier lab — no es lo que queremos.
 
@@ -405,9 +405,9 @@ pre-commit run --all-files
 
 > **Nota:** Si Trivy imprime *"Unable to derive number of available CPU cores"*, es un aviso inocuo (Trivy no detecta el límite de CPU del host). Puedes silenciarlo añadiendo `--hook-config=--parallelism-ci-cpu-cores=N` (donde `N` = nº de cores) al hook `terraform_trivy` del `.pre-commit-config.yaml`.
 
-A partir de aquí, todos los `git commit` posteriores en el sandbox pasarán por los hooks. Las pruebas de la sección 3.2 (commit con archivo desformateado) se ejecutan dentro de este sandbox. Cuando termines puedes borrarlo con `rm -rf /tmp/secure-bucket-sandbox`.
+A partir de aquí, todos los `git commit` posteriores en el sandbox pasarán por los hooks. Las pruebas de "Verificar pre-commit" más abajo (commit con archivo desformateado) se ejecutan dentro de este sandbox. Cuando termines puedes borrarlo con `rm -rf /tmp/secure-bucket-sandbox`.
 
-### 2.4 Probar el ejemplo básico
+### Probar el ejemplo básico
 
 ```bash
 cd modules/secure-bucket/examples/basic
@@ -422,7 +422,7 @@ terraform output
 terraform destroy
 ```
 
-### 2.5 Probar el ejemplo avanzado
+### Probar el ejemplo avanzado
 
 ```bash
 cd ../advanced
@@ -442,18 +442,18 @@ terraform destroy
 
 ## Verificación final
 
-### 3.1 Verificar terraform-docs
+### Verificar terraform-docs
 
 ```bash
 # Ver el README generado
-  more ../../README.md
+more ../../README.md
 ```
 
 Debe contener tablas con todas las variables y outputs entre los marcadores `<!-- BEGIN_TF_DOCS -->` y `<!-- END_TF_DOCS -->`.
 
-### 3.2 Verificar pre-commit
+### Verificar pre-commit
 
-Dentro del sandbox creado en 2.3 (`/tmp/secure-bucket-sandbox`):
+Dentro del sandbox creado en "Configurar pre-commit" (`/tmp/secure-bucket-sandbox`):
 
 ```bash
 cd /tmp/secure-bucket-sandbox
@@ -514,7 +514,7 @@ git reset HEAD modules/secure-bucket/test_fmt.tf 2>/dev/null || true
 
 > **Lección clave:** un solo archivo desformateado dispara una cascada de validaciones. El commit se rechaza no porque alguno sea "más importante" que otro, sino porque **cualquier hook que modifique archivos** falla por diseño — la idea es forzarte a revisar y re-añadir los cambios al staging antes de commitear.
 
-### 3.3 Verificar versionado con Git tag
+### Verificar versionado con Git tag
 
 Seguimos en el sandbox (`/tmp/secure-bucket-sandbox`), que es el repo que representa al módulo publicable:
 
@@ -532,7 +532,7 @@ git tag -l "v1.*"
 git show v1.0.0
 ```
 
-### 3.4 Probar el proyecto consumidor consumiendo el módulo por tag
+### Probar el proyecto consumidor consumiendo el módulo por tag
 
 El consumer vive en el repo del curso, **no en el sandbox**. El objetivo de este paso es cerrar el ciclo de gobernanza: ahora que el sandbox tiene `v1.0.0` etiquetado, el consumer debe **fetchear el módulo por tag** desde el sandbox — exactamente como lo haría en producción contra GitHub.
 
@@ -601,7 +601,7 @@ cd ~/terraform-on-aws/labs/lab-26/aws/consumer
 git checkout -- main.tf
 ```
 
-> **Por qué este paso es importante:** sin él, el tag `v1.0.0` creado en 3.3 sería puro ceremonial — nunca se usa. Con él, queda demostrada la cadena **publicar → versionar → consumir por `?ref=`**, que es justamente el punto del lab. En un escenario real, `git::file:///tmp/...` se sustituye por `git::https://github.com/<org>/terraform-aws-secure-bucket.git?ref=v1.0.0` y todo lo demás funciona idéntico.
+> **Por qué este paso es importante:** sin él, el tag `v1.0.0` creado en "Verificar versionado con Git tag" sería puro ceremonial — nunca se usa. Con él, queda demostrada la cadena **publicar → versionar → consumir por `?ref=`**, que es justamente el punto del lab. En un escenario real, `git::file:///tmp/...` se sustituye por `git::https://github.com/<org>/terraform-aws-secure-bucket.git?ref=v1.0.0` y todo lo demás funciona idéntico.
 
 ---
 
@@ -609,9 +609,9 @@ git checkout -- main.tf
 
 ### Reto 1 — Crear un CHANGELOG y simular un release con breaking change
 
-**Situación**: Has publicado `v1.0.0` del módulo en el sandbox (sección 3.3). Ahora, como mantenedor del módulo, necesitas añadir una nueva funcionalidad (variable `expiration_days`) y luego hacer un breaking change (renombrar `bucket_name` a `name`). Quieres seguir el flujo correcto de versionado semántico.
+**Situación**: Has publicado `v1.0.0` del módulo en el sandbox (paso "Verificar versionado con Git tag"). Ahora, como mantenedor del módulo, necesitas añadir una nueva funcionalidad (variable `expiration_days`) y luego hacer un breaking change (renombrar `bucket_name` a `name`). Quieres seguir el flujo correcto de versionado semántico.
 
-> **Dónde se hace el reto:** **todas las modificaciones del módulo van al sandbox** (`/tmp/secure-bucket-sandbox`), no al repo del curso. El sandbox representa el repo del módulo publicable; los tags, commits y CHANGELOG viven allí. El repo del curso queda intacto como "estado inicial v1.0.0" — esto evita contaminar tags del monorepo y refleja el flujo real (un equipo de plataforma mantiene el módulo, otros equipos lo consumen). La migración del consumer (sección 6 de este reto) sí toca el repo del curso, porque el consumer vive ahí.
+> **Dónde se hace el reto:** **todas las modificaciones del módulo van al sandbox** (`/tmp/secure-bucket-sandbox`), no al repo del curso. El sandbox representa el repo del módulo publicable; los tags, commits y CHANGELOG viven allí. El repo del curso queda intacto como "estado inicial v1.0.0" — esto evita contaminar tags del monorepo y refleja el flujo real (un equipo de plataforma mantiene el módulo, otros equipos lo consumen). La migración del consumer (Paso 6 de este reto) sí toca el repo del curso, porque el consumer vive ahí.
 
 **Tu objetivo**:
 
@@ -874,7 +874,7 @@ Hasta aquí todo era trabajo del **mantenedor del módulo** en el sandbox. Ahora
 En este lab el consumer vive en el repo del curso. La migración consiste en bumpear el `?ref=` y renombrar el argumento del módulo:
 
 ```bash
-cd ~/github/mios/terraform-on-aws/labs/lab-26/aws/consumer
+cd ~/terraform-on-aws/labs/lab-26/aws/consumer
 ```
 
 Edita `main.tf`:
@@ -1110,7 +1110,7 @@ Para eliminar el sandbox de pre-commit y los tags creados en él:
 rm -rf /tmp/secure-bucket-sandbox
 ```
 
-> **Nota:** No es necesario borrar tags en el repo del curso, porque la sección 3.3 los crea en el sandbox aislado, no en el repo padre.
+> **Nota:** No es necesario borrar tags en el repo del curso, porque "Verificar versionado con Git tag" los crea en el sandbox aislado, no en el repo padre.
 
 ---
 

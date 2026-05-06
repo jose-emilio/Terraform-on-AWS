@@ -41,7 +41,7 @@ resource "aws_eip" "nat" {
 }
 ```
 
-> **Coste trampa:** AWS cobra **$0.005/hora (~$3.60/mes)** por una EIP que NO está asociada a un recurso en uso. Si creas EIPs de más o dejas instancias paradas, el coste se acumula silenciosamente. Terraform te ayuda aquí: si la EIP y el NAT Gateway están en el mismo código, ambos se crean y destruyen juntos.
+> **Coste trampa:** AWS cobra **$0.005/hora (~$3.60/mes)** por una EIP que esté o NO asociada a un recurso en uso. Terraform te ayuda aquí: si la EIP y el NAT Gateway están en el mismo código, ambos se crean y destruyen juntos.
 
 ---
 

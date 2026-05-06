@@ -1,9 +1,9 @@
-# Laboratorio 23 — LocalStack: Cimientos de EC2: Despliegue Dinamico y Seguro
+# Laboratorio 27 — LocalStack: Cimientos de EC2: Despliegue Dinámico y Seguro
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guia adapta el lab27 para ejecutarse integramente en LocalStack. La configuracion es identica a la de AWS real: data source `aws_ami`, IAM Instance Profile, Security Group e instancia EC2 con IMDSv2. Solo cambia el `providers.tf`.
+Esta guía adapta el lab27 para ejecutarse íntegramente en LocalStack. La configuración es idéntica a la de AWS real: data source `aws_ami`, IAM Instance Profile, Security Group e instancia EC2 con IMDSv2. Sólo cambia el `providers.tf`.
 
 ## Prerrequisitos
 
@@ -38,7 +38,7 @@ provider "aws" {
 }
 ```
 
-> **Nota:** El data source `aws_ami` en LocalStack devuelve AMIs simuladas. El filtro se mantiene identico para validar la sintaxis, pero el ID devuelto no corresponde a una imagen real.
+> **Nota:** El data source `aws_ami` en LocalStack devuelve AMIs simuladas. El filtro se mantiene idéntico para validar la sintaxis, pero el ID devuelto no corresponde a una imagen real.
 
 ## 2. Despliegue
 
@@ -51,7 +51,7 @@ terraform plan
 terraform apply
 ```
 
-## 3. Verificacion
+## 3. Verificación
 
 ```bash
 awslocal ec2 describe-instances --filters "Name=tag:Name,Values=corp-lab27-web"
@@ -65,4 +65,4 @@ awslocal ec2 describe-security-groups --group-names corp-lab27-web-sg
 terraform destroy
 ```
 
-Consulta la guia principal en [../README.md](../README.md) para los conceptos y el despliegue en AWS.
+Consulta la guía principal en [../README.md](../README.md) para los conceptos y el despliegue en AWS.

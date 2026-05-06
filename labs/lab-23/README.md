@@ -33,7 +33,7 @@ Crear módulos que validen los datos antes de intentar crear infraestructura en 
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
+- lab-02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
 - Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
@@ -48,6 +48,8 @@ echo "Bucket: $BUCKET"
 ```
 lab-23/
 ├── README.md                                <- Esta guía
+├── arch/
+│   └── diagrama.svg                         <- Diagrama de la arquitectura del lab
 ├── aws/
 │   ├── providers.tf                         <- Backend S3 parcial
 │   ├── variables.tf                         <- Variables del Root Module
@@ -82,7 +84,7 @@ lab-23/
 
 ## Análisis del código
 
-### 1.1 Arquitectura del laboratorio
+### Arquitectura del laboratorio
 
 ![Root Module orquesta 3 módulos con tres técnicas distintas de validación: validation, object+sensitive, postcondition](arch/diagrama.svg)
 
@@ -92,7 +94,7 @@ Cada módulo encapsula una técnica de validación diferente. El Root Module los
 - **`validated-bucket`** — `validation` en la variable `bucket_name` con `can(regex(...))` que exige el prefijo `empresa-` (validación **antes** del plan, sin tocar la API de AWS).
 - **`db-config`** — `variable "db_config"` de tipo `object({})` con `optional(...)` para campos con default + `db_password` marcada como `sensitive` (oculta en logs / plan / apply pero sí en state).
 
-### 1.2 Módulo `validated-bucket` — Regex en la interfaz del módulo
+### Módulo `validated-bucket` — Regex en la interfaz del módulo
 
 ```hcl
 # modules/validated-bucket/variables.tf
@@ -134,7 +136,7 @@ Terraform rechaza el valor **antes** de contactar con AWS. No se crea ningún re
 
 La validación está **dentro del módulo**, no en el Root Module. Esto significa que cualquier equipo que reutilice `validated-bucket` obtendrá la validación gratis, sin necesidad de recordar añadirla.
 
-### 1.3 Módulo `db-config` — Tipos complejos y secretos
+### Módulo `db-config` — Tipos complejos y secretos
 
 #### Variable `object` con campos opcionales
 
@@ -259,7 +261,7 @@ resource "aws_ssm_parameter" "db_config_json" {
 }
 ```
 
-### 1.4 Módulo `safe-network` — Postcondición RFC 1918
+### Módulo `safe-network` — Postcondición RFC 1918
 
 ```hcl
 # modules/safe-network/main.tf
@@ -304,7 +306,7 @@ Error: Resource postcondition failed
   El CIDR 52.0.0.0/16 no es un rango privado RFC 1918.
 ```
 
-### 1.5 Root Module — Orquestación de módulos
+### Root Module — Orquestación de módulos
 
 ```hcl
 # main.tf (Root Module)
@@ -397,7 +399,7 @@ Nota que la contraseña **no aparece** en los outputs gracias a `sensitive = tru
 
 ## Verificación final
 
-### 3.1 Probar que las validaciones rechazan valores inválidos
+### Probar que las validaciones rechazan valores inválidos
 
 ```bash
 # Bucket sin prefijo corporativo → debe fallar
@@ -418,8 +420,8 @@ terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=corta'
 # Error: Invalid value for variable
 #   La contraseña debe tener al menos 12 caracteres.
 
-# Contraseña suficientemente larga pero todo minúsculas/numérico → fallan
-# DOS validaciones (mayúscula y otro carácter), cada una con su mensaje:
+# Contraseña suficientemente larga y con dígito pero sin mayúsculas → falla
+# solo la regla de mayúscula:
 terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=todoenlowercase123'
 # Error: Invalid value for variable
 #   La contraseña debe contener al menos una letra mayúscula (A-Z).
@@ -432,7 +434,7 @@ terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=Password
 
 Las cuatro reglas (`length`, mayúscula, minúscula, dígito) están en `validation` blocks separados — Terraform reporta **cada** una que falle, así que el alumno ve exactamente qué corregir en lugar de un mensaje genérico.
 
-### 3.2 Verificar el bucket S3
+### Verificar el bucket S3
 
 ```bash
 BUCKET_NAME=$(terraform output -raw bucket_id)
@@ -444,7 +446,7 @@ aws s3api get-bucket-tagging --bucket $BUCKET_NAME \
   --query 'TagSet[].{Key: Key, Value: Value}' --output table
 ```
 
-### 3.3 Verificar la configuración en SSM
+### Verificar la configuración en SSM
 
 ```bash
 SSM_PREFIX=$(terraform output -raw ssm_prefix)
@@ -457,7 +459,7 @@ aws ssm get-parameters-by-path \
 
 Debe mostrar los parámetros individuales: engine, engine-version, instance-class, port, y el JSON completo de config.
 
-### 3.4 Verificar el secreto (sin exponer la contraseña)
+### Verificar el secreto (sin exponer la contraseña)
 
 ```bash
 SECRET_ARN=$(terraform output -raw secret_arn)
@@ -475,7 +477,7 @@ aws secretsmanager get-secret-value \
   --output text
 ```
 
-### 3.5 Probar la postcondición RFC 1918
+### Probar la postcondición RFC 1918
 
 ```bash
 # CIDR público → la postcondición debe fallar

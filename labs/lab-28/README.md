@@ -1,4 +1,4 @@
-# Laboratorio 28: Escalabilidad y Alta Disponibilidad con Zero Downtime
+# Laboratorio 28 — Escalabilidad y Alta Disponibilidad con Zero Downtime
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -22,8 +22,8 @@ Al finalizar este laboratorio serás capaz de:
 
 ## Requisitos Previos
 
-- Terraform >= 1.5 instalado
-- Laboratorio 2 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
+- **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
+- Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - Perfil AWS con permisos sobre EC2, VPC, ELB, Auto Scaling e IAM
 - LocalStack en ejecución (para la sección de LocalStack)
 
@@ -118,7 +118,7 @@ El campo `triggers = ["launch_template"]` le indica a Terraform que debe iniciar
 lab28/
 ├── aws/
 │   ├── aws.s3.tfbackend  # Parámetros del backend S3 (sin bucket)
-│   ├── providers.tf      # Backend S3, Terraform >= 1.5, provider AWS
+│   ├── providers.tf      # Backend S3, Terraform >= 1.10, provider AWS
 │   ├── variables.tf      # region, project, vpc_cidr, instance_type, sizes, app_version
 │   ├── main.tf           # VPC, ALB, Launch Template, ASG, scaling policy
 │   ├── outputs.tf        # URL del ALB, nombre del ASG, versión del Launch Template
@@ -135,7 +135,7 @@ lab28/
 
 ## Despliegue en AWS Real
 
-### 1.1 Arquitectura
+### Arquitectura
 
 ```
 Internet
@@ -160,7 +160,7 @@ Internet
 
 Cada AZ tiene su propio NAT Gateway: si una zona cae, las instancias de las otras AZs conservan conectividad de salida. Las instancias del ASG nunca reciben tráfico directo de Internet; todo el tráfico entrante pasa por el ALB.
 
-### 1.2 Código Terraform
+### Código Terraform
 
 **`aws/main.tf`** — Fragmentos clave:
 
@@ -197,7 +197,7 @@ echo 'Header always set Connection "close"' > /etc/httpd/conf.d/lab28.conf
 systemctl enable --now httpd
 ```
 
-### 1.3 Inicialización y despliegue
+### Inicialización y despliegue
 
 ```bash
 export BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
@@ -224,7 +224,7 @@ launch_template_latest_version = 1
 private_subnet_ids             = ["subnet-aaa", "subnet-bbb"]
 ```
 
-### 1.4 Verificar la distribución Multi-AZ y el ALB
+### Verificar la distribución Multi-AZ y el ALB
 
 Espera ~2 minutos a que las instancias superen los health checks del target group.
 
@@ -249,7 +249,7 @@ aws autoscaling describe-auto-scaling-groups \
   --output table
 ```
 
-### 1.5 Demostrar el Rolling Update (Instance Refresh)
+### Demostrar el Rolling Update (Instance Refresh)
 
 Cambia la versión de la aplicación para generar una nueva versión del Launch Template. El ASG detectará el cambio y reemplazará las instancias gradualmente manteniendo el servicio activo.
 
@@ -291,7 +291,7 @@ v2 | AZ: us-east-1a | ID: i-0xyz789
 v2 | AZ: us-east-1b | ID: i-0uvw012
 ```
 
-### 1.6 Demostrar el Target Tracking Scaling
+### Demostrar el Target Tracking Scaling
 
 Genera carga artificial en una instancia para observar cómo el ASG añade capacidad automáticamente.
 
@@ -317,7 +317,7 @@ aws ssm start-session --target <INSTANCE_ID>
 ```bash
 sudo dnf install -y stress
 
-# 2 workers de CPU durante 5 minutos (uno por vCPU en t4g.micro)
+# 2 workers de CPU durante 5 minutos (uno por vCPU en t4g.small)
 stress --cpu 2 --timeout 300
 ```
 
@@ -344,7 +344,7 @@ El ASG aumentará `DesiredCapacity` para mantener la CPU media en torno al 50%. 
 # Obtener la URL del ALB
 ALB_URL=$(terraform output -raw alb_url)
 
-# Probar la aplicacion
+# Probar la aplicación
 curl -s "http://${ALB_URL}" | head -5
 
 # Verificar que el ASG tiene instancias en servicio
@@ -353,10 +353,7 @@ aws autoscaling describe-auto-scaling-groups \
   --output table
 
 # Ver el estado del target group
-TG_ARN=$(terraform output -raw target_group_arn 2>/dev/null || \
-  aws elbv2 describe-target-groups \
-    --query 'TargetGroups[?contains(TargetGroupName,`lab28`)].TargetGroupArn' \
-    --output text)
+TG_ARN=$(terraform output -raw target_group_arn)
 aws elbv2 describe-target-health \
   --target-group-arn "$TG_ARN" \
   --query 'TargetHealthDescriptions[*].{ID:Target.Id,State:TargetHealth.State}' \

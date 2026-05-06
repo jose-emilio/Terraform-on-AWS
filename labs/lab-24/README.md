@@ -64,6 +64,8 @@ echo "Bucket: $BUCKET"
 ```
 lab-24/
 ├── README.md                                <- Esta guía
+├── arch/
+│   └── diagrama.svg                         <- Diagrama de la arquitectura del lab
 ├── aws/
 │   ├── providers.tf                         <- Backend S3 parcial
 │   ├── variables.tf                         <- Variables del Root Module
@@ -81,7 +83,7 @@ lab-24/
 
 ## Análisis del código
 
-### 1.1 Arquitectura del laboratorio
+### Arquitectura del laboratorio
 
 ![Wrapper corporate-rds que compone los módulos públicos VPC y RDS del Registry con compliance hardcoded](arch/diagrama.svg)
 
@@ -90,7 +92,7 @@ El wrapper contiene tres componentes:
 2. **Security group**: restringe el acceso a RDS solo desde las subredes privadas
 3. **Módulo público RDS**: crea la base de datos con parámetros de seguridad hardcoded
 
-### 1.2 Composición de módulos — VPC del Registry
+### Composición de módulos — VPC del Registry
 
 ```hcl
 module "vpc" {
@@ -124,7 +126,7 @@ Puntos clave:
 - `create_database_subnet_group = true` crea automáticamente el subnet group que RDS necesita
 - Los CIDRs se calculan con `cidrsubnet()`: públicas en `x.x.0.0/24`, `x.x.1.0/24`; privadas en `x.x.10.0/24`, `x.x.11.0/24`; database en `x.x.20.0/24`, `x.x.21.0/24`
 
-### 1.3 Encadenamiento de outputs — VPC → RDS
+### Encadenamiento de outputs — VPC → RDS
 
 ```hcl
 module "rds" {
@@ -151,7 +153,7 @@ module.vpc.private_subnets_cidr_blocks ──► aws_security_group.rds.ingress.
 
 Terraform resuelve estas dependencias automáticamente: primero crea la VPC, luego el security group, y finalmente la instancia RDS. No se necesita `depends_on` explícito porque las referencias implican el orden.
 
-### 1.4 Estandarización — Parámetros hardcoded
+### Estandarización — Parámetros hardcoded
 
 ```hcl
 module "rds" {
@@ -189,7 +191,7 @@ Error: Unsupported argument
 
 Este es el poder del patrón wrapper: **cumplimiento por diseño**, no por convención.
 
-### 1.5 Contraseña gestionada por RDS
+### Contraseña gestionada por RDS
 
 ```hcl
 manage_master_user_password = true
@@ -205,7 +207,7 @@ output "db_master_user_secret_arn" {
 
 Las aplicaciones pueden recuperar la contraseña desde Secrets Manager usando el SDK de AWS, sin que ningún humano necesite conocerla.
 
-### 1.6 Root Module — Interfaz simplificada
+### Root Module — Interfaz simplificada
 
 ```hcl
 module "corporate_rds" {
@@ -270,7 +272,7 @@ terraform output
 
 ## Verificación final
 
-### 3.1 Verificar la VPC y subredes
+### Verificar la VPC y subredes
 
 ```bash
 VPC_ID=$(terraform output -raw vpc_id)
@@ -284,11 +286,9 @@ aws ec2 describe-subnets \
 
 Debe mostrar 6 subredes: 2 públicas, 2 privadas, 2 de base de datos.
 
-### 3.2 Verificar parámetros de seguridad de RDS
+### Verificar parámetros de seguridad de RDS
 
 ```bash
-DB_ID=$(terraform output -raw db_endpoint | cut -d: -f1 | sed 's/.us-east-1.rds.amazonaws.com//')
-
 aws rds describe-db-instances \
   --db-instance-identifier lab24-db \
   --query 'DBInstances[0].{
@@ -307,13 +307,10 @@ Debe mostrar:
 - `DeletionProtection: true` — hardcoded por el wrapper
 - `PubliclyAccessible: false` — hardcoded por el wrapper
 
-### 3.3 Verificar security group
+### Verificar security group
 
 ```bash
-SG_ID=$(terraform output -raw security_group_id 2>/dev/null || \
-  aws ec2 describe-security-groups \
-    --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=lab24-rds-*" \
-    --query 'SecurityGroups[0].GroupId' --output text)
+SG_ID=$(terraform output -raw security_group_id)
 
 aws ec2 describe-security-groups \
   --group-ids $SG_ID \
@@ -323,7 +320,7 @@ aws ec2 describe-security-groups \
 
 Debe mostrar que el ingreso solo está permitido desde los CIDRs de las subredes privadas (`10.20.10.0/24`, `10.20.11.0/24`).
 
-### 3.4 Verificar la contraseña en Secrets Manager
+### Verificar la contraseña en Secrets Manager
 
 ```bash
 SECRET_ARN=$(terraform output -raw db_secret_arn)

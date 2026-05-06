@@ -1,20 +1,20 @@
-# Laboratorio 25 — LocalStack: Microservicios con ECS Fargate y Malla de Servicios
+# Laboratorio 29 — LocalStack: Microservicios con ECS Fargate y Malla de Servicios
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Este documento describe cómo ejecutar el laboratorio 25 contra LocalStack. El código Terraform es el mismo que en `aws/`; solo cambia la configuración del provider.
+Este documento describe cómo ejecutar el laboratorio 29 contra LocalStack. El código Terraform es el mismo que en `aws/`; solo cambia la configuración del provider.
 
 ## Requisitos Previos
 
 - LocalStack en ejecución: `localstack start -d`
-- Terraform >= 1.5
+- Terraform >= 1.10
 
 ---
 
-## 1. Despliegue en LocalStack
+## Despliegue en LocalStack
 
-### 1.1 Limitaciones conocidas
+### Limitaciones conocidas
 
 LocalStack Community simula los servicios de AWS con algunas restricciones relevantes para este laboratorio:
 
@@ -32,7 +32,7 @@ LocalStack Community simula los servicios de AWS con algunas restricciones relev
 
 El valor del laboratorio con LocalStack radica en verificar que el código Terraform es sintácticamente válido y que todos los recursos se crean sin errores de API. Para observar el comportamiento real de Service Connect, la inyección de secretos SSM y el Circuit Breaker, se requiere AWS real.
 
-### 1.2 Inicialización y despliegue
+### Inicialización y despliegue
 
 Asegúrate de que LocalStack está en ejecución:
 
@@ -49,7 +49,7 @@ terraform plan
 terraform apply
 ```
 
-### 1.3 Verificación
+### Verificación
 
 Comprueba que los recursos se han creado correctamente:
 
@@ -91,7 +91,7 @@ awslocal servicediscovery list-namespaces \
 
 ---
 
-## 2. Limpieza
+## Limpieza
 
 ```bash
 # Desde lab29/localstack/
@@ -100,7 +100,7 @@ terraform destroy
 
 ---
 
-## 3. Comparativa AWS Real vs LocalStack
+## Comparativa AWS Real vs LocalStack
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
@@ -117,7 +117,7 @@ terraform destroy
 
 ---
 
-## 4. Buenas Prácticas
+## Buenas Prácticas
 
 - Usa LocalStack para validar la sintaxis de las task definitions y los `jsonencode()` antes de desplegar en AWS real.
 - Para probar el comportamiento dinámico de Service Connect, la autenticación por header y el Circuit Breaker, usa AWS real.
@@ -126,7 +126,7 @@ terraform destroy
 
 ---
 
-## 5. Recursos Adicionales
+## Recursos Adicionales
 
 - [LocalStack — ECR](https://docs.localstack.cloud/aws/services/ecr/)
 - [LocalStack — ECS](https://docs.localstack.cloud/aws/services/ecs/)
