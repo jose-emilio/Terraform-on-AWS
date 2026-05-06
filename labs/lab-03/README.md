@@ -133,6 +133,14 @@ Esta estructura sigue la nomenclatura estándar recomendada por HashiCorp: cada 
 
 ---
 
+## Arquitectura
+
+![VPC parametrizada con tipos complejos, cidrsubnet() y bloques dynamic en el Security Group](arch/diagrama.svg)
+
+Una VPC con CIDR parametrizado (`var.vpc_cidr`, validado contra RFC 1918), 4 subredes (2 públicas + 2 privadas) generadas con `cidrsubnet()` para evitar el cálculo manual, y un Security Group cuyas reglas se generan con un bloque `dynamic "ingress"` iterando sobre una lista tipada (`list(object(...))`). Añadir o quitar puertos = editar el list, sin tocar el SG ni duplicar bloques.
+
+---
+
 ## 1. Despliegue en AWS Real
 
 ### 1.1 Código Terraform

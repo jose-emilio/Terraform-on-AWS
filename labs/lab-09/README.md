@@ -145,6 +145,16 @@ lab09/
 
 ---
 
+## Arquitectura
+
+![Workspaces Terraform: una sola base de código → múltiples states (Dev / Prod) seleccionados por terraform.workspace + check + precondition](arch/diagrama.svg)
+
+Una sola base de código que cambia su comportamiento según `terraform.workspace`: un `lookup()` selecciona el bloque de configuración (instance_type, CIDR) aplicable al entorno actual. El backend S3 separa los states automáticamente bajo `env:/<workspace>/`. El bloque `check {}` añade validaciones no bloqueantes (warnings) y `lifecycle.precondition` aborta el plan si el workspace activo no está mapeado (evita usar el `default` por accidente).
+
+> **Cuándo NO usar workspaces:** si los entornos divergen mucho (Dev tiene Aurora pero Prod tiene RDS), mejor usar **state splitting** ([lab-10](../lab-10/README.md)) o directorios separados con módulos compartidos.
+
+---
+
 ## Despliegue en AWS Real
 
 ### 1.1 Código Terraform

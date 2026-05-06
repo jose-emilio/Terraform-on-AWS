@@ -32,32 +32,9 @@ administradores de la llave (que gestionan su ciclo de vida) de las aplicaciones
 
 ## Arquitectura
 
-```
-                    ┌───────────────── KMS ─────────────────────────┐
-                    │                                               │
-                    │  aws_kms_key "main"                           │
-                    │    enable_key_rotation = true (anual)         │
-                    │    deletion_window     = 7 días               │
-                    │    Key Policy:                                │
-                    │      Root account  → kms:*                    │
-                    │      Administradores → gestión ciclo de vida  │
-                    │      Usuarios finales → Encrypt / Decrypt     │
-                    │                                               │
-                    │  aws_kms_alias "main"                         │
-                    │    alias/lab13-main ──► Key ID (UUID)         │
-                    │                                               │
-                    └──────────┬──────────────────┬─────────────────┘
-                               │                  │
-                    ┌──── EBS ─▼──────┐  ┌── S3 ──▼─────────────────┐
-                    │                 │  │                          │
-                    │ aws_ebs_volume  │  │ aws_s3_bucket            │
-                    │  type  = gp3    │  │  SSE-KMS → alias/lab13   │
-                    │  encrypted      │  │  bucket_key_enabled      │
-                    │  kms_key_id     │  │  Bucket Policy:          │
-                    │  = alias ARN    │  │    DenyNonKMSUploads     │
-                    │                 │  │    DenyWrongKMSKey       │
-                    └─────────────────┘  └──────────────────────────┘
-```
+![KMS CMK con Key Policy segregada (root/admin/user) + alias + cifrado de EBS y S3 + bucket policy con deny explícitos](arch/diagrama.svg)
+
+Una Customer Managed Key (CMK) con `enable_key_rotation = true` y un alias `alias/lab13-main` (capa de indirección que permite rotar la CMK sin tocar a los consumidores). La Key Policy segrega tres roles: **root** (recuperación de emergencia), **administradores** (gestión del ciclo de vida sin Encrypt/Decrypt) y **usuarios finales** (Encrypt/Decrypt sin gestión). La CMK cifra dos servicios: un volumen EBS gp3 (envelope encryption con data keys por bloque) y un bucket S3 con SSE-KMS, `bucket_key_enabled = true` (-99% coste KMS) y bucket policy con dos `Deny` explícitos (`DenyNonKMSUploads` + `DenyWrongKMSKey`).
 
 ## Conceptos clave
 

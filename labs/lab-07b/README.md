@@ -64,46 +64,11 @@ export TFC_WORKSPACE="lab07b-dev"               # nombre del workspace
 
 ## Arquitectura
 
-```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                         TERRAFORM CLOUD (HCP)                                ║
-║                                                                              ║
-║  ┌─────────────────────────────────────────────────────────────────────┐     ║
-║  │  Organización: terraform-labs-<ACCOUNT_ID>                          │     ║
-║  │                                                                     │     ║
-║  │  ┌───────────────────────────┐   ┌───────────────────────────┐      │     ║
-║  │  │  Workspace: lab07b-dev    │   │  Workspace: lab07b-prod   │      │     ║
-║  │  │  (Reto 3)                 │   │  Execution: Remote        │      │     ║
-║  │  │  Execution: Remote        │   │  Variables: AWS creds     │      │     ║
-║  │  │  Variables: AWS creds     │   │  Estado: versionado       │      │     ║
-║  │  │  Estado: versionado       │   └───────────────────────────┘      │     ║
-║  │  └───────────────────────────┘                                      │     ║
-║  │                    │  state / runs / vars                           │     ║
-║  └────────────────────┼────────────────────────────────────────────────┘     ║
-╚═══════════════════════╪══════════════════════════════════════════════════════╝
-                        │  terraform plan / apply
-                        │  (ejecutado en agentes HCP o local según modo)
-                        ▼
-╔═══════════════════════════════════════════════════════╗
-║                    AWS (us-east-1)                    ║
-║                                                       ║
-║  ┌──────────────────────────────────────────────┐     ║
-║  │  VPC: lab07b-vpc  (10.0.0.0/16)              │     ║
-║  │                                              │     ║
-║  │  ┌────────────────────┐                      │     ║
-║  │  │  Subnet pública    │                      │     ║
-║  │  │  10.0.1.0/24       │                      │     ║
-║  │  └────────────────────┘                      │     ║
-║  │                                              │     ║
-║  │  Internet Gateway                            │     ║
-║  │  Route Table (0.0.0.0/0 → IGW)               │     ║
-║  └──────────────────────────────────────────────┘     ║
-╚═══════════════════════════════════════════════════════╝
-```
+![HCP Terraform como backend SaaS + ejecución remota + OIDC Dynamic Credentials → AWS sin secretos estáticos](arch/diagrama.svg)
 
 El bloque `cloud {}` en `providers.tf` es el único punto de unión entre el código local y
 la plataforma HCP. Terraform CLI se autentica con el token generado en el Paso 1 y delega
-la ejecución y el almacenamiento del estado al workspace configurado.
+la ejecución y el almacenamiento del estado al workspace configurado. Con OIDC Dynamic Credentials, los runs en HCP solicitan un JWT que intercambian por credenciales temporales de STS — sin almacenar `AWS_ACCESS_KEY_ID` en el workspace.
 
 ## Conceptos clave
 

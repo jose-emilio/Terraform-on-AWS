@@ -32,35 +32,9 @@ Las credenciales estáticas (Access Key ID + Secret Access Key) son el vector de
 
 ## Arquitectura
 
-```
-                    ┌──────────────────── IAM ─────────────────────┐
-                    │                                              │
-                    │  aws_iam_group "developers"                  │
-                    │    └── Política: EC2 + IAM read-only         │
-                    │          │ (membresía)                       │
-                    │  aws_iam_user "dev-01"                       │
-                    │                                              │
-                    │  aws_iam_role "ec2-role"                     │
-                    │    Trust Policy → ec2.amazonaws.com          │
-                    │    ├── AmazonSSMManagedInstanceCore          │
-                    │    └── AmazonEC2ReadOnlyAccess               │
-                    │          │ (contenedor)                      │
-                    │  aws_iam_instance_profile "ec2-profile"      │
-                    │                                              │
-                    └──────────────────┬───────────────────────────┘
-                                       │ asociado a
-                    ┌───── EC2 ────────▼───────────────────────────┐
-                    │                                              │
-                    │   aws_instance "app" (t4g.micro, AL2023)     │
-                    │   Sin clave SSH — acceso exclusivo por SSM   │
-                    │   IMDSv2 obligatorio (http_tokens=required)  │
-                    │                                              │
-                    │   IMDS (169.254.169.254)                     │
-                    │     └──► STS ──► Credenciales temporales     │
-                    │           (AccessKeyId / Token / Expiration) │
-                    │                                              │
-                    └──────────────────────────────────────────────┘
-```
+![IAM users + grupo + role con Trust Policy → Instance Profile → EC2 con IMDSv2 obligatorio + STS](arch/diagrama.svg)
+
+El usuario `dev-01` representa a una persona (credenciales estáticas) miembro del grupo `developers`. El `ec2-role` tiene Trust Policy con principal `ec2.amazonaws.com` (solo el servicio EC2 puede asumirlo). El `instance_profile` es el conector EC2 ↔ Role (EC2 no usa roles directamente). La instancia obtiene credenciales temporales firmadas por STS a través de IMDSv2 (con `http_tokens = required` para mitigar SSRF) — sin par de claves SSH, acceso exclusivo por SSM Session Manager.
 
 ## Conceptos clave
 

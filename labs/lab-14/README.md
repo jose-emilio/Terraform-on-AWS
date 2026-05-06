@@ -36,35 +36,9 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 
 ## Arquitectura
 
-```
-                         terraform apply
-                              │
-              ┌───────────────▼────────────────────┐
-              │         random_password            │
-              │    genera 32 chars (entropía OS)   │
-              │    nunca aparece en plan/logs      │
-              └───────┬───────────────┬────────────┘
-                      │               │
-         ┌────────────▼─────┐  ┌──────▼───────────────────┐
-         │  Secrets Manager │  │    aws_db_instance       │
-         │  secret_version  │  │    password = result     │
-         │  jsonencode({    │  │    (inyección directa)   │
-         │    user, pass,   │  └──────────────────────────┘
-         │    host, port... │
-         │  })              │
-         └────────┬─────────┘
-                  │ cifrado con
-         ┌────────▼─────────────────────────────────┐
-         │              KMS CMK                     │
-         │   alias/lab14-secrets                    │
-         │   enable_key_rotation = true             │
-         │                                          │
-         │   Cifra tres capas:                      │
-         │   ├── Secrets Manager (secret_string)    │
-         │   ├── RDS (almacenamiento en disco)      │
-         │   └── Backend S3 (.tfstate)              │
-         └──────────────────────────────────────────┘
-```
+![Zero-Touch secrets: random_password → inyección directa en RDS y JSON en Secrets Manager + KMS cifra Secrets, RDS y backend S3](arch/diagrama.svg)
+
+Patrón Zero-Touch — ningún humano ve la contraseña. Terraform la genera con `random_password` (32 chars, entropía CSPRNG del SO), la inyecta directamente como `password` en `aws_db_instance` y como JSON estructurado (`jsonencode({user, pass, host, port, dbname})`) en `aws_secretsmanager_secret_version`. Una CMK (`alias/lab14-secrets`) con rotación anual cifra tres capas distintas: el `secret_string` de Secrets Manager, el almacenamiento on-disk de RDS y el `.tfstate` del backend S3 (hardening crítico — el password se almacena en texto plano en el state). Las aplicaciones consumen el JSON con una sola llamada a `aws secretsmanager get-secret-value`.
 
 ## Conceptos clave
 

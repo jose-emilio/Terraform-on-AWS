@@ -55,6 +55,15 @@ lab11/
     └── localstack.s3.tfbackend  ← Backend completo para LocalStack
 ```
 
+## Arquitectura
+
+![Drift detection (refresh/plan) + DR 3-2-1: restaurar tfstate desde versionado S3](arch/diagrama.svg)
+
+Dos fases:
+
+- **Detección de drift:** `terraform plan` compara el state contra AWS real. Cuando difieren (alguien editó tags por consola), Terraform muestra el diff. Estrategia A "Terraform gana" — `apply` revierte el cambio. Estrategia B "la realidad gana" — `apply -refresh-only` o editar el código para reconciliar.
+- **DR 3-2-1 sobre el tfstate:** el versionado S3 del lab-02 mantiene la historia de cada cambio. Si el tfstate se corrompe, `aws s3api list-object-versions` localiza la última versión sana y `get-object --version-id` la restaura. Cross-Region Replication (opcional) cubre el "1 off-site".
+
 ## Despliegue inicial
 
 ```bash

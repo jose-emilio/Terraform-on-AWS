@@ -131,6 +131,14 @@ lab04/
 
 ---
 
+## Arquitectura
+
+![IAM users con for_each + AMI Ubuntu vía data source + Launch Template con lifecycle.create_before_destroy (blue-green)](arch/diagrama.svg)
+
+Cuatro mecanismos clave combinados: (1) `for_each` sobre `map(object)` para crear N usuarios IAM con direccionamiento estable por clave; (2) `data "aws_ami"` con filtro `most_recent` para resolver dinámicamente la AMI ARM más reciente de Canonical; (3) `aws_launch_template` con `lifecycle.create_before_destroy = true` que ante un cambio de AMI crea la versión nueva antes de destruir la antigua (despliegue blue-green sin ventana de capacidad cero); (4) expresión `for` en outputs para exponer ARNs por usuario.
+
+---
+
 ## 1. Despliegue en AWS Real
 
 ### 1.1 Código Terraform

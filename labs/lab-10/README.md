@@ -53,17 +53,7 @@ Estado monolítico (un solo tfstate)
 
 La solución es separar la infraestructura en proyectos Terraform independientes, cada uno con su propio estado. Cada capa solo gestiona los recursos de su dominio y expone una interfaz pública mínima a través de `output`.
 
-```
-Capa de Red (network/tfstate)          Capa de Cómputo (compute/tfstate)
-┌──────────────────────────┐           ┌──────────────────────────────────┐
-│  aws_vpc.main            │           │  data "terraform_remote_state"   │
-│  aws_subnet.public       │  outputs  │    └── vpc_id (solo lectura)     │
-│                          │ ────────► │  aws_security_group.app          │
-│  output "vpc_id"         │           │                                  │
-│  output "subnet_id"      │           │                                  │
-└──────────────────────────┘           └──────────────────────────────────┘
-      Estado aislado                         Estado aislado
-```
+![State splitting: capa de red y capa de cómputo con tfstates aislados, comunicadas vía terraform_remote_state](arch/diagrama.svg)
 
 Un error o destrucción en la capa de cómputo **no toca** el estado de la capa de red. El blast radius queda contenido al dominio afectado.
 

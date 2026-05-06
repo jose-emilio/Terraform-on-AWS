@@ -97,6 +97,14 @@ lab-07/
 
 ---
 
+## Arquitectura
+
+![Backend remoto profesional: tfstate en S3 cifrado + lock distribuido en DynamoDB para applies concurrentes](arch/diagrama.svg)
+
+El bloque `backend "s3"` apunta al bucket compartido del lab-02 (`encrypt = true`, versionado heredado) y a una nueva tabla DynamoDB `terraform-state-locks` (hash key `LockID`, billing PAY_PER_REQUEST) que actúa como mutex distribuido: cada `apply` hace `PutItem` con condition expression — si el item ya existe (otro apply en curso), STS rechaza con `ConditionalCheckFailedException` y el segundo cliente recibe "Error acquiring the state lock". Al terminar, `DeleteItem` libera el lock. Sin DynamoDB, dos applies concurrentes escribirían el tfstate en orden indeterminado → corrupción.
+
+---
+
 ## 1. Despliegue
 
 ### 1.1 Prerrequisito: bucket del lab-02

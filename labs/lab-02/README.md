@@ -105,6 +105,23 @@ Cada subdirectorio es un proyecto Terraform independiente con su propio estado. 
 
 ---
 
+## Arquitectura
+
+![Bucket S3 fundacional con versionado, cifrado AES-256 y bloqueo de acceso público — backend de tfstate compartido](arch/diagrama.svg)
+
+> Fuente editable: [`diagrama.drawio`](diagrama.drawio) — abrir con la extensión
+> [Draw.io Integration](https://marketplace.visualstudio.com/items?itemName=hediet.vscode-drawio)
+> de VS Code o en [app.diagrams.net](https://app.diagrams.net).
+
+Un único bucket `terraform-state-labs-<ACCOUNT_ID>` con tres recursos de configuración:
+- `aws_s3_bucket_versioning` (Enabled) — base para la recuperación de estado del lab-11.
+- `aws_s3_bucket_server_side_encryption_configuration` (AES256) — cifrado at-rest.
+- `aws_s3_bucket_public_access_block` (4 flags `true`) — defensa contra exposición accidental.
+
+Cada lab posterior usa un prefijo distinto dentro del bucket (`lab07/...`, `lab10/network/...`, etc.) como `key` del backend S3. **No destruyas este bucket al final del lab** — es un recurso compartido del que dependen el resto de laboratorios.
+
+---
+
 ## 1. Creación del Bucket en AWS Real
 
 ### 1.1 Código Terraform
