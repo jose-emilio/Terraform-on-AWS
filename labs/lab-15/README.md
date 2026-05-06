@@ -42,42 +42,21 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 
 ## Arquitectura
 
-```
-GitHub Actions Job
-┌─────────────────────────────────────────────────────────┐
-│                                                         │
-│  1. Runner solicita token OIDC firmado por GitHub       │
-│        │                                                │
-│  2. aws-actions/configure-aws-credentials               │
-│        │  POST https://sts.amazonaws.com                │
-│        │  Action: AssumeRoleWithWebIdentity             │
-│        │  Token: <jwt firmado por GitHub>               │
-│        ▼                                                │
-│  3. IAM valida:                                         │
-│        - aud == "sts.amazonaws.com"                     │
-│        - sub == "repo:<org>/<repo>:<ref>"               │
-│        - Emisor == token.actions.githubusercontent.com  │
-│        │                                                │
-│  4. STS devuelve credenciales temporales (1h)           │
-│        │                                                │
-│  5. terraform plan / apply con credenciales efímeras    │
-│                                                         │
-│  ┌─── Antes del plan ───────────────────────────────┐   │
-│  │  checkov --directory aws/                        │   │
-│  │  trivy config aws/                               │   │
-│  │  conftest test aws/*.tf --policy policies/       │   │
-│  └──────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-                          │
-                    ┌─────▼──────┐
-                    │    AWS     │
-                    │  IAM Role  │◄── Trust: OIDC Provider
-                    │  (efímero) │    (token.actions.githubusercontent.com)
-                    └─────┬──────┘
-                          │ permisos mínimos
-                          ▼
-                    S3 (tfstate + lock nativo .tflock)
-```
+![Arquitectura del pipeline DevSecOps con federación OIDC GitHub Actions ↔ AWS](arch/diagrama.svg)
+
+> Fuente editable: [`diagrama.drawio`](diagrama.drawio) — abrir con la extensión
+> [Draw.io Integration](https://marketplace.visualstudio.com/items?itemName=hediet.vscode-drawio)
+> de VS Code o en [app.diagrams.net](https://app.diagrams.net).
+
+**Flujo en cinco pasos:**
+
+1. El job `terraform-apply` envía a STS la acción `AssumeRoleWithWebIdentity` con el JWT firmado por GitHub.
+2. STS verifica la firma del JWT contra el JWKS público del OIDC Identity Provider.
+3. STS valida los claims (`aud`, `sub`, `iss`) contra la Trust Policy del rol IAM.
+4. STS devuelve credenciales temporales (`ASIA…` + `SessionToken`, TTL 1h).
+5. Terraform ejecuta `plan`/`apply` contra el backend S3 (`tfstate` + `.tflock` nativo) con esas credenciales efímeras.
+
+Antes del paso 1, el job `security-scan` ejecuta Checkov + Trivy + Conftest/OPA **sin credenciales AWS**: si alguno falla, el pipeline aborta sin llegar a STS.
 
 ## Conceptos clave
 
