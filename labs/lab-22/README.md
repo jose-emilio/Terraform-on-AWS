@@ -50,6 +50,8 @@ echo "Bucket: $BUCKET"
 ```
 lab-22/
 ├── README.md                          <- Esta guía
+├── arch/
+│   └── diagrama.svg                   <- Diagrama de la arquitectura del lab
 ├── aws/
 │   ├── providers.tf                   <- Backend S3 parcial
 │   ├── variables.tf                   <- Variables: región, proyecto, entorno
@@ -86,7 +88,7 @@ El diagrama contrasta los dos enfoques que estudiamos en este lab:
 
 ## Análisis del código
 
-### 1.1 El problema: enfoque monolítico
+### El problema: enfoque monolítico
 
 Antes de modularizar, el código típico para crear dos buckets S3 se ve así:
 
@@ -120,7 +122,7 @@ Problemas evidentes:
 - **Sin versionado**: no hay forma de recuperar objetos eliminados accidentalmente
 - **Copia-pega**: cada nuevo bucket requiere duplicar y adaptar todo el bloque
 
-### 1.2 La solución: módulo `s3-bucket`
+### La solución: módulo `s3-bucket`
 
 #### Estructura del módulo
 
@@ -253,7 +255,7 @@ Las cuatro opciones en `true` crean una defensa en profundidad:
 | `ignore_public_acls` | ACLs públicas existentes (las ignora) |
 | `restrict_public_buckets` | Acceso público a través de cross-account policies |
 
-### 1.3 Root Module — Invocación múltiple
+### Root Module — Invocación múltiple
 
 ```hcl
 locals {
@@ -317,7 +319,7 @@ Tags finales:          { ManagedBy = "terraform", Module = "s3-bucket",
 
 Nota que `ManagedBy` aparece en `default_tags` y en `common_tags` con el mismo valor. Si tuvieran valores diferentes, el de `common_tags` ganaría (último merge tiene prioridad).
 
-### 1.4 Diferencias entre ambas instancias
+### Diferencias entre ambas instancias
 
 | Parámetro | `logs_bucket` | `data_bucket` |
 |---|---|---|
@@ -364,7 +366,7 @@ terraform output
 
 ## Verificación final
 
-### 3.1 Verificar los buckets creados
+### Verificar los buckets creados
 
 ```bash
 LOGS_BUCKET=$(terraform output -raw logs_bucket_id)
@@ -376,7 +378,7 @@ aws s3 ls | grep lab22
 # 2026-xx-xx lab22-data-123456789012
 ```
 
-### 3.2 Verificar etiquetas
+### Verificar etiquetas
 
 ```bash
 # Tags del bucket de logs
@@ -398,7 +400,7 @@ aws s3api get-bucket-tagging \
 
 Debe mostrar `Purpose=data` y `DataClassification=confidential` en lugar de los valores del bucket de logs.
 
-### 3.3 Verificar versionado
+### Verificar versionado
 
 ```bash
 # Logs: versionado desactivado
@@ -410,7 +412,7 @@ aws s3api get-bucket-versioning --bucket $DATA_BUCKET
 # { "Status": "Enabled" }
 ```
 
-### 3.4 Verificar bloqueo de acceso público
+### Verificar bloqueo de acceso público
 
 ```bash
 aws s3api get-public-access-block --bucket $DATA_BUCKET \
@@ -423,7 +425,7 @@ aws s3api get-public-access-block --bucket $DATA_BUCKET \
 # }
 ```
 
-### 3.5 Verificar protección contra destrucción
+### Verificar protección contra destrucción
 
 ```bash
 # Intentar destruir — debe fallar por prevent_destroy

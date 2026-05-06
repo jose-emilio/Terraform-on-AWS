@@ -75,17 +75,6 @@ lab-20/
 ![Hub-and-Spoke con TGW: 4 VPCs (clients, inspection, egress) + 3 route tables + RAM share](arch/diagrama.svg)
 
 Cuatro VPCs conectadas al TGW. El tráfico se segmenta mediante **tres tablas de rutas del TGW** que fuerzan todo el tráfico a pasar por inspection antes de llegar a su destino o a Internet.
-
-**Flujo de tráfico resumido:**
-
-```
-client-a/b ── TGW (client-rt: 0.0.0.0/0 → inspection)
-                              │
-                    inspection-vpc (firewall)
-                              │
-               TGW (inspection-rt: 0.0.0.0/0 → egress)
-                              │
-                    egress-vpc ── NAT GW (×2 AZ) ── IGW ── Internet
 ```
 
 ### Transit Gateway — Tablas de rutas personalizadas
@@ -795,12 +784,22 @@ resource "aws_instance" "test_client_c" {
     Name = "test-client-c-${var.project_name}"
   })
 
+  # Mismas dependencias que test_client_a/b: la cadena ida-y-vuelta entera
+  # (client_rt -> inspection -> egress -> NAT -> IGW + rutas de retorno) tiene
+  # que estar lista antes de que arranque la instancia, porque el user_data
+  # hace `dnf install -y amazon-ssm-agent` y necesita Internet.
   depends_on = [
     aws_route.client_c_default,
+    aws_route.egress_public_internet,
+    aws_route.egress_private_nat,
+    aws_route.egress_public_to_client_c,
+    aws_route.egress_private_to_client_c,
+    aws_ec2_transit_gateway_route.client_default,
+    aws_ec2_transit_gateway_route.inspection_default,
     aws_ec2_transit_gateway_route_table_association.client_c,
     aws_ec2_transit_gateway_route_table_propagation.client_c_to_inspection,
     aws_ec2_transit_gateway_route_table_propagation.client_c_to_egress,
-    aws_route.egress_private_to_client_c,
+    aws_ec2_transit_gateway_route_table_propagation.inspection_to_egress,
     aws_nat_gateway.egress,
   ]
 }
@@ -845,6 +844,7 @@ Verificar que client-c tiene conectividad. La validación tiene **dos partes** �
 ```bash
 # (1) Desde client-a, hacer ping a client-c (recorre client-rt → inspection → client-c)
 aws ssm start-session --target $(terraform output -raw test_instance_client_a_id)
+
 ping -c 3 10.20.10.10   # ← reemplaza por el valor de $IP_C si lo cambiaste
 # Debe responder. Si sale "Request timeout", verifica:
 #   - que la instancia test-client-c está running y registrada en SSM
@@ -906,7 +906,7 @@ Dos puntos clave para entender por qué basta con el blackhole:
 
 #### Paso 1: Eliminar propagaciones de clients en inspection-rt
 
-Eliminar las propagaciones de **todos** los clients en `main.tf` (incluyendo client-c si completaste el Reto 1):
+Eliminar las propagaciones de **todos** los clients en `main.tf` (incluyendo client-c si completaste el Reto 1), así como las referencias en `dependes_on`:
 
 ```hcl
 # ELIMINAR:
@@ -922,16 +922,22 @@ Eliminar las propagaciones de **todos** los clients en `main.tf` (incluyendo cli
 >   # ...
 >   depends_on = [
 >     aws_route.client_c_default,
+>     aws_route.egress_public_internet,
+>     aws_route.egress_private_nat,
+>     aws_route.egress_public_to_client_c,
+>     aws_route.egress_private_to_client_c,
+>     aws_ec2_transit_gateway_route.client_default,
+>     aws_ec2_transit_gateway_route.inspection_default,
 >     aws_ec2_transit_gateway_route_table_association.client_c,
 >     # aws_ec2_transit_gateway_route_table_propagation.client_c_to_inspection,  # ← comentar/eliminar (eliminado en Reto 2)
 >     aws_ec2_transit_gateway_route_table_propagation.client_c_to_egress,
->     aws_route.egress_private_to_client_c,
+>     aws_ec2_transit_gateway_route_table_propagation.inspection_to_egress,
 >     aws_nat_gateway.egress,
 >   ]
 > }
 > ```
 >
-> El resto de dependencias se mantienen: `egress_private_to_client_c` sigue siendo necesario para la salida a Internet desde client-c.
+> El resto de dependencias se mantienen: las rutas de egress y las propagaciones que quedan siguen siendo necesarias para la salida a Internet desde client-c.
 
 #### Paso 2: Añadir rutas blackhole en inspection-rt
 
@@ -947,7 +953,7 @@ variable "client_cidrs" {
   # Si completaste el Reto 1, añadir: ["10.16.0.0/16", "10.19.0.0/16", "10.20.0.0/16"]
 }
 ```
-
+Declarar en `main.tf` las rutas blackhole que evitan la comunicación entre VPCs clientes a través de Transit Gateway
 ```hcl
 resource "aws_ec2_transit_gateway_route" "blackhole_clients" {
   for_each = toset(var.client_cidrs)

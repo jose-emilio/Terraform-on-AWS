@@ -38,6 +38,8 @@ echo "Bucket: $BUCKET"
 ```
 lab-21/
 ├── README.md                    <- Esta guía
+├── arch/
+│   └── diagrama.svg             <- Diagrama de la arquitectura del lab
 ├── aws/
 │   ├── providers.tf             <- Backend S3 parcial
 │   ├── variables.tf             <- Variables: región, CIDR, proyecto, dominio interno
@@ -55,7 +57,7 @@ lab-21/
 
 ## Análisis del código
 
-### 1.1 Arquitectura del laboratorio
+### Arquitectura del laboratorio
 
 ![Route 53 Private Hosted Zone + ALB + EC2 db/test, demostrando que la zona NO resuelve desde Internet](arch/diagrama.svg)
 
@@ -65,7 +67,7 @@ Una VPC con:
 - Un registro **A** `db.app.internal` que apunta a la IP privada de una instancia (simulando una DB)
 - Una instancia de test para verificar la resolución DNS con `nslookup` y `dig`
 
-### 1.2 Zona Hospedada Privada — DNS solo interno
+### Zona Hospedada Privada — DNS solo interno
 
 ```hcl
 resource "aws_route53_zone" "internal" {
@@ -91,7 +93,7 @@ Puntos clave:
 
 `.local` está reservado para mDNS (Multicast DNS) y puede causar conflictos. AWS recomienda usar TLDs como `.internal`, `.corp`, `.private` o dominios propios con un subdominio dedicado (ej: `internal.miempresa.com`).
 
-### 1.3 Registro Alias — Apuntar al ALB
+### Registro Alias — Apuntar al ALB
 
 ```hcl
 resource "aws_route53_record" "web" {
@@ -118,7 +120,7 @@ Un registro Alias es diferente de un CNAME:
 
 `evaluate_target_health = true` hace que Route 53 deje de responder con este registro si el ALB no tiene targets sanos, evitando enviar tráfico a un servicio caído.
 
-### 1.4 Registro A — IP fija para la "base de datos"
+### Registro A — IP fija para la "base de datos"
 
 ```hcl
 resource "aws_route53_record" "db" {
@@ -134,7 +136,7 @@ Un registro A simple que mapea `db.app.internal` a la IP privada de la instancia
 
 > **Nota:** En producción, para una base de datos RDS se usaría un registro Alias apuntando al endpoint de RDS en vez de una IP fija. Las IPs de las instancias EC2 cambian si se detienen y reinician.
 
-### 1.5 VPC DNS — Requisitos
+### VPC DNS — Requisitos
 
 ```hcl
 resource "aws_vpc" "main" {
@@ -181,7 +183,7 @@ terraform output
 
 ## Verificación final
 
-### 3.1 Zona Hospedada Privada
+### Zona Hospedada Privada
 
 Verificar que la zona existe y está asociada a la VPC:
 
@@ -196,7 +198,7 @@ aws route53 get-hosted-zone \
 
 Debe mostrar `PrivateZone: true` y el ID de la VPC.
 
-### 3.2 Registros DNS
+### Registros DNS
 
 Listar los registros de la zona:
 
@@ -212,7 +214,7 @@ Deberías ver:
 - `db.app.internal.` tipo A (IP privada)
 - `app.internal.` tipo NS y SOA (creados automáticamente)
 
-### 3.3 Verificar resolución DNS desde dentro de la VPC
+### Verificar resolución DNS desde dentro de la VPC
 
 Conectarse a la instancia de test via SSM:
 
@@ -251,7 +253,7 @@ curl -s http://web.app.internal
 exit
 ```
 
-### 3.4 Verificar que el nombre no resuelve desde fuera
+### Verificar que el nombre no resuelve desde fuera
 
 Desde tu máquina local (fuera de la VPC):
 

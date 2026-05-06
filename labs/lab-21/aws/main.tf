@@ -340,6 +340,11 @@ resource "aws_security_group" "test" {
   description = "Solo trafico saliente (test con nslookup/dig)"
   vpc_id      = aws_vpc.main.id
 
+  # Sin reglas de entrada: la instancia no acepta conexiones entrantes.
+  # `ingress = []` explicito documenta la intencion (en lugar de simplemente
+  # omitir el bloque) y evita findings falsos de linters como tfsec/Checkov.
+  ingress = []
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -448,11 +453,14 @@ resource "aws_instance" "db" {
   iam_instance_profile   = aws_iam_instance_profile.ssm.name
   private_ip             = cidrhost(aws_subnet.private["private-1"].cidr_block, 10)
 
+  # Sin user_data: la AMI AL2023 estandar trae SSM Agent preinstalado.
+  # Esta instancia no necesita Internet al arrancar, asi que NO declara
+  # depends_on = [aws_nat_gateway.main] (a diferencia de web y test, que
+  # ejecutan dnf install en su user_data).
+
   tags = merge(local.common_tags, {
     Name = "db-${var.project_name}"
   })
-
-  depends_on = [aws_nat_gateway.main]
 }
 
 # Instancia de test (para verificar DNS con nslookup/dig)
