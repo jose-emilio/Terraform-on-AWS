@@ -6,8 +6,12 @@
 #   vpc-app (10.15.0.0/16) ◄──peering──► vpc-c   (10.17.0.0/16)
 #   vpc-c   (10.17.0.0/16)  ── ✗ ──      vpc-db  (sin peering, no transitivo)
 #
-# vpc-app tiene IGW + NAT Gateway para salida a Internet.
-# vpc-db y vpc-c salen a Internet a traves de vpc-app via peering.
+# vpc-app tiene IGW + NAT Gateway para su propia salida a Internet.
+# vpc-db y vpc-c NO tienen salida a Internet: el peering solo permite trafico
+# cuyo destino sea el CIDR de la VPC peer, no reenvia trafico hacia Internet.
+# Para que el SSM Agent pueda registrarse sin Internet, se crean VPC Interface
+# Endpoints (PrivateLink) en vpc-db y vpc-c hacia los servicios ssm/ssmmessages/
+# ec2messages.
 
 # --- Data Sources ---
 
@@ -482,7 +486,7 @@ resource "aws_iam_instance_profile" "ssm" {
 
 resource "aws_security_group" "app" {
   name        = "app-${var.project_name}"
-  description = "Permite ICMP desde db y vpc-c, tráfico saliente"
+  description = "Permite ICMP desde db y vpc-c, trafico saliente"
   vpc_id      = aws_vpc.app.id
 
   ingress {
@@ -498,7 +502,7 @@ resource "aws_security_group" "app" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el tráfico saliente"
+    description = "Todo el trafico saliente"
   }
 
   tags = merge(local.common_tags, {
@@ -532,7 +536,7 @@ resource "aws_security_group" "db" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el tráfico saliente"
+    description = "Todo el trafico saliente"
   }
 
   tags = merge(local.common_tags, {
@@ -542,7 +546,7 @@ resource "aws_security_group" "db" {
 
 resource "aws_security_group" "c" {
   name        = "c-${var.project_name}"
-  description = "Permite ICMP desde app, tráfico saliente"
+  description = "Permite ICMP desde app, trafico saliente"
   vpc_id      = aws_vpc.c.id
 
   ingress {
@@ -558,7 +562,7 @@ resource "aws_security_group" "c" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el tráfico saliente"
+    description = "Todo el trafico saliente"
   }
 
   tags = merge(local.common_tags, {

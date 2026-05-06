@@ -185,7 +185,7 @@ resource "aws_route_table_association" "private" {
 
 resource "aws_security_group" "alb" {
   name        = "alb-${var.project_name}"
-  description = "Tráfico HTTP/HTTPS desde Internet hacia el ALB"
+  description = "Trafico HTTP/HTTPS desde Internet hacia el ALB"
   vpc_id      = aws_vpc.main.id
 
   tags = merge(local.common_tags, {
@@ -228,7 +228,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_all" {
 
 resource "aws_security_group" "app" {
   name        = "app-${var.project_name}"
-  description = "Tráfico solo desde el ALB"
+  description = "Trafico solo desde el ALB"
   vpc_id      = aws_vpc.main.id
 
   tags = merge(local.common_tags, {

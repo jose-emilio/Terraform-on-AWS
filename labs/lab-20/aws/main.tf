@@ -753,10 +753,23 @@ resource "aws_instance" "test_client_a" {
     Name = "test-client-a-${var.project_name}"
   })
 
+  # user_data hace `dnf install -y amazon-ssm-agent` (la AMI minimal no lo
+  # incluye), asi que necesita Internet ya disponible al arrancar. Eso
+  # implica que TODA la cadena ida-y-vuelta este operativa antes de la EC2:
+  # client_rt -> inspection -> egress -> NAT -> IGW + rutas de retorno.
+  # Si falta cualquiera de estas dependencias, el dnf falla por timeout y la
+  # instancia se queda sin SSM Agent.
   depends_on = [
     aws_route.client_a_default,
+    aws_route.egress_public_internet,
+    aws_route.egress_private_nat,
+    aws_route.egress_public_to_clients,
+    aws_route.egress_private_to_clients,
     aws_ec2_transit_gateway_route.client_default,
     aws_ec2_transit_gateway_route.inspection_default,
+    aws_ec2_transit_gateway_route_table_propagation.client_a_to_inspection,
+    aws_ec2_transit_gateway_route_table_propagation.client_a_to_egress,
+    aws_ec2_transit_gateway_route_table_propagation.inspection_to_egress,
     aws_nat_gateway.egress,
   ]
 }
@@ -775,10 +788,18 @@ resource "aws_instance" "test_client_b" {
     Name = "test-client-b-${var.project_name}"
   })
 
+  # Mismas dependencias que test_client_a (ver comentario alli).
   depends_on = [
     aws_route.client_b_default,
+    aws_route.egress_public_internet,
+    aws_route.egress_private_nat,
+    aws_route.egress_public_to_clients,
+    aws_route.egress_private_to_clients,
     aws_ec2_transit_gateway_route.client_default,
     aws_ec2_transit_gateway_route.inspection_default,
+    aws_ec2_transit_gateway_route_table_propagation.client_b_to_inspection,
+    aws_ec2_transit_gateway_route_table_propagation.client_b_to_egress,
+    aws_ec2_transit_gateway_route_table_propagation.inspection_to_egress,
     aws_nat_gateway.egress,
   ]
 }

@@ -56,6 +56,8 @@ echo "Bucket: $BUCKET"
 ```
 lab-20/
 ├── README.md                    <- Esta guía
+├── arch/
+│   └── diagrama.svg             <- Diagrama de la arquitectura del lab
 └── aws/
     ├── providers.tf             <- Backend S3 parcial
     ├── variables.tf             <- Variables: region, CIDRs, proyecto, appliance mode
@@ -68,7 +70,7 @@ lab-20/
 
 ## Análisis del código
 
-### 1.1 Arquitectura con inspección y egress centralizados
+### Arquitectura con inspección y egress centralizados
 
 ![Hub-and-Spoke con TGW: 4 VPCs (clients, inspection, egress) + 3 route tables + RAM share](arch/diagrama.svg)
 
@@ -86,7 +88,7 @@ client-a/b ── TGW (client-rt: 0.0.0.0/0 → inspection)
                     egress-vpc ── NAT GW (×2 AZ) ── IGW ── Internet
 ```
 
-### 1.2 Transit Gateway — Tablas de rutas personalizadas
+### Transit Gateway — Tablas de rutas personalizadas
 
 ```hcl
 resource "aws_ec2_transit_gateway" "main" {
@@ -113,7 +115,7 @@ Si propagáramos los CIDRs de client-a y client-b en client-rt, el tráfico inte
 
 > **Aviso de seguridad — `auto_accept_shared_attachments = "enable"`:** con esta opción, **cualquier cuenta que reciba el TGW vía RAM puede crear attachments contra él sin aprobación manual** del equipo propietario del TGW. Es cómodo en un lab y razonable cuando el TGW se comparte solo dentro de una AWS Organization donde confías en todas las cuentas, pero **en escenarios multi-tenant o con cuentas externas conviene dejarlo en `"disable"`** y aceptar cada attachment de forma explícita (consola o `aws ec2 accept-transit-gateway-vpc-attachment`).
 
-### 1.3 Flujo de tráfico detallado
+### Flujo de tráfico detallado
 
 **Tráfico entre client-a y client-b:**
 
@@ -132,7 +134,7 @@ Si propagáramos los CIDRs de client-a y client-b en client-rt, el tráfico inte
 5. egress-vpc: subred privada `0.0.0.0/0 → NAT GW (de la misma AZ)` → subred pública `0.0.0.0/0 → IGW` → Internet
 6. Respuesta vuelve: IGW → NAT GW → ruta de retorno en tabla pública `10.16.0.0/16 → TGW` → **egress-rt**: `10.16.0.0/16 → client-a` (propagada), pero el tráfico debe volver por inspection → **egress-rt** reenvía a inspection → **inspection-rt**: `10.16.0.0/16 → client-a` (propagada) → client-a
 
-### 1.4 Appliance Mode — Simetría de tráfico para firewalls
+### Appliance Mode — Simetría de tráfico para firewalls
 
 ```hcl
 resource "aws_ec2_transit_gateway_vpc_attachment" "inspection" {
@@ -168,7 +170,7 @@ Con `appliance_mode_support = "enable"`, el TGW garantiza que todos los paquetes
 >
 > En un escenario real con un firewall stateful (Palo Alto, Fortinet, AWS Network Firewall) en la inspection-vpc, desactivar Appliance Mode provocaría que conexiones TCP largas se cayeran de forma intermitente cuando el hashing del TGW enviara ida y vuelta a AZs distintas — un bug muy difícil de diagnosticar sin entender este detalle.
 
-### 1.5 Egress centralizado — NAT Gateway por AZ
+### Egress centralizado — NAT Gateway por AZ
 
 ```hcl
 resource "aws_eip" "nat_egress" {
@@ -193,7 +195,7 @@ La egress-vpc concentra toda la salida a Internet del hub. Se despliega **un NAT
 
 Las tablas de rutas **pública** y **privada** de egress necesitan rutas de retorno hacia las otras VPCs (`10.16.0.0/16 → TGW`, `10.17.0.0/16 → TGW`, `10.19.0.0/16 → TGW`). Sin estas rutas, el NAT Gateway traduce la respuesta de Internet pero no sabe cómo devolverla a la VPC de origen — la única ruta disponible sería `0.0.0.0/0 → IGW`, que la enviaría de vuelta a Internet.
 
-### 1.6 AWS RAM — Compartir el TGW entre cuentas
+### AWS RAM — Compartir el TGW entre cuentas
 
 ```hcl
 resource "aws_ram_resource_share" "tgw" {
@@ -220,7 +222,7 @@ En este lab, `var.app_account_id` simula una cuenta de aplicación (por defecto 
 
 > **Aviso de seguridad — `allow_external_principals = true`:** este flag autoriza a compartir el TGW con cuentas **fuera** de tu AWS Organization. Es necesario cuando uno de los principales es un Account ID externo, como el `var.app_account_id` simulado en este lab. **En entornos reales con Organizations + RAM sharing habilitado**, lo recomendable es ponerlo a `false` para forzar el modelo "solo dentro de la organización" — cualquier intento de compartir hacia fuera se bloquea, lo que limita el blast radius en caso de error humano o credenciales comprometidas.
 
-### 1.7 TGW Flow Logs — Auditar todo el tráfico que atraviesa el hub
+### TGW Flow Logs — Auditar todo el tráfico que atraviesa el hub
 
 ```hcl
 resource "aws_flow_log" "tgw" {
@@ -284,7 +286,7 @@ terraform apply
 >
 > **Total base ≈ 216 USD/mes**, sin contar el tráfico procesado por TGW (~$0,02/GB) ni por NAT GW (~$0,045/GB). Además, `max_aggregation_interval = 60` en los TGW Flow Logs (sección 1.7) eleva el volumen ingerido a CloudWatch — fácilmente varios GB por día con tráfico moderado. Si dejas el lab corriendo, la factura sube rápido. **Ejecuta `terraform destroy` (sección 8) en cuanto termines la práctica** (incluidos los Retos).
 
-Terraform creará ~80 recursos: 4 VPCs, 10 subredes (2 privadas en client-a/b/inspection + 2 públicas + 2 privadas en egress), 6 tablas de rutas con sus asociaciones, ~15 rutas (IGW, NAT, retorno público y privado a clients/inspection, default por VPC), IGW + 2 EIPs + 2 NAT Gateways (uno por AZ), 1 TGW + 4 attachments + 3 TGW Route Tables + 4 asociaciones + 2 rutas estáticas + 5 propagaciones, 3 recursos RAM (share + association + principal), 5 IAM (rol SSM + attach + instance profile + rol Flow Logs + policy Flow Logs) + 1 CloudWatch Log Group + 1 TGW Flow Log, 2 Security Groups y 2 instancias EC2 de test.
+Terraform creará ~83 recursos: 4 VPCs, 10 subredes (2 privadas en client-a/b/inspection + 2 públicas + 2 privadas en egress), 6 tablas de rutas con sus asociaciones, ~15 rutas (IGW, NAT, retorno público y privado a clients/inspection, default por VPC), IGW + 2 EIPs + 2 NAT Gateways (uno por AZ), 1 TGW + 4 attachments + 3 TGW Route Tables + 4 asociaciones + 2 rutas estáticas + 5 propagaciones, 3 recursos RAM (share + association + principal), 5 IAM (rol SSM + attach + instance profile + rol Flow Logs + policy Flow Logs) + 1 CloudWatch Log Group + 1 TGW Flow Log, 2 Security Groups y 2 instancias EC2 de test.
 
 ```bash
 terraform output
@@ -303,7 +305,7 @@ terraform output
 
 ## Verificación final
 
-### 3.1 Transit Gateway y attachments
+### Transit Gateway y attachments
 
 Verificar que el TGW está en estado `available` y que los 4 attachments están conectados:
 
@@ -321,7 +323,7 @@ aws ec2 describe-transit-gateway-vpc-attachments \
 
 Deberías ver 4 attachments en estado `available`: client-a, client-b, inspection y egress.
 
-### 3.2 Tablas de rutas del TGW
+### Tablas de rutas del TGW
 
 Listar las 3 tablas de rutas personalizadas y verificar sus rutas:
 
@@ -387,7 +389,7 @@ Resumen esperado:
 | inspection-rt | `0.0.0.0/0` (static), `10.16.0.0/16` (propagated), `10.19.0.0/16` (propagated) |
 | egress-rt | `10.16.0.0/16` (propagated), `10.17.0.0/16` (propagated), `10.19.0.0/16` (propagated) |
 
-### 3.3 Appliance Mode
+### Appliance Mode
 
 Verificar que el attachment de inspection tiene Appliance Mode habilitado:
 
@@ -400,7 +402,7 @@ aws ec2 describe-transit-gateway-vpc-attachments \
 
 Debe mostrar `ApplianceModeSupport = enable`.
 
-### 3.4 NAT Gateways en egress (alta disponibilidad)
+### NAT Gateways en egress (alta disponibilidad)
 
 Verificar que hay un NAT Gateway por AZ en la egress-vpc:
 
@@ -413,7 +415,7 @@ aws ec2 describe-nat-gateways \
 
 Deberías ver 2 NAT Gateways en estado `available`, cada uno en una subred pública de AZ diferente.
 
-### 3.5 RAM Resource Share
+### RAM Resource Share
 
 Verificar que el TGW esta compartido via RAM:
 
@@ -425,7 +427,7 @@ aws ram get-resource-shares \
   --output table
 ```
 
-### 3.6 Verificar conectividad inter-VPC (instancias de test)
+### Verificar conectividad inter-VPC (instancias de test)
 
 > **¿Cómo se conecta el SSM Agent a Internet desde una subred privada sin VPC Endpoints?** Las instancias de test están en `client-a`/`client-b` (subredes privadas, sin IGW, sin VPC Endpoints). El SSM Agent necesita salir a `ssm.us-east-1.amazonaws.com`, `ssmmessages…` y `ec2messages…` para registrarse y atender la sesión. La salida funciona porque la ruta `0.0.0.0/0 → TGW` de cada client encadena `TGW (client-rt) → inspection-vpc → TGW (inspection-rt) → egress-vpc → NAT GW → IGW → Internet`. Es decir, **el propio tráfico de SSM también atraviesa la inspección y el egress centralizado**, igual que un `curl` del Test 2. A diferencia del lab-19, donde se usaron VPC Interface Endpoints porque las VPCs no tenían salida a Internet, aquí la salida existe (centralizada) y los endpoints son innecesarios.
 
@@ -462,7 +464,7 @@ terraform output nat_public_ips
 # La IP del curl debe coincidir con la EIP de la AZ donde esta la subred privada de egress
 ```
 
-### 3.7 Si SSM no conecta
+### Si SSM no conecta
 
 Si `start-session` se queda colgado, verificar:
 
@@ -483,7 +485,7 @@ aws ssm describe-instance-information \
 
 Si PingStatus no es "Online", el user_data no pudo instalar el SSM Agent. Esto ocurre si la ruta a Internet no está completa. Verificar que las rutas por defecto en las VPCs, las tablas del TGW y las rutas de retorno en egress están todas configuradas.
 
-### 3.8 Verificar el tráfico que atraviesa el TGW (TGW Flow Logs)
+### Verificar el tráfico que atraviesa el TGW (TGW Flow Logs)
 
 El recurso `aws_flow_log.tgw` (sección 1.7) registra **todos los paquetes que pasan por el Transit Gateway**, incluidos los de tránsito puro entre VPCs vacías de hosts. Cada registro identifica el `tgw-attachment-id` de origen, las IPs originales del paquete (`packet-srcaddr` / `packet-dstaddr`) y, cuando aplique, la `tgw-route-table-id` consultada.
 
@@ -771,7 +773,7 @@ resource "aws_security_group" "test_client_c" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el tra                                                                                                                                                                  fico saliente"
+    description = "Todo el trafico saliente"
   }
 
   tags = merge(local.common_tags, {

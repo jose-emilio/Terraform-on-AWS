@@ -39,7 +39,7 @@ El tráfico atraviesa **cuatro capas independientes** antes de llegar a la aplic
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
+- lab-02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
 - Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
@@ -73,14 +73,14 @@ lab-18/
 
 ## Análisis del código
 
-### 1.1 Security Group del ALB — Puerta de entrada controlada
+### Security Group del ALB — Puerta de entrada controlada
 
-El SG se declara "vacío" (sin reglas inline) y cada regla vive en su propio recurso `aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule` (sucesores oficiales de `aws_security_group_rule` desde el provider AWS 5.x):
+El SG se declara "vacío" (sin reglas inline) y cada regla vive en su propio recurso `aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule` (recomendados por HashiCorp desde el provider AWS 5.x sobre el antiguo `aws_security_group_rule`, que sigue funcionando pero queda como modelo legado):
 
 ```hcl
 resource "aws_security_group" "alb" {
   name        = "alb-${var.project_name}"
-  description = "Tráfico HTTP/HTTPS desde Internet"
+  description = "Trafico HTTP/HTTPS desde Internet"
   vpc_id      = aws_vpc.main.id
 }
 
@@ -117,12 +117,12 @@ Cuando las reglas son bloques inline dentro de `aws_security_group`, Terraform l
 1. **Drift al editar reglas a mano** (consola, CLI, otra herramienta): el siguiente `apply` revierte todo lo que no esté en el código.
 2. **Dependencias circulares** cuando dos SGs se referencian mutuamente — Terraform no puede crear el SG-A porque su regla apunta al SG-B y viceversa. Con reglas separadas, los SGs se crean primero (vacíos) y las reglas después, rompiendo el ciclo.
 
-### 1.2 Security Group de las EC2 — Solo tráfico desde el ALB
+### Security Group de las EC2 — Solo tráfico desde el ALB
 
 ```hcl
 resource "aws_security_group" "app" {
   name        = "app-${var.project_name}"
-  description = "Tráfico solo desde el ALB"
+  description = "Trafico solo desde el ALB"
   vpc_id      = aws_vpc.main.id
 }
 
@@ -146,7 +146,7 @@ Punto clave: la regla de entrada usa `referenced_security_group_id` (identidad d
 
 **Ventaja sobre CIDR:** Si el ALB cambia de IP (por escalado, reemplazo, etc.), la regla sigue funcionando porque referencia la identidad del SG, no una IP fija.
 
-### 1.3 Network ACL — Bloqueo explícito de IP maliciosa
+### Network ACL — Bloqueo explícito de IP maliciosa
 
 ```hcl
 resource "aws_network_acl" "public" {
@@ -217,7 +217,7 @@ Las NACLs evalúan reglas en **orden numérico ascendente** y aplican la primera
 
 Los Security Groups son **stateful**: si permites tráfico de entrada, el de retorno se permite automáticamente. Las NACLs son **stateless**: cada dirección necesita su propia regla. Sin la regla de puertos efímeros (1024-65535), las respuestas HTTP de las instancias no podrían salir de la subred.
 
-### 1.4 VPC Flow Logs — Solo tráfico REJECT
+### VPC Flow Logs — Solo tráfico REJECT
 
 ```hcl
 resource "aws_flow_log" "reject" {
@@ -249,7 +249,7 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará ~38 recursos: VPC, 4 subredes (2 públicas + 2 privadas), IGW + tabla de rutas pública + asociaciones, EIP + NAT Gateway + tabla de rutas privada + asociaciones, 2 Security Groups (ALB y app) + 5 reglas separadas (2 ingress ALB + 1 egress ALB + 1 ingress app + 1 egress app), 2 NACLs (pública y privada), ALB + Target Group + listener HTTP + 2 attachments, IAM role + policy attachment + instance profile para SSM, 2 instancias EC2, CloudWatch Log Group + IAM role/policy + recurso `aws_flow_log`.
+Terraform creará ~39 recursos: VPC, 4 subredes (2 públicas + 2 privadas), IGW + tabla de rutas pública + asociaciones, EIP + NAT Gateway + tabla de rutas privada + asociaciones, 2 Security Groups (ALB y app) + 5 reglas separadas (2 ingress ALB + 1 egress ALB + 1 ingress app + 1 egress app), 2 NACLs (pública y privada), ALB + Target Group + listener HTTP + 2 attachments, IAM role + policy attachment + instance profile para SSM, 2 instancias EC2, CloudWatch Log Group + IAM role/policy + recurso `aws_flow_log`.
 
 ```bash
 terraform output
@@ -263,7 +263,7 @@ terraform output
 
 ## Verificación final
 
-### 3.1 Verificar el patrón ALB -> EC2 (referencia por SG)
+### Verificar el patrón ALB -> EC2 (referencia por SG)
 
 ```bash
 # Ver el SG de las instancias de aplicacion
@@ -277,7 +277,7 @@ aws ec2 describe-security-groups \
 
 Deberías ver que el único origen permitido es el SG del ALB (no un CIDR).
 
-### 3.2 Probar el ALB
+### Probar el ALB
 
 ```bash
 ALB_DNS=$(terraform output -raw alb_dns_name)
@@ -287,7 +287,7 @@ curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS
 # 200
 ```
 
-### 3.3 Verificar la NACL
+### Verificar la NACL
 
 ```bash
 aws ec2 describe-network-acls \
@@ -298,7 +298,7 @@ aws ec2 describe-network-acls \
 
 Deberías ver la regla 50 con `deny` para la IP bloqueada.
 
-### 3.4 Consultar VPC Flow Logs (tráfico REJECT)
+### Consultar VPC Flow Logs (tráfico REJECT)
 
 ```bash
 LOG_GROUP=$(terraform output -raw flow_log_group)
@@ -504,7 +504,7 @@ LocalStack emula Security Groups, NACLs y VPC Flow Logs a nivel de API, pero no 
 - **Bloques `dynamic` para reglas de NACL**: las NACLs requieren números de regla y muchas entradas repetitivas. El bloque `dynamic` genera las reglas desde una lista de objetos, reduciendo la duplicación y facilitando el mantenimiento.
 - **VPC Flow Logs para diagnóstico**: habilitar Flow Logs permite diagnosticar tráfico denegado sin necesitar acceso a las instancias. El patrón `REJECT` en los logs indica un bloqueo de SG o NACL.
 - **Rango de puertos efímeros en NACLs de salida**: las NACLs deben permitir el rango de puertos efímeros (1024-65535) en las reglas de salida de las subnets que reciben conexiones TCP entrantes, o el handshake de tres vías falla.
-- **Reglas de Security Group como recursos independientes (`aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule`)**: el lab declara los SGs vacíos y gestiona cada regla en su propio recurso (sucesores oficiales del antiguo `aws_security_group_rule`, soft-deprecated desde el provider AWS 5.x). Ventajas: (1) cada regla tiene su propio address en el state y se puede importar / destruir / aplicar `lifecycle` por separado; (2) evita el drift cuando alguien añade reglas fuera de Terraform, ya que el SG en sí no las controla; (3) rompe dependencias circulares cuando dos SGs se referencian entre sí — los SGs se crean primero (vacíos) y las reglas después.
+- **Reglas de Security Group como recursos independientes (`aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule`)**: el lab declara los SGs vacíos y gestiona cada regla en su propio recurso, el patrón recomendado por HashiCorp desde el provider AWS 5.x sobre el antiguo `aws_security_group_rule` (que sigue funcionando, pero queda como modelo legado). Ventajas: (1) cada regla tiene su propio address en el state y se puede importar / destruir / aplicar `lifecycle` por separado; (2) evita el drift cuando alguien añade reglas fuera de Terraform, ya que el SG en sí no las controla; (3) rompe dependencias circulares cuando dos SGs se referencian entre sí — los SGs se crean primero (vacíos) y las reglas después.
 
 ---
 

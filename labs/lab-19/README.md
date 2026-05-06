@@ -53,6 +53,8 @@ echo "Bucket: $BUCKET"
 ```
 lab-19/
 ├── README.md                    <- Esta guía
+├── arch/
+│   └── diagrama.svg             <- Diagrama de la arquitectura del lab
 ├── aws/
 │   ├── providers.tf             <- Backend S3 parcial
 │   ├── variables.tf             <- Variables: region, CIDRs, proyecto
@@ -70,7 +72,7 @@ lab-19/
 
 ## Análisis del código
 
-### 1.1 Arquitectura del laboratorio
+### Arquitectura del laboratorio
 
 ![3 VPCs con 2 VPC Peerings (app↔db, app↔c) demostrando la NO transitividad hacia c↔db](arch/diagrama.svg)
 
@@ -81,7 +83,7 @@ Tres VPCs con dos peerings:
 
 Solo `vpc-app` tiene IGW + NAT Gateway. `vpc-db` y `vpc-c` acceden a SSM Session Manager mediante 3 VPC Interface Endpoints (`ssm`, `ssmmessages`, `ec2messages`) cada una, sin necesidad de salida a Internet.
 
-### 1.2 VPC Peering — Solicitud y aceptación
+### VPC Peering — Solicitud y aceptación
 
 ```hcl
 resource "aws_vpc_peering_connection" "app_to_db" {
@@ -116,7 +118,7 @@ AWS rechaza la solicitud de peering con el error `InvalidParameterValue: CIDRs o
 - db: `10.16.0.0/16`
 - vpc-c: `10.17.0.0/16`
 
-### 1.3 Enrutamiento — El paso crítico
+### Enrutamiento — El paso crítico
 
 ```hcl
 # app → db: el tráfico hacia 10.16.0.0/16 va por el peering
@@ -142,7 +144,7 @@ resource "aws_route" "db_to_app" {
 
 TCP requiere comunicación en ambas direcciones (SYN → SYN-ACK → ACK). Si solo app tiene ruta hacia db, el paquete SYN llega a db, pero el SYN-ACK no puede volver porque db no tiene ruta hacia app. El resultado es un timeout de conexión.
 
-### 1.4 Security Group — Acceso por CIDR
+### Security Group — Acceso por CIDR
 
 ```hcl
 resource "aws_security_group" "db" {
@@ -174,14 +176,14 @@ resource "aws_security_group" "db" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el tráfico saliente"
+    description = "Todo el trafico saliente"
   }
 }
 ```
 
 A diferencia del patrón ALB → EC2 (lab18) donde se referencia el Security Group ID, en peering se usa el **CIDR de la otra VPC** como origen. Esto permite que solo las instancias de vpc-app puedan conectarse al puerto 3306 de las instancias en vpc-db.
 
-### 1.5 No transitividad — Por qué vpc-c no puede hablar con db
+### No transitividad — Por qué vpc-c no puede hablar con db
 
 ```
 vpc-c (10.17.0.0/16)
@@ -208,7 +210,7 @@ Aunque vpc-c tiene peering con app, y app tiene peering con db, vpc-c **no puede
 
 En otras palabras, el bloqueo no ocurre "en tiempo de tráfico" (el paquete llega a app y se descarta), sino **en tiempo de configuración** (AWS no permite siquiera crear la ruta intermedia). Esa es la garantía de que el peering es **estrictamente punto a punto** y no transitivo. Para conectividad transitiva, se necesita Transit Gateway (lab-20).
 
-### 1.6 Acceso SSM sin salida a Internet — AMI con SSM + VPC Endpoints
+### Acceso SSM sin salida a Internet — AMI con SSM + VPC Endpoints
 
 vpc-db y vpc-c no tienen IGW ni NAT Gateway, y **el peering no permite reenviar tráfico a Internet** — solo permite tráfico cuyo destino sea el CIDR de la VPC peer. Para poder conectarse a las instancias via SSM Session Manager se combinan dos estrategias:
 
@@ -244,9 +246,9 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará ~49 recursos: 3 VPCs, 8 subredes (4 en app, 2 en db, 2 en vpc-c), IGW + EIP + NAT Gateway en app, 4 tablas de rutas con sus asociaciones, 2 peerings + 4 rutas peering, **6 VPC Interface Endpoints** (3 servicios SSM × 2 VPCs sin Internet) + 2 SGs para los endpoints, 3 IAM (rol + attachment + instance profile) para SSM, 3 Security Groups (app/db/c) y 3 instancias EC2 de test.
+Terraform creará ~51 recursos: 3 VPCs, 8 subredes (4 en app, 2 en db, 2 en vpc-c), IGW + EIP + NAT Gateway en app, 4 tablas de rutas con sus asociaciones, 2 peerings + 4 rutas peering, **6 VPC Interface Endpoints** (3 servicios SSM × 2 VPCs sin Internet) + 2 SGs para los endpoints, 3 IAM (rol + attachment + instance profile) para SSM, 3 Security Groups (app/db/c) y 3 instancias EC2 de test.
 
-> **⚠️ Aviso de coste — VPC Interface Endpoints:** los 6 Interface Endpoints (PrivateLink) facturan **~0,01 USD/hora por endpoint y AZ**. Asumiendo 1 AZ activa: 6 endpoints × 0,01 USD × 720 h ≈ **43,20 USD/mes** solo por los endpoints SSM, además del NAT Gateway (~32 USD/mes) y el resto de cargos. Si dejas el lab desplegado, el coste se acumula rápido — ejecuta `terraform destroy` (sección 6) en cuanto termines la práctica.
+> **⚠️ Aviso de coste — VPC Interface Endpoints:** los 6 Interface Endpoints (PrivateLink) facturan **~0,01 USD/hora por endpoint y AZ**. Este lab los despliega en **2 AZs** (`slice(..., 0, 2)` en [aws/main.tf](aws/main.tf)): 6 endpoints × 2 AZs × 0,01 USD × 720 h ≈ **86,40 USD/mes** solo por los endpoints SSM, además del NAT Gateway (~32 USD/mes) y el resto de cargos. Si dejas el lab desplegado, el coste se acumula rápido — ejecuta `terraform destroy` en cuanto termines la práctica.
 
 ```bash
 terraform output
@@ -267,7 +269,7 @@ terraform output
 
 ## Verificación final
 
-### 3.1 Estado de los peerings
+### Estado de los peerings
 
 Verificar que ambos peerings están en estado `active`:
 
@@ -280,7 +282,7 @@ aws ec2 describe-vpc-peering-connections \
 
 Deberías ver 2 peerings en estado `active`.
 
-### 3.2 Tablas de rutas
+### Tablas de rutas
 
 Verificar que las rutas bidireccionales estan configuradas:
 
@@ -293,7 +295,7 @@ aws ec2 describe-route-tables \
 
 Cada tabla de rutas debe tener rutas hacia los CIDRs de las VPCs con las que tiene peering.
 
-### 3.3 Security Group de db
+### Security Group de db
 
 Verificar que el SG de db permite MySQL (3306) desde el CIDR de app:
 
@@ -306,7 +308,7 @@ aws ec2 describe-security-groups \
   --output json
 ```
 
-### 3.4 Conectividad app ↔ db (debe funcionar)
+### Conectividad app ↔ db (debe funcionar)
 
 ```bash
 INSTANCE_APP=$(terraform output -raw test_instance_app_id)
@@ -326,7 +328,7 @@ curl -s --max-time 5 https://checkip.amazonaws.com
 exit
 ```
 
-### 3.5 Conectividad vpc-c → db (debe fallar — no transitivo)
+### Conectividad vpc-c → db (debe fallar — no transitivo)
 
 Conectarse a la instancia en vpc-c via SSM (funciona gracias a los VPC Endpoints):
 
@@ -370,7 +372,7 @@ ping -c 3 -W 2 10.17.10.10
 exit
 ```
 
-### 3.6 Si SSM no conecta
+### Si SSM no conecta
 
 Si `start-session` se queda colgado, esperar 2-3 minutos para que el SSM Agent se registre:
 
@@ -525,7 +527,7 @@ Cada peering requiere 2 rutas + reglas de SG. Con 20 VPCs serían 190 peerings, 
 
 ## Limpieza
 
-> **⚠️ Importante — coste acumulado:** este lab incluye **6 VPC Interface Endpoints** (~0,01 USD/hora por endpoint y AZ ≈ **43,20 USD/mes asumiendo 3 AZ activas**, sin contar el tráfico procesado), 1 NAT Gateway (~32 USD/mes) y 3 EIPs. Si dejas el despliegue activo, la factura crece rápido. Ejecuta `terraform destroy` en cuanto termines la práctica (incluido el Reto, si lo has hecho).
+> **⚠️ Importante — coste acumulado:** este lab incluye **6 VPC Interface Endpoints** desplegados en 2 AZs (~0,01 USD/hora por endpoint y AZ → **~86,40 USD/mes**, sin contar el tráfico procesado), 1 NAT Gateway (~32 USD/mes) y 1 EIP. Si dejas el despliegue activo, la factura crece rápido. Ejecuta `terraform destroy` en cuanto termines la práctica (incluido el Reto, si lo has hecho).
 
 ```bash
 terraform destroy
