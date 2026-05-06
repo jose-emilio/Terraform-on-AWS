@@ -1,6 +1,6 @@
 variable "region" {
   type        = string
-  description = "Región (fija en LocalStack)"
+  description = "Región usada en el service_name del VPC Endpoint (en LocalStack los endpoints son emulados, pero el ARN se respeta)"
   default     = "us-east-1"
 }
 
@@ -22,8 +22,6 @@ variable "environment" {
   default     = "lab"
 }
 
-variable "use_nat_instance" {
-  type        = bool
-  description = "true = Instancia NAT EC2 (dev, ahorro ~62%); false = NAT Gateway (producción, alta disponibilidad)"
-  default     = false
-}
+# Nota: en la versión aws/ existe `use_nat_instance` para alternar entre NAT
+# Gateway y NAT Instance. En LocalStack siempre se despliega NAT Gateway
+# (la NAT Instance requiere AMI real de EC2), por lo que esa variable se omite.

@@ -32,10 +32,13 @@ Revisa los outputs:
 
 ```bash
 terraform output
-# vpc_id               = "vpc-xxxxxxxxx"
-# internet_gateway_id  = "igw-xxxxxxxxx"
-# nat_gateway_id       = "nat-xxxxxxxxx"
-# s3_endpoint_id       = "vpce-xxxxxxxxx"
+# vpc_id                  = "vpc-xxxxxxxxx"
+# internet_gateway_id     = "igw-xxxxxxxxx"
+# nat_gateway_ids         = { "public-1" = "nat-xxxxxxxxx", ... }
+# nat_public_ips          = { "public-1" = "x.x.x.x", ... }
+# s3_endpoint_id          = "vpce-xxxxxxxxx"
+# private_subnet_ids      = { "private-1" = "subnet-xxx", ... }
+# private_route_table_ids = { "private-1" = "rtb-xxx", ... }
 ```
 
 ## 2. Verificación
@@ -67,11 +70,11 @@ awslocal ec2 describe-route-tables \
   --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, GatewayId: GatewayId, NatGatewayId: NatGatewayId}' \
   --output table
 
-# Tabla privada: 0.0.0.0/0 → NAT GW + prefijo S3 → VPC Endpoint
+# Tablas privadas (una por AZ): 0.0.0.0/0 → NAT GW + prefijo S3 → VPC Endpoint
 awslocal ec2 describe-route-tables \
-  --filters Name=tag:Name,Values=lab17-private-rt \
-  --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, GatewayId: GatewayId, NatGatewayId: NatGatewayId}' \
-  --output table
+  --filters "Name=tag:Name,Values=lab17-private-rt-*" \
+  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, GatewayId: GatewayId, NatGatewayId: NatGatewayId}}' \
+  --output json
 ```
 
 ### 2.4 VPC Endpoint para S3
@@ -83,18 +86,34 @@ awslocal ec2 describe-vpc-endpoints \
   --output table
 ```
 
-## 3. Limitaciones en LocalStack
+## 3. Instancia de test
+
+Igual que en la versión aws/, este lab despliega una `aws_instance.test` en
+`private-1` con un Security Group que solo permite tráfico saliente (`ingress = []`
+explícito). En LocalStack esta instancia no ejecuta tráfico real — su único
+propósito es validar la estructura Terraform: que el SG, las dependencias del
+NAT Gateway y la asociación de subred privada se declaren correctamente.
+
+```bash
+awslocal ec2 describe-instances \
+  --filters Name=tag:Project,Values=lab17 \
+  --query 'Reservations[].Instances[].{ID: InstanceId, AZ: Placement.AvailabilityZone, SubnetId: SubnetId}' \
+  --output table
+```
+
+## 4. Limitaciones en LocalStack
 
 | Característica | AWS Real | LocalStack |
 |---|---|---|
 | NAT Gateway | Funcional, procesa tráfico | Emulado, sin tráfico real |
 | NAT Instance | AL2023 ARM + iptables user_data | No disponible (requiere AMI real) |
+| Instancia de test | Conectividad real verificable por SSM | Emulada, sin SSM ni tráfico |
 | VPC Endpoint S3 | Ruta real al servicio S3 | Emulado |
 | Cargos NAT | $0.045/GB procesado | Sin cargos |
 
 Para probar la Instancia NAT, usa la versión `aws/` con `-var="use_nat_instance=true"`.
 
-## 4. Limpieza
+## 5. Limpieza
 
 ```bash
 terraform destroy

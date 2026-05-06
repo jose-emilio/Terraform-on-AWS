@@ -65,7 +65,7 @@ Una única VPC `10.12.0.0/16` con 6 subredes distribuidas en 3 AZs (3 públicas 
 
 Antes de ejecutar nada, revisemos las técnicas clave del código en `main.tf`.
 
-### 1.1 La VPC y la resolución DNS
+### La VPC y la resolución DNS
 
 ```hcl
 resource "aws_vpc" "main" {
@@ -91,7 +91,7 @@ Tres atributos clave de la VPC:
 
 Ambos flags son **requisitos previos para EKS**: el plano de control de Kubernetes resuelve los nodos por hostname y los servicios por DNS; sin estas dos opciones a `true`, el cluster no funciona. De ahí que las dejemos activadas desde el lab base de red.
 
-### 1.2 Cálculo dinámico de CIDRs con `cidrsubnet()`
+### Cálculo dinámico de CIDRs con `cidrsubnet()`
 
 ```hcl
 cidr_block = cidrsubnet(aws_vpc.main.cidr_block, 8, each.value.subnet_index)
@@ -118,7 +118,7 @@ Con el CIDR `10.12.0.0/16` y `newbits = 8`, el cálculo produce:
 
 Los `netnum` de las subredes privadas (10, 11, 12) están separados intencionalmente de las públicas (0, 1, 2), dejando espacio para futuras subredes intermedias.
 
-### 1.3 Iteración con `for_each`
+### Iteración con `for_each`
 
 ```hcl
 resource "aws_subnet" "this" {
@@ -135,7 +135,7 @@ En lugar de repetir 6 bloques `resource`, definimos un único recurso con `for_e
 
 Terraform crea instancias identificadas por clave: `aws_subnet.this["public-1"]`, `aws_subnet.this["private-2"]`, etc. Esto es más robusto que `count` porque renombrar o reordenar subredes no fuerza la destrucción y recreación.
 
-### 1.4 Tags dinámicos con `merge()`
+### Tags dinámicos con `merge()`
 
 ```hcl
 tags = merge(
@@ -154,7 +154,7 @@ tags = merge(
 2. **Tags específicos** de cada subred (nombre y tier)
 3. **Tags EKS** condicionales — las subredes públicas reciben `kubernetes.io/role/elb` y las privadas `kubernetes.io/role/internal-elb`
 
-### 1.5 Postcondición para validar RFC 1918
+### Postcondición para validar RFC 1918
 
 ```hcl
 lifecycle {
@@ -204,7 +204,7 @@ terraform output
 
 ## Verificación final
 
-### 3.1 Verificar la VPC
+### Verificar la VPC
 
 ```bash
 aws ec2 describe-vpcs \
@@ -213,7 +213,7 @@ aws ec2 describe-vpcs \
   --output table
 ```
 
-### 3.2 Verificar las subredes y su distribución por AZ
+### Verificar las subredes y su distribución por AZ
 
 ```bash
 aws ec2 describe-subnets \
@@ -224,7 +224,7 @@ aws ec2 describe-subnets \
 
 Deberías ver 6 subredes distribuidas en 3 AZs, con las públicas marcadas con `MapPublicIpOnLaunch = True`.
 
-### 3.3 Verificar tags EKS
+### Verificar tags EKS
 
 ```bash
 aws ec2 describe-subnets \
@@ -235,9 +235,7 @@ aws ec2 describe-subnets \
 
 Las subredes públicas deben tener `ELB = 1` y las privadas `InternalELB = 1`. Todas deben tener `Cluster = shared`.
 
----
-
-## Probar la postcondición RFC 1918
+### Probar la postcondición RFC 1918
 
 Intenta desplegar con un CIDR público para verificar que la postcondición funciona:
 
@@ -259,9 +257,7 @@ Terraform rechazará el apply con este error:
 
 ---
 
-## Retos
-
-### Reto 1 — Ampliar la red con subredes de base de datos
+## Reto — Ampliar la red con subredes de base de datos
 
 **Situación**: El equipo de base de datos necesita 3 subredes privadas adicionales dedicadas exclusivamente a RDS, aisladas de las subredes de aplicación existentes.
 
@@ -281,12 +277,11 @@ Terraform rechazará el apply con este error:
 
 ---
 
-## Soluciones
+## Solución
 
 <details>
-<summary><strong>Solución al Reto 1 — Ampliar la red con subredes de base de datos</strong></summary>
+<summary><strong>Ampliar la red con subredes de base de datos</strong></summary>
 
-### Solución al Reto 1 — Ampliar la red con subredes de base de datos
 
 #### Paso 1: Ampliar el mapa de subredes
 
@@ -406,7 +401,7 @@ Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md
 ## Buenas prácticas aplicadas
 
 - **`cidrsubnet()` para calcular subredes dinámicamente**: calcular los bloques CIDR de las subredes a partir del CIDR de la VPC usando `cidrsubnet()` garantiza que no hay solapamientos y que el código escala sin modificación cuando cambia el número de AZs.
-- **`for_each` sobre AZs disponibles**: iterar sobre `data.aws_availability_zones.available.names` en lugar de hardcodear `["us-east-1a", "us-east-1b"]` hace el código portable entre regiones sin modificación.
+- **Selección dinámica de AZs**: derivar `local.azs` de `data.aws_availability_zones.available.names` con `slice(...)` en lugar de hardcodear `["us-east-1a", "us-east-1b"]` hace el código portable entre regiones sin modificación.
 - **Tags de discovery para EKS**: los tags `kubernetes.io/role/elb` y `kubernetes.io/role/internal-elb` son requeridos por EKS para descubrir automáticamente las subnets donde crear los Load Balancers.
 - **Postcondición para validar RFC 1918**: una postcondición que verifica que el CIDR de la VPC pertenece al espacio privado (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) detecta errores de configuración antes de que lleguen a producción.
 - **Separación lógica de subredes públicas y privadas desde el plano de direccionamiento**: aunque en este laboratorio la diferencia entre "pública" y "privada" se materializa **únicamente** a nivel de `map_public_ip_on_launch` y de tags (no hay aún Internet Gateway, NAT Gateway ni tablas de rutas), reservar desde el principio rangos CIDR distintos (`10.x.0.0/24`–`10.x.2.0/24` para públicas, `10.x.10.0/24`–`10.x.12.0/24` para privadas) y etiquetar la intención facilita aplicar más adelante políticas de routing y seguridad diferenciadas por capa. El **routing real a Internet (IGW para públicas, NAT Gateway para privadas) se añade en el [lab-17](../lab-17/README.md)**; en lab-16 una subred "pública" todavía no tiene salida a Internet.

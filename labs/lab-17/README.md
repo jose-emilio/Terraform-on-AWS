@@ -34,7 +34,7 @@ Configurar la conectividad de salida a Internet priorizando la **alta disponibil
 
 ## Prerrequisitos
 
-- lab02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
+- lab-02 desplegado: bucket `terraform-state-labs-<ACCOUNT_ID>` con versionado habilitado (usado como backend de tfstate)
 - AWS CLI configurado con credenciales válidas
 - Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
@@ -159,21 +159,30 @@ resource "aws_instance" "nat" {
 
   source_dest_check = false  # ← CLAVE para NAT
 
-  user_data = <<-EOT
-    #!/bin/bash
-    set -euo pipefail
-    dnf install -y amazon-ssm-agent
-    systemctl enable amazon-ssm-agent && systemctl start amazon-ssm-agent
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-nat.conf
-    sysctl -p /etc/sysctl.d/90-nat.conf
-    dnf install -y iptables-nft
-    iptables -t nat -A POSTROUTING -o ens5 -s ${var.vpc_cidr} -j MASQUERADE
-    iptables -A FORWARD -i ens5 -o ens5 -m state --state RELATED,ESTABLISHED -j ACCEPT
-    iptables -A FORWARD -i ens5 -o ens5 -j ACCEPT
-    service iptables save
-  EOT
+  user_data = templatefile("${path.module}/scripts/nat_init.sh", {
+    vpc_cidr = var.vpc_cidr
+  })
 }
 ```
+
+> En el código real, el `user_data` se mantiene en
+> [`scripts/nat_init.sh`](aws/scripts/nat_init.sh) (cargado con
+> `templatefile()`). Lo importante son las tres operaciones que ese script
+> realiza al arrancar la instancia:
+>
+> ```bash
+> # 1. Habilitar IP forwarding
+> echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-nat.conf
+> sysctl -p /etc/sysctl.d/90-nat.conf
+>
+> # 2. Instalar iptables-nft (AL2023 minimal usa nftables como backend)
+> dnf install -y iptables-nft
+>
+> # 3. Reescribir IP origen de los paquetes reenviados (MASQUERADE)
+> iptables -t nat -A POSTROUTING -o ens5 -s ${var.vpc_cidr} -j MASQUERADE
+> iptables -A FORWARD -i ens5 -o ens5 -m state --state RELATED,ESTABLISHED -j ACCEPT
+> iptables -A FORWARD -i ens5 -o ens5 -j ACCEPT
+> ```
 
 Mismo patrón `for_each` que los NAT Gateways: una instancia por AZ en su subred pública correspondiente.
 
@@ -203,10 +212,10 @@ resource "aws_vpc_endpoint" "s3" {
   service_name      = "com.amazonaws.${var.region}.s3"
   vpc_endpoint_type = "Gateway"
 
-  route_table_ids = [
-    aws_route_table.public.id,
-    aws_route_table.private.id,
-  ]
+  route_table_ids = concat(
+    [aws_route_table.public.id],
+    [for rt in aws_route_table.private : rt.id],   # private es un mapa (for_each por AZ)
+  )
 }
 ```
 
@@ -272,13 +281,14 @@ terraform output
 ```bash
 aws ec2 describe-route-tables \
   --filters Name=tag:Name,Values=lab17-public-rt \
-  --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, GatewayId: GatewayId}' \
+  --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, GatewayId: GatewayId}' \
   --output table
 ```
 
-Deberías ver:
+Deberías ver tres rutas:
 - `10.13.0.0/16 → local` (ruta interna de la VPC, automática)
 - `0.0.0.0/0 → igw-xxx` (ruta al IGW)
+- `Dest=None, Prefix=pl-xxx → vpce-xxx` (ruta al VPC Endpoint S3 — usa `DestinationPrefixListId` en lugar de CIDR, por eso `Dest` aparece vacío)
 
 ### 3.2 Tablas de rutas privadas (una por AZ)
 
@@ -286,7 +296,7 @@ Deberías ver:
 aws ec2 describe-route-tables \
   --filters "Name=tag:Name,Values=lab17-private-rt-*" \
   --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, NatGW: NatGatewayId, GatewayId: GatewayId}}' \
-  --output json
+  --output table
 ```
 
 Cada tabla debe tener:
@@ -308,8 +318,10 @@ aws ec2 describe-vpc-endpoints \
 ### 3.4 Verificar el prefix list de S3
 
 ```bash
+REGION=$(aws configure get region || echo us-east-1)
+
 PLID=$(aws ec2 describe-prefix-lists \
-  --filters Name=prefix-list-name,Values=com.amazonaws.us-east-1.s3 \
+  --filters "Name=prefix-list-name,Values=com.amazonaws.${REGION}.s3" \
   --query 'PrefixLists[0].PrefixListId' --output text)
 
 aws ec2 describe-prefix-lists \
@@ -318,13 +330,13 @@ aws ec2 describe-prefix-lists \
   --output table
 ```
 
-Estos son los rangos IP de S3 que el Gateway Endpoint intercepta antes de que lleguen al NAT.
+Estos son los rangos de IPs públicas de S3 que el Gateway Endpoint intercepta antes de que lleguen al NAT.
 
 ---
 
 ## 4. Despliegue — Modo desarrollo (Instancia NAT)
 
-Se modifica el despliegue anterior y redespliega con la instancia NAT:
+Modifica el despliegue anterior y vuelve a aplicar con la variable activada — Terraform destruirá los NAT Gateways y creará las instancias NAT en su lugar:
 
 ```bash
 terraform apply -var="use_nat_instance=true"
@@ -453,7 +465,7 @@ La Instancia NAT no está disponible en LocalStack (requiere AMIs reales de EC2)
 - **NAT Gateway por AZ en producción**: desplegar un NAT Gateway por AZ elimina la dependencia de una única zona para la conectividad de salida. Si una AZ cae, las instancias de las otras AZs mantienen salida a Internet.
 - **Instancia NAT solo en desarrollo**: la Instancia NAT es más barata que el NAT Gateway (~$12.26/mes en `t4g.small` vs ~$32/mes por NAT Gateway, ahorro ~62%) pero tiene menor throughput, sin alta disponibilidad gestionada y requiere mantenimiento del SO (parches, iptables, monitoreo). Usarla solo en entornos no críticos.
 - **VPC Gateway Endpoint para S3 y DynamoDB**: el Gateway Endpoint no tiene costo y evita que el tráfico hacia S3 o DynamoDB salga por el NAT Gateway (ahorrando costes de procesamiento). Siempre debe activarse en VPCs con subnets privadas.
-- **`count` para despliegue condicional**: usar `count = var.use_nat_gateway ? 1 : 0` permite elegir entre NAT Gateway e Instancia NAT en tiempo de despliegue con una sola variable, sin duplicar código de infraestructura.
+- **`for_each` mutuamente excluyente para despliegue condicional**: usar `for_each = var.use_nat_instance ? toset([]) : toset(local.azs)` (y la negación en el otro recurso) permite elegir entre NAT Gateway e Instancia NAT en tiempo de despliegue con una sola variable, sin duplicar código y manteniendo la granularidad por AZ.
 - **IP Elástica para el NAT Gateway**: la IP fija del NAT Gateway permite configurar reglas de firewall en los destinos que solo permiten IPs conocidas, sin depender de IPs efímeras.
 - **Disable source/dest check en la Instancia NAT**: las instancias EC2 normales descartan paquetes que no van dirigidos a su IP. La Instancia NAT necesita este check deshabilitado para poder reenviar paquetes de otras instancias.
 - **`ingress = []` explícito en Security Groups sin entrada**: aunque un SG sin reglas de ingreso ya bloquea por defecto todo el tráfico entrante, declarar `ingress = []` de forma explícita (como en `aws_security_group.test`) deja documentada la intención de "deny all inbound" y evita findings falsos de linters de seguridad (tfsec, Checkov, etc.) que marcan los SGs sin bloque `ingress` declarado. La administración de la instancia se realiza por SSM Session Manager, que sólo requiere tráfico saliente.
