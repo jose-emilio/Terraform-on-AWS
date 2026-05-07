@@ -50,58 +50,9 @@ export REGION="us-east-1"
 
 ## Arquitectura
 
-```
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  VPC  10.47.0.0/16                                                           │
-  │                                                                              │
-  │  ┌─────────────────────────┐   ┌─────────────────────────┐                   │
-  │  │  Subred pública AZ-a    │   │  Subred pública AZ-b    │                   │
-  │  │  10.47.0.0/24           │   │  10.47.1.0/24           │                   │
-  │  │                         │   │                         │                   │
-  │  │  ┌──────────────────┐   │   │                         │                   │
-  │  │  │ EC2 traffic-gen  │   │   │                         │                   │
-  │  │  │ t4g.small        │   │   │                         │                   │
-  │  │  │ SG: 22 in/all out│   │   │                         │                   │
-  │  │  └───────┬──────────┘   │   │                         │                   │
-  │  └──────────┼──────────────┘   └─────────────────────────┘                   │
-  │             │ ENI primaria                                                   │
-  │  ┌──────────▼──────────────┐   ┌─────────────────────────┐                   │
-  │  │  Subred privada AZ-a    │   │  Subred privada AZ-b    │                   │
-  │  │  10.47.10.0/24          │   │  10.47.11.0/24          │                   │ 
-  │  └─────────────────────────┘   └─────────────────────────┘                   │
-  │                                                                              │
-  └──────────────────────────────┬───────────────────────────────────────────────┘
-                                 │ Internet Gateway
-                                 ▼
-                           Internet (tráfico ALL)
+![Hub & Spoke de telemetría: Flow Logs (REJECT) + CloudTrail multi-región → CloudWatch Logs → subscription filter → Kinesis Firehose → S3 + Glacier · CMK compartida](arch/diagrama.svg)
 
-  VPC Flow Log (ENI) ──────────────────────────────────────────────────────────┐
-                                                                               │
-              ┌────────────────────────────────────────────────────────────────▼─┐
-              │  CloudWatch Log Group /lab47/vpc-flow-logs  [KMS · 30d ret.]     │
-              │  └── Subscription Filter ─────────────────────────────────────┐  │
-              └───────────────────────────────────────────────────────────────┼──┘
-                                                                              │
-  ┌───────────────────────────────────────────────────────────────────────────▼──┐
-  │  Kinesis Firehose  lab47-logs-to-s3                                          │
-  │  Buffer: 5 MB / 300 s  ·  Compresión: GZIP  ·  Partición: año/mes/día        │
-  └──────────────────────────────────────────────────────────────────────────┬───┘
-                                                                             │
-  ┌──────────────────────────────────────────────────────────────────────────▼───┐
-  │  S3  lab47-archive-<account-id>                [KMS · versioning · ACL off]  │
-  │  ├── cloudtrail/AWSLogs/<account-id>/...  ← CloudTrail (JSON.gz)             │
-  │  └── firehose/year=/month=/day=/...       ← Kinesis Firehose (GZIP)          │
-  │                                                                              │
-  │  Lifecycle: Standard ──[90 días]──► Glacier Deep Archive  (~95% ahorro)      │
-  └──────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  AWS CloudTrail  lab47-trail                                                 │
-  │  Multi-región  ·  Log file validation  ·  KMS  ·  Global services            │
-  │  ├── S3 → cloudtrail/AWSLogs/...              (archivo, ~5 min latencia)     │
-  │  └── CloudWatch /lab47/cloudtrail             (tiempo real, Log Insights)    │
-  └──────────────────────────────────────────────────────────────────────────────┘
-```
+Patrón hub-and-spoke de observabilidad: dos fuentes de telemetría (**VPC Flow Logs** capturando `traffic_type = REJECT` y **CloudTrail** multi-región con `enable_log_file_validation` para detectar manipulación de logs) convergen en **CloudWatch Logs** como hub. Desde ahí, una `aws_cloudwatch_log_subscription_filter` reenvía a **Kinesis Firehose** que hace **buffering** (tamaño O intervalo, lo que llegue antes), **compresión GZIP** y **particionado temporal** (`year=YYYY/month=MM/day=DD`) compatible con Athena/Glue antes de depositar en el bucket S3 centralizado. CloudTrail también escribe directamente en S3 (entrega cada ~5 min), aprovechando ambas rutas: tiempo real vía CloudWatch + archivo histórico vía S3. La **CMK compartida** cifra toda la cadena (CWL + CloudTrail + Firehose) con statements distintos por servicio. La policy lifecycle transiciona objetos a **Glacier Deep Archive** tras N días (~96% más barato que S3 Standard).
 
 ## Conceptos clave
 

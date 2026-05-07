@@ -43,9 +43,13 @@ export REGION="us-east-1"
 
 ## Arquitectura
 
+![Observabilidad as Code: log group cifrado con KMS + metric filter ERROR + alarmas (Anomaly Detection ML, status check, CPU) → Composite AND → SNS · dashboard 5 widgets](arch/diagrama.svg)
+
+La EC2 emite logs y métricas. El **log group** se cifra con CMK propia (la policy de KMS otorga `AllowCloudWatchLogs`). Un **log_metric_filter** transforma cada línea con `ERROR` en una métrica numérica `ErrorCount` (con `default_value = 0` para que los periodos sin errores tengan datapoint). Tres alarmas: una con **Anomaly Detection** (`ANOMALY_DETECTION_BAND(m1, N)`) que aprende los patrones normales de CPU vía ML; una de **Status Check** y una de **CPU alta** sin acciones individuales — sólo la **Composite Alarm** con regla `ALARM(status) AND ALARM(cpu)` notifica al SNS. Esto reduce el ruido: se alertan únicamente los incidentes donde la instancia está bajo presión Y degradada simultáneamente. El **dashboard** se define como código con `jsonencode` y referencia los recursos por ID/ARN — actualizar el dashboard es tan simple como cambiar el HCL.
+
 ```
   ┌────────────────────────────────────────────────────────────────────────────┐
-  │  EC2 (t3.micro)   /var/log/app.log                                         │
+  │  EC2 (t4g.micro)   /var/log/app.log                                        │
   │  └── log-gen (systemd) ──► CloudWatch Agent                                │
   └────────────────────────────────────────┬───────────────────────────────────┘
                                            │

@@ -54,74 +54,13 @@ export REGION="us-east-1"
 
 ## Arquitectura
 
-```
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  Provider AWS — default_tags                                                │
-  │  ┌──────────────────────────────────────────────────────────────────────┐   │
-  │  │  Environment = "prd"   Project = "lab48"                             │   │
-  │  │  ManagedBy = "terraform"   CostCenter = "engineering"                │   │
-  │  │  ↓ inyectadas automáticamente en TODOS los recursos de la cuenta     │   │
-  │  └──────────────────────────────────────────────────────────────────────┘   │
-  └─────────────────────────────────────────────────────────────────────────────┘
+![FinOps: default_tags + módulo naming → ASG con Mixed Instances Policy (On-Demand base + Spot capacity-optimized) + AWS Budgets filtrado por tag → SNS](arch/diagrama.svg)
 
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  Módulo de Naming  modules/naming                                           │
-  │  ┌───────────────────────────────────────────────────────────────────────┐  │
-  │  │  Patrón: {app}-{env}-{component}-{resource}                           │  │
-  │  │  myapp-prd-network-vpc    myapp-prd-network-igw                       │  │
-  │  │  myapp-prd-compute-asg    myapp-prd-compute-lt                        │  │
-  │  │  myapp-prd-finops-budget  myapp-prd-finops-sns                        │  │
-  │  └───────────────────────────────────────────────────────────────────────┘  │
-  └─────────────────────────────────────────────────────────────────────────────┘
+Tres palancas FinOps complementarias actuando sobre la misma infraestructura:
 
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  VPC  10.48.0.0/16                                                          │
-  │                                                                             │
-  │  ┌─────────────────────────┐   ┌─────────────────────────┐                  │
-  │  │  Subred pública AZ-a    │   │  Subred pública AZ-b    │                  │
-  │  │  10.48.0.0/24           │   │  10.48.1.0/24           │                  │
-  │  │                         │   │                         │                  │
-  │  │  ┌──────────────────┐   │   │  ┌──────────────────┐   │                  │
-  │  │  │  EC2 On-Demand   │   │   │  │  EC2 On-Demand   │   │                  │
-  │  │  │  t3.small        │   │   │  │  t3.small        │   │                  │
-  │  │  └──────────────────┘   │   │  └──────────────────┘   │                  │
-  │  │  ┌──────────────────┐   │   │  ┌──────────────────┐   │                  │
-  │  │  │  EC2 Spot        │   │   │  │  EC2 Spot        │   │                  │
-  │  │  │  t3.small        │   │   │  │  t3.small        │   │                  │
-  │  │  │  (interrumpible) │   │   │  │  (interrumpible) │   │                  │
-  │  │  └──────────────────┘   │   │  └──────────────────┘   │                  │
-  │  └─────────────────────────┘   └─────────────────────────┘                  │
-  │                                                                             │
-  └─────────────────────────────────┬───────────────────────────────────────────┘
-                                    │ Internet Gateway
-                                    ▼
-                              Internet
-
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  Auto Scaling Group  myapp-prd-compute-asg                                  │
-  │  min=1 · max=4 · desired=4                                                  │
-  │                                                                             │
-  │  Mixed Instances Policy                                                     │
-  │  ├── On-Demand base: 1 instancia (garantizada, no interrumpible)            │
-  │  ├── Adicionales: 30% On-Demand / 70% Spot                                  │
-  │  ├── Spot pool: t3.small, t3a.small, t3.medium, t3a.medium                  │
-  │  └── Estrategia: capacity-optimized (máxima disponibilidad Spot)            │
-  │                                                                             │
-  │  Launch Template: Amazon Linux 2023 · gp3 20GB · IMDSv2 · SSM               │
-  └─────────────────────────────────────────────────────────────────────────────┘
-
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  AWS Budgets  myapp-prd-finops-budget                                       │
-  │  Límite: $20/mes  ·  Tipo: COST  ·  Periodo: MONTHLY                        │
-  │                                                                             │
-  │  Alerta 1 (FORECASTED, 85%):  predicción > $17 → SNS publish                │
-  │  Alerta 2 (ACTUAL, 100%):     gasto real > $20  → SNS publish               │
-  │       │                                                                     │
-  │       ▼                                                                     │
-  │  SNS Topic  myapp-prd-finops-sns                                            │
-  │  └── Subscripción email (opcional)                                          │
-  └─────────────────────────────────────────────────────────────────────────────┘
-```
+- **Tagging consistente.** `default_tags` del provider (`Environment`, `Project`, `ManagedBy`, `CostCenter`) se inyectan automáticamente en todos los recursos; un módulo `naming` invocado con `for_each` genera nombres `<app>-<env>-<component>-<resource>` coherentes. Esta base es imprescindible para que **Cost Allocation Reports** y Budgets puedan filtrar por proyecto.
+- **Ahorro de cómputo.** El ASG tiene **Mixed Instances Policy**: `on_demand_base_capacity` garantiza N instancias On-Demand siempre disponibles + el resto se distribuye según `on_demand_percentage_above_base_capacity` con **`spot_allocation_strategy = capacity-optimized`** sobre un pool de 4 tipos similares (`t3.small`, `t3a.small`, `t3.medium`, `t3a.medium`) — diversidad de pools reduce la tasa de interrupción Spot.
+- **Visibilidad y alertas.** `aws_budgets_budget` con **dos thresholds** (`ACTUAL` 80% y `FORECASTED` 100%) filtrado por `cost_filter` con la tag `Project = var.app_name` notifica al SNS topic; el subscriber email se entera antes de que el coste real explote.
 
 ## Conceptos clave
 

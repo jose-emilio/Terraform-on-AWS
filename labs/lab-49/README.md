@@ -79,6 +79,14 @@ export REGION="us-east-1"
 
 ## Arquitectura
 
+![Compliance as Code: Config recorder → reglas EBS y S3 → SSM Automation auto-remediation con rol IAM mínimo + Security Hub FSBP unifica hallazgos](arch/diagrama.svg)
+
+Tres capas combinadas sobre la misma cuenta:
+
+- **Detectiva (AWS Config).** El `aws_config_configuration_recorder` captura los cambios de configuración de cada recurso y los entrega a un bucket S3 (delivery channel). Dos reglas gestionadas evalúan el estado: `ENCRYPTED_VOLUMES` para EBS y `S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED` para S3 — los recursos se marcan `COMPLIANT` o `NON_COMPLIANT`.
+- **Correctiva (auto-remediation).** La regla S3 está vinculada a un `aws_config_remediation_configuration` con `automatic = true`. Cuando un bucket entra en `NON_COMPLIANT`, Config dispara el documento SSM `AWSConfigRemediation-ConfigureS3BucketPublicAccessBlock` que asume el `remediation IAM role` (mínimo privilegio: `s3:PutBucketPublicAccessBlock` + `Get…` + `GetBucketLocation`) y restaura los 4 ajustes de Block Public Access. Los `execution_controls.ssm_controls` (concurrent 25%, error 20%, max attempts 3) evitan efecto dominó. EBS no tiene remediación automática porque cifrar un volumen existente requiere parada de la EC2 — solo detección.
+- **Visibilidad unificada (Security Hub).** `aws_securityhub_account` con suscripción al estándar **FSBP v1.0.0** (~300 controles, formato ASFF). Config recorder es prerequisito crítico: sin él, los controles del estándar quedan en 0%.
+
 ```
   ╔═══════════════════════════════════════════════════════════════════════════════╗
   ║  CAPA 1 — PREVENTIVA (pipeline, pre-deploy)                                   ║
