@@ -61,65 +61,9 @@ export REGION="us-east-1"
 
 ## Arquitectura
 
-```
-Supply chain completa:
-─────────────────────────────────────────────────────────────────────────────
+![Registro privado de módulos Terraform en CodeArtifact: dominio cifrado con CMK + repo formato generic + roles publisher (PublishPackageVersion) y consumer (solo Read*)](arch/diagrama.svg)
 
-  ┌──────────────────────────┐
-  │  module/vpc/             │  Código fuente del módulo (en este repositorio)
-  │  main.tf, variables.tf,  │
-  │  outputs.tf              │
-  └──────────┬───────────────┘
-             │ tar -czf
-             ▼
-  vpc-module-1.0.0.tar.gz   (asset local, SHA-256 calculado)
-             │
-             │ aws codeartifact publish-package-version
-             │ (credenciales ci-publisher)
-             ▼
-  ┌────────────────────────────────────────────────────────────────────────┐
-  │  AWS CodeArtifact                                                      │
-  │                                                                        │
-  │  Dominio: supply-chain  (CMK: alias/lab42-codeartifact)                │
-  │  └── Repositorio: terraform-modules  (format: generic)                 │
-  │      └── Package: vpc-module                                           │
-  │          └── Version: 1.0.0  (IMMUTABLE)                               │
-  │              └── Asset: vpc-module-1.0.0.tar.gz  (SHA-256 verificado)  │
-  └──────────────────────────────────────────────┬─────────────────────────┘
-                                                  │
-                                                  │ AWS Sig V4 (get-package-version-asset)
-                                                  │ (credenciales ci-consumer)
-                                                  ▼
-  ┌──────────────────────────────────────────────────────────┐
-  │  get-package-version-asset  →  /tmp/vpc-module/          │
-  │                                                          │
-  │  consumer/main.tf                                        │
-  │  module "vpc" {                                          │
-  │    source = "/tmp/vpc-module"   (ruta local extraída)    │
-  │  }                                                       │
-  │                                                          │
-  │  terraform init  →  carga módulo desde ruta local        │
-  └──────────────────────────────────────────────────────────┘
-
-Gobernanza de acceso:
-─────────────────────────────────────────────────────────────────────────────
-
-  Capa 1 — IAM (identidad)
-  ┌────────────────────────────────────────────────────────────────────────┐
-  │  ci-publisher: GetAuthorizationToken, sts:GetServiceBearerToken        │
-  │  ci-consumer:  GetAuthorizationToken, sts:GetServiceBearerToken        │
-  │                                                                        │
-  │  AMBOS necesitan el token antes de cualquier operacion de paquete.     │
-  └────────────────────────────────────────────────────────────────────────┘
-
-  Capa 2 — Recurso (politica del repositorio)
-  ┌────────────────────────────────────────────────────────────────────────┐
-  │  ci-publisher: PublishPackageVersion, PutPackageMetadata, Read*        │
-  │  ci-consumer:  GetPackageVersionAsset, ReadFromRepository, List*       │
-  │                                                                        │
-  │  ci-consumer NO tiene PublishPackageVersion — solo lectura.            │
-  └────────────────────────────────────────────────────────────────────────┘
-```
+Un **dominio CodeArtifact** cifrado con CMK propia (rotación anual, **clave inmutable** una vez creada) contiene un **repositorio en formato `generic`** que aloja módulos Terraform empaquetados como `tar.gz` con versiones inmutables (publicar `vpc-module-1.0.0` no permite reescribirlo). La defensa en profundidad combina **políticas IAM** en cada usuario con **políticas de recurso** en el dominio y el repo: el principal necesita permiso en ambas capas. Los **publishers** pueden `PublishPackageVersion` pero **no** `DeletePackageVersions` — la inmutabilidad se refuerza haciendo que sólo el admin pueda borrar. Los **consumers** sólo tienen `Read*` y `GetPackageVersionAsset`. El cliente obtiene un token AuthZ con `aws codeartifact get-authorization-token` (TTL 12h) y descarga assets vía Sig V4 contra el endpoint `<domain>-<account>.d.codeartifact.<region>.amazonaws.com`.
 
 ## Conceptos clave
 
@@ -234,6 +178,9 @@ explícito) puede hacerlo. Esto refuerza la auditoría.
 
 ```
 labs/lab-42/
+├── diagrama.drawio   ── Fuente editable del diagrama de arquitectura
+├── arch/
+│   └── diagrama.svg  ── Diagrama de arquitectura (referenciado en este README)
 ├── aws/              ── Infraestructura CodeArtifact + IAM (Terraform)
 │   ├── providers.tf
 │   ├── variables.tf

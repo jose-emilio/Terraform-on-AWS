@@ -80,6 +80,12 @@ export REGION="us-east-1"
 
 ## Arquitectura
 
+![Pipeline CI de IaC: CodeCommit → EventBridge → CodeBuild (imagen ECR custom con terraform/tflint/trivy/checkov) → tfplan en S3](arch/diagrama.svg)
+
+Cada push a `main` del repo CodeCommit emite un evento que **EventBridge** filtra (`referenceName = main`) y dispara como target al proyecto **CodeBuild**. El proyecto usa una imagen custom alojada en **ECR** (tag IMMUTABLE, scan_on_push, lifecycle reduce a N tagged + untagged 1d) que contiene Terraform + TFLint + Trivy + Checkov pre-instalados — se descarga con `image_pull_credentials_type = SERVICE_ROLE`. El `buildspec.yml` corre **Fail Fast**: `pre_build` ejecuta `fmt → init/validate → tflint → trivy → checkov` y aborta a la primera, `build` solo corre si todas pasan y produce `tfplan` + `tfplan.txt` que se suben como artefactos a un **bucket S3** cifrado (SSE-S3 con bucket key, versionado, `DenyNonTLS`, lifecycle 90d). Los logs van al log group `/aws/codebuild/<project>-iac-runner`.
+
+### Detalle del flujo y de la imagen
+
 ```
 Flujo del pipeline:
 ───────────────────────────────────────────────────────────────────────────────
@@ -94,16 +100,16 @@ Flujo del pipeline:
   │  ├── .tflint.hcl      (configuracion del linter)                         │
   │  └── buildspec.yml    (logica del pipeline)                              │
   └─────────────────────────────┬────────────────────────────────────────────┘
-                                 │ evento referenceUpdated (rama main)
-                                 ▼
+                                │ evento referenceUpdated (rama main)
+                                ▼
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  EventBridge Rule  lab43-on-push-main                                    │
   │  ├── source      - aws.codecommit                                        │
   │  ├── detail-type - CodeCommit Repository State Change                    │
   │  └── target      - lab43-iac-runner (CodeBuild)                          │
   └─────────────────────────────┬────────────────────────────────────────────┘
-                                 │ codebuild:StartBuild (rol events)
-                                 ▼
+                                │ codebuild:StartBuild (rol events)
+                                ▼
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  CodeBuild Project  lab43-iac-runner                                     │
   │                                                                          │
@@ -145,7 +151,7 @@ Flujo del pipeline:
 
   ┌──────────────────────────────────────────────────────────────────────────┐
   │  CodeBuild Reports                                                       │
-  │  ├── lab43-iac-runner-trivy-report    → hallazgos de Trivy por build      │
+  │  ├── lab43-iac-runner-trivy-report    → hallazgos de Trivy por build     │
   │  └── lab43-iac-runner-checkov-report  → checks de Checkov por build      │
   │      Ambos se suben aunque el build falle (patron Collect and Fail)      │
   └──────────────────────────────────────────────────────────────────────────┘
@@ -167,7 +173,7 @@ Imagen Docker multi-stage:
   │  ├── Descarga terraform_1.15.2_linux_amd64.zip → SHA256 ✓                │
   │  ├── Descarga tflint_0.62.0_linux_amd64.zip    → SHA256 ✓                │
   │  ├── Descarga trivy_0.70.0_Linux-64bit.tar.gz  → SHA256 ✓                │
-  │  ├── Descarga trivy contrib/junit.tpl           → embebida en imagen      │
+  │  ├── Descarga trivy contrib/junit.tpl           → embebida en imagen     │
   │  └── Instala plugin TFLint AWS v0.31.0         → pre-instalado           │
   └──────────────────────────────┬───────────────────────────────────────────┘
                                  │ COPY --from=downloader
@@ -436,6 +442,9 @@ codebuild:BatchPutCodeCoverages — requerida por el agente aunque no se usen
 
 ```
 labs/lab-43/
+├── diagrama.drawio          ── Fuente editable del diagrama de arquitectura
+├── arch/
+│   └── diagrama.svg         ── Diagrama de arquitectura (referenciado en este README)
 ├── aws/                     ── Infraestructura del pipeline (Terraform)
 │   ├── providers.tf         ── Provider AWS ~> 6.0, backend S3
 │   ├── variables.tf         ── Versiones pinneadas, nombres de recursos
