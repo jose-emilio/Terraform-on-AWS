@@ -83,6 +83,8 @@ Tras confirmar, el archivo `terraform.tfstate` local queda vacío y el estado vi
 
 ```
 lab-07/
+├── arch/
+│   └── diagrama.svg   # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf   # Bloque terraform{} y provider{}
 │   ├── variables.tf   # Nombre del bucket (lab02), tabla y región

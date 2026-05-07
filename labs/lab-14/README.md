@@ -79,6 +79,8 @@ Almacenar el secreto como JSON es la práctica estándar de AWS por tres razones
 ```
 lab-14/
 ├── README.md
+├── arch/
+│   └── diagrama.svg           # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf           # Provider AWS ~> 6.0 + random + backend S3
 │   ├── variables.tf           # region, project_name, environment, vpc_cidr, db_name, db_username

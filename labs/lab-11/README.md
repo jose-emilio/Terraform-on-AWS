@@ -40,6 +40,8 @@ echo "Bucket: $BUCKET"
 ```
 lab-11/
 ├── README.md                    ← Esta guía
+├── arch/
+│   └── diagrama.svg             ← Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf             ← Backend S3 parcial
 │   ├── variables.tf

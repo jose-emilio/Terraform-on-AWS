@@ -158,6 +158,8 @@ resource "aws_cloudwatch_metric_alarm" "ecs_cpu" {
 
 ```
 lab-32/
+├── arch/
+│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
 └── aws/
     ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
     ├── providers.tf          # Backend S3, Terraform >= 1.10, providers AWS y archive

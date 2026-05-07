@@ -142,6 +142,8 @@ detecta cada tipo de incumplimiento de forma aislada.
 
 ```
 lab-15/
+├── arch/
+│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf          # Terraform + provider AWS
 │   ├── variables.tf          # region, project, github_org, github_repo, allowed_ref

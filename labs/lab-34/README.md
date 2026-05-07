@@ -158,6 +158,8 @@ Esto permite que múltiples aplicaciones compartan el mismo EFS con aislamiento 
 ```
 labs/lab-34/
 ├── README.md
+├── arch/
+│   └── diagrama.svg                       # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf
 │   ├── variables.tf

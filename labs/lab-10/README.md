@@ -106,6 +106,8 @@ Si la capa de red no ha sido desplegada, el data source falla inmediatamente en 
 
 ```
 lab-10/
+├── arch/
+│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── network/
 │   │   ├── providers.tf      # Backend S3 (parcial) + provider AWS

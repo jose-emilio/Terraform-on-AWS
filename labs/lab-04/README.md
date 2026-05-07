@@ -117,6 +117,8 @@ Esto genera un map `{ "alice" => "arn:...", "bob" => "arn:..." }`, mucho más le
 
 ```
 lab-04/
+├── arch/
+│   └── diagrama.svg   # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf   # Bloque terraform{} y provider{}
 │   ├── variables.tf   # Map de usuarios IAM y nombre de aplicación

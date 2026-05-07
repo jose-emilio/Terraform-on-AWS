@@ -117,6 +117,8 @@ terraform fmt -check -diff
 
 ```
 lab-03/
+├── arch/
+│   └── diagrama.svg   # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf   # Bloques terraform{} y provider{}
 │   ├── variables.tf   # Variables con tipos object y validaciones

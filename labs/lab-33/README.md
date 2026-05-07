@@ -143,6 +143,8 @@ Con `Effect = "Deny"` y esta condición, cualquier petición que no provenga del
 
 ```
 lab-33/
+├── arch/
+│   └── diagrama.svg              # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
 │   ├── providers.tf          # Backend S3, Terraform >= 1.10, provider AWS

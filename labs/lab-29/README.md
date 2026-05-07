@@ -184,6 +184,9 @@ Sin el Circuit Breaker, un despliegue con un contenedor defectuoso (imagen incor
 
 ```
 lab-29/
+├── diagrama.drawio       # Fuente editable del diagrama de arquitectura
+├── arch/
+│   └── diagrama.svg      # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── aws.s3.tfbackend   # Parámetros del backend S3 (sin bucket)
 │   ├── providers.tf       # Backend S3, Terraform >= 1.10, provider AWS

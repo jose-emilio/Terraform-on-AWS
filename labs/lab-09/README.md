@@ -125,6 +125,8 @@ resource "aws_vpc" "main" {
 
 ```
 lab-09/
+├── arch/
+│   └── diagrama.svg      # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf      # Requiere Terraform >= 1.10, backend "s3" {}
 │   ├── variables.tf      # region, is_prod

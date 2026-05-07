@@ -88,6 +88,8 @@ La configuración SSE por defecto no impide subir objetos sin cifrado si el clie
 ```
 lab-13/
 ├── README.md
+├── arch/
+│   └── diagrama.svg       # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf       # Provider AWS ~> 6.0 + backend S3
 │   ├── variables.tf       # region, project, admin_principal_arns, app_principal_arns, ebs_volume_size_gb

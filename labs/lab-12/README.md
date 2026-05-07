@@ -97,6 +97,8 @@ El resultado incluye `AccessKeyId`, `SecretAccessKey`, `Token` y `Expiration`. E
 ```
 lab-12/
 ├── README.md
+├── arch/
+│   └── diagrama.svg       # Diagrama de arquitectura (referenciado en este README)
 ├── user_data.sh           # Script de verificación (ejecutado al arrancar EC2)
 ├── aws/
 │   ├── providers.tf       # Provider AWS + backend S3

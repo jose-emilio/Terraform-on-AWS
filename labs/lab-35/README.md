@@ -180,6 +180,8 @@ La replicación es asíncrona — puede haber un lag de milisegundos. Para datos
 ```
 labs/lab-35/
 ├── README.md
+├── arch/
+│   └── diagrama.svg                       # Diagrama de arquitectura (referenciado en este README)
 └── aws/
     ├── providers.tf
     ├── variables.tf

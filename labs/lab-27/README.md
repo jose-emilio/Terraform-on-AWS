@@ -124,6 +124,8 @@ El resultado (`data.aws_iam_policy_document.ec2_assume_role.json`) se pasa direc
 
 ```
 lab-27/
+├── arch/
+│   └── diagrama.svg     # Diagrama de arquitectura (referenciado en este README)
 ├── user_data.tftpl      # Plantilla de bash compartida por ambos entornos
 ├── aws/
 │   ├── aws.s3.tfbackend # Parámetros del backend S3 (sin bucket)

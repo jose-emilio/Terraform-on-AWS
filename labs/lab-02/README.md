@@ -95,6 +95,8 @@ Cuando ejecutas `terraform apply`, Terraform genera un archivo `terraform.tfstat
 
 ```
 lab-02/
+├── arch/
+│   └── diagrama.svg  # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   └── main.tf       # Bucket S3 + versionado + cifrado + acceso público bloqueado
 └── localstack/
