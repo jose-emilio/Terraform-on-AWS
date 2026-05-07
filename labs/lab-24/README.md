@@ -10,6 +10,15 @@
 
 Crear un módulo "wrapper" que orqueste módulos públicos del Terraform Registry (VPC y RDS), inyectando estándares de seguridad obligatorios que los equipos de desarrollo **no pueden desactivar**. Encadenar los outputs del módulo de VPC como inputs del módulo de RDS. Usar bloques `moved {}` para renombrar recursos internos sin destruir infraestructura.
 
+## Arquitectura
+
+![Wrapper corporate-rds que compone los módulos públicos VPC y RDS del Registry con compliance hardcoded](arch/diagrama.svg)
+
+El wrapper contiene tres componentes:
+1. **Módulo público VPC**: crea la red completa (VPC, subredes, NAT Gateway, route tables)
+2. **Security group**: restringe el acceso a RDS solo desde las subredes privadas
+3. **Módulo público RDS**: crea la base de datos con parámetros de seguridad hardcoded
+
 ## Conceptos clave
 
 | Concepto | Descripción |
@@ -82,15 +91,6 @@ lab-24/
 ```
 
 ## Análisis del código
-
-### Arquitectura del laboratorio
-
-![Wrapper corporate-rds que compone los módulos públicos VPC y RDS del Registry con compliance hardcoded](arch/diagrama.svg)
-
-El wrapper contiene tres componentes:
-1. **Módulo público VPC**: crea la red completa (VPC, subredes, NAT Gateway, route tables)
-2. **Security group**: restringe el acceso a RDS solo desde las subredes privadas
-3. **Módulo público RDS**: crea la base de datos con parámetros de seguridad hardcoded
 
 ### Composición de módulos — VPC del Registry
 

@@ -10,6 +10,17 @@
 
 Establecer un túnel privado entre dos VPCs independientes para permitir la comunicación bidireccional **sin que el tráfico salga nunca a Internet**. Verificar experimentalmente que el peering **no es transitivo** mediante una tercera VPC.
 
+## Arquitectura
+
+![3 VPCs con 2 VPC Peerings (app↔db, app↔c) demostrando la NO transitividad hacia c↔db](arch/diagrama.svg)
+
+Tres VPCs con dos peerings:
+- **app ↔ db**: comunicación directa (ej. aplicación accede a base de datos)
+- **app ↔ vpc-c**: comunicación directa
+- **vpc-c ↔ db**: **sin peering** — vpc-c no puede alcanzar db a través de app (no transitividad)
+
+Solo `vpc-app` tiene IGW + NAT Gateway. `vpc-db` y `vpc-c` acceden a SSM Session Manager mediante 3 VPC Interface Endpoints (`ssm`, `ssmmessages`, `ec2messages`) cada una, sin necesidad de salida a Internet.
+
 ## Conceptos clave
 
 | Concepto | Descripción |
@@ -71,17 +82,6 @@ lab-19/
 ```
 
 ## Análisis del código
-
-### Arquitectura del laboratorio
-
-![3 VPCs con 2 VPC Peerings (app↔db, app↔c) demostrando la NO transitividad hacia c↔db](arch/diagrama.svg)
-
-Tres VPCs con dos peerings:
-- **app ↔ db**: comunicación directa (ej. aplicación accede a base de datos)
-- **app ↔ vpc-c**: comunicación directa
-- **vpc-c ↔ db**: **sin peering** — vpc-c no puede alcanzar db a través de app (no transitividad)
-
-Solo `vpc-app` tiene IGW + NAT Gateway. `vpc-db` y `vpc-c` acceden a SSM Session Manager mediante 3 VPC Interface Endpoints (`ssm`, `ssmmessages`, `ec2messages`) cada una, sin necesidad de salida a Internet.
 
 ### VPC Peering — Solicitud y aceptación
 

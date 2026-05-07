@@ -29,6 +29,14 @@ Al finalizar este laboratorio serás capaz de:
 
 ---
 
+## Arquitectura
+
+![State splitting: capa de red y capa de cómputo con tfstates aislados, comunicadas vía terraform_remote_state](arch/diagrama.svg)
+
+La solución es separar la infraestructura en proyectos Terraform independientes, cada uno con su propio estado. Cada capa solo gestiona los recursos de su dominio y expone una interfaz pública mínima a través de `output`. Un error o destrucción en la capa de cómputo **no toca** el estado de la capa de red — el blast radius queda contenido al dominio afectado.
+
+---
+
 ## Conceptos Clave
 
 ### Blast radius y el estado monolítico
@@ -48,14 +56,6 @@ Estado monolítico (un solo tfstate)
 └─────────────────────────────────────────────┘
          Un error aquí afecta a todo ↑
 ```
-
-### Arquitectura de capas (state splitting)
-
-La solución es separar la infraestructura en proyectos Terraform independientes, cada uno con su propio estado. Cada capa solo gestiona los recursos de su dominio y expone una interfaz pública mínima a través de `output`.
-
-![State splitting: capa de red y capa de cómputo con tfstates aislados, comunicadas vía terraform_remote_state](arch/diagrama.svg)
-
-Un error o destrucción en la capa de cómputo **no toca** el estado de la capa de red. El blast radius queda contenido al dominio afectado.
 
 ### `output` como interfaz pública entre capas
 

@@ -10,6 +10,12 @@
 
 Centralizar la interconectividad de múltiples VPCs mediante un **Transit Gateway (TGW)** central con **inspección obligatoria** de todo el tráfico, **salida a Internet centralizada** a través de una egress-vpc con NAT Gateway altamente disponible (uno por AZ), y compartición del TGW entre cuentas con **AWS Resource Access Manager (RAM)**.
 
+## Arquitectura
+
+![Hub-and-Spoke con TGW: 4 VPCs (clients, inspection, egress) + 3 route tables + RAM share](arch/diagrama.svg)
+
+Cuatro VPCs conectadas al TGW. El tráfico se segmenta mediante **tres tablas de rutas del TGW** que fuerzan todo el tráfico a pasar por inspection antes de llegar a su destino o a Internet.
+
 ## Conceptos clave
 
 | Concepto | Descripción |
@@ -69,13 +75,6 @@ lab-20/
 ```
 
 ## Análisis del código
-
-### Arquitectura con inspección y egress centralizados
-
-![Hub-and-Spoke con TGW: 4 VPCs (clients, inspection, egress) + 3 route tables + RAM share](arch/diagrama.svg)
-
-Cuatro VPCs conectadas al TGW. El tráfico se segmenta mediante **tres tablas de rutas del TGW** que fuerzan todo el tráfico a pasar por inspection antes de llegar a su destino o a Internet.
-```
 
 ### Transit Gateway — Tablas de rutas personalizadas
 

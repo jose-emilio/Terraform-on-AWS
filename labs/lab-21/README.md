@@ -10,6 +10,16 @@
 
 Implementar un sistema de nombres interno (`.internal`) sin necesidad de un dominio comprado en Internet, utilizando una **Zona Hospedada Privada** en Route 53. Verificar que los nombres solo resuelven desde dentro de la VPC.
 
+## Arquitectura
+
+![Route 53 Private Hosted Zone + ALB + EC2 db/test, demostrando que la zona NO resuelve desde Internet](arch/diagrama.svg)
+
+Una VPC con:
+- Una **Zona Hospedada Privada** `app.internal` asociada a la VPC
+- Un registro **Alias** `web.app.internal` que apunta al ALB
+- Un registro **A** `db.app.internal` que apunta a la IP privada de una instancia (simulando una DB)
+- Una instancia de test para verificar la resolución DNS con `nslookup` y `dig`
+
 ## Conceptos clave
 
 | Concepto | Descripción |
@@ -56,16 +66,6 @@ lab-21/
 ```
 
 ## Análisis del código
-
-### Arquitectura del laboratorio
-
-![Route 53 Private Hosted Zone + ALB + EC2 db/test, demostrando que la zona NO resuelve desde Internet](arch/diagrama.svg)
-
-Una VPC con:
-- Una **Zona Hospedada Privada** `app.internal` asociada a la VPC
-- Un registro **Alias** `web.app.internal` que apunta al ALB
-- Un registro **A** `db.app.internal` que apunta a la IP privada de una instancia (simulando una DB)
-- Una instancia de test para verificar la resolución DNS con `nslookup` y `dig`
 
 ### Zona Hospedada Privada — DNS solo interno
 

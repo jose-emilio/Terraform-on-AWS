@@ -10,6 +10,16 @@
 
 Crear módulos que validen los datos antes de intentar crear infraestructura en AWS. Aplicar cuatro técnicas de diseño defensivo dentro de módulos reutilizables: validación con regex para nombres de bucket, tipos complejos (`object`) para configuración de base de datos, variables sensibles para contraseñas, y postcondiciones que verifican el estado real del recurso creado.
 
+## Arquitectura
+
+![Root Module orquesta 3 módulos con tres técnicas distintas de validación: validation, object+sensitive, postcondition](arch/diagrama.svg)
+
+Cada módulo encapsula una técnica de validación diferente. El Root Module los orquesta pasando variables y etiquetas comunes:
+
+- **`safe-network`** — `lifecycle.postcondition` con regex RFC 1918 sobre `self.cidr_block` (validación **después** del create, sobre el atributo real que devolvió AWS).
+- **`validated-bucket`** — `validation` en la variable `bucket_name` con `can(regex(...))` que exige el prefijo `empresa-` (validación **antes** del plan, sin tocar la API de AWS).
+- **`db-config`** — `variable "db_config"` de tipo `object({})` con `optional(...)` para campos con default + `db_password` marcada como `sensitive` (oculta en logs / plan / apply pero sí en state).
+
 ## Conceptos clave
 
 | Concepto | Descripción |
@@ -83,16 +93,6 @@ lab-23/
 ```
 
 ## Análisis del código
-
-### Arquitectura del laboratorio
-
-![Root Module orquesta 3 módulos con tres técnicas distintas de validación: validation, object+sensitive, postcondition](arch/diagrama.svg)
-
-Cada módulo encapsula una técnica de validación diferente. El Root Module los orquesta pasando variables y etiquetas comunes:
-
-- **`safe-network`** — `lifecycle.postcondition` con regex RFC 1918 sobre `self.cidr_block` (validación **después** del create, sobre el atributo real que devolvió AWS).
-- **`validated-bucket`** — `validation` en la variable `bucket_name` con `can(regex(...))` que exige el prefijo `empresa-` (validación **antes** del plan, sin tocar la API de AWS).
-- **`db-config`** — `variable "db_config"` de tipo `object({})` con `optional(...)` para campos con default + `db_password` marcada como `sensitive` (oculta en logs / plan / apply pero sí en state).
 
 ### Módulo `validated-bucket` — Regex en la interfaz del módulo
 

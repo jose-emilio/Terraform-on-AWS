@@ -32,6 +32,14 @@ Al finalizar este laboratorio serás capaz de:
 
 ---
 
+## Arquitectura
+
+![Data Lake S3 con KMS CMK, SSE-KMS Bucket Key, versionado, lifecycle a Glacier y bucket policy que exige VPC Gateway Endpoint](arch/diagrama.svg)
+
+El módulo `secure-bucket` encapsula todas las capas de defensa: una **CMK** dedicada con rotación anual cifra los objetos vía **SSE-KMS con Bucket Key** (1 sola llamada a KMS por bucket en lugar de por objeto). El bloqueo público con los 4 controles, el **versionado** anti-ransomware y la **lifecycle rule** que transiciona a Glacier y luego expira completan la fortificación. La **bucket policy** deniega `s3:*` cuando `aws:sourceVpce ≠ endpoint` **Y** `aws:PrincipalAccount ≠ cuenta` (AND lógico): así los principales de la propia cuenta acceden con normalidad y los accesos externos solo funcionan a través del **VPC Gateway Endpoint** desde la subred privada.
+
+---
+
 ## Conceptos Clave
 
 ### Módulo local: encapsulación de controles de seguridad
@@ -170,12 +178,6 @@ lab-33/
 ---
 
 ## Despliegue en AWS Real
-
-### Arquitectura
-
-![Data Lake S3 con KMS CMK, SSE-KMS Bucket Key, versionado, lifecycle a Glacier y bucket policy que exige VPC Gateway Endpoint](arch/diagrama.svg)
-
-El módulo `secure-bucket` encapsula todas las capas de defensa: una **CMK** dedicada con rotación anual cifra los objetos vía **SSE-KMS con Bucket Key** (1 sola llamada a KMS por bucket en lugar de por objeto). El bloqueo público con los 4 controles, el **versionado** anti-ransomware y la **lifecycle rule** que transiciona a Glacier y luego expira completan la fortificación. La **bucket policy** deniega `s3:*` cuando `aws:sourceVpce ≠ endpoint` **Y** `aws:PrincipalAccount ≠ cuenta` (AND lógico): así los principales de la propia cuenta acceden con normalidad y los accesos externos solo funcionan a través del **VPC Gateway Endpoint** desde la subred privada.
 
 ### Módulo secure-bucket
 

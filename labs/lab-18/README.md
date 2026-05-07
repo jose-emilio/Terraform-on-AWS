@@ -10,19 +10,7 @@
 
 Implementar un modelo de **seguridad por capas** (Capa 7 y Capa 4) utilizando Security Groups y NACLs, aplicando el patrón de diseño ALB -> EC2 con referencia por Security Group, bloques dinámicos, NACLs defensivas y VPC Flow Logs para diagnóstico.
 
-## Conceptos clave
-
-| Concepto | Descripción |
-|---|---|
-| **Security Group (SG)** | Firewall stateful a nivel de instancia (Capa 4/7). Evalúa solo reglas de permitir; el tráfico de retorno se permite automáticamente. Se pueden encadenar referenciando el ID de otro SG como origen |
-| **`source_security_group_id`** | Permite que un SG acepte tráfico solo desde instancias asociadas a otro SG, sin acoplar CIDRs. Patrón clave para ALB -> EC2 |
-| **Bloque `dynamic`** | Meta-argumento de Terraform que genera múltiples bloques anidados (como `ingress`) a partir de una lista o mapa, eliminando repetición |
-| **Network ACL (NACL)** | Firewall stateless a nivel de subred (Capa 4). Evalúa reglas de permitir y denegar con prioridad numérica. Requiere reglas explícitas para tráfico de retorno (puertos efímeros) |
-| **Puertos efímeros** | Rango 1024-65535 usado por clientes para recibir respuestas. Las NACLs, al ser stateless, necesitan permitir estos puertos explícitamente para que el tráfico de retorno funcione |
-| **VPC Flow Logs** | Registro del tráfico IP que entra y sale de las interfaces de red de la VPC. Puede capturar todo, solo ACCEPT, o solo REJECT. Se almacena en CloudWatch Logs o S3 |
-| **ALB (Application Load Balancer)** | Balanceador de carga en Capa 7 (HTTP/HTTPS) que distribuye tráfico entre instancias en múltiples AZs |
-
-## Arquitectura — Modelo de seguridad por capas
+## Arquitectura
 
 ![Defensa en profundidad: NACL pública → SG ALB → NACL privada → SG EC2 + Flow Logs](arch/diagrama.svg)
 
@@ -36,6 +24,18 @@ El tráfico atraviesa **cuatro capas independientes** antes de llegar a la aplic
 **VPC Flow Logs** en modo `REJECT` graba en CloudWatch todo el tráfico denegado, lo que permite diagnosticar bloqueos sin SSH a las instancias.
 
 > **Defensa en profundidad:** Las NACLs actúan como primera línea (bloqueo de IPs conocidas, rango de puertos). Los Security Groups actúan como segunda línea (referencia por identidad, no por IP). Ambas capas se complementan.
+
+## Conceptos clave
+
+| Concepto | Descripción |
+|---|---|
+| **Security Group (SG)** | Firewall stateful a nivel de instancia (Capa 4/7). Evalúa solo reglas de permitir; el tráfico de retorno se permite automáticamente. Se pueden encadenar referenciando el ID de otro SG como origen |
+| **`source_security_group_id`** | Permite que un SG acepte tráfico solo desde instancias asociadas a otro SG, sin acoplar CIDRs. Patrón clave para ALB -> EC2 |
+| **Bloque `dynamic`** | Meta-argumento de Terraform que genera múltiples bloques anidados (como `ingress`) a partir de una lista o mapa, eliminando repetición |
+| **Network ACL (NACL)** | Firewall stateless a nivel de subred (Capa 4). Evalúa reglas de permitir y denegar con prioridad numérica. Requiere reglas explícitas para tráfico de retorno (puertos efímeros) |
+| **Puertos efímeros** | Rango 1024-65535 usado por clientes para recibir respuestas. Las NACLs, al ser stateless, necesitan permitir estos puertos explícitamente para que el tráfico de retorno funcione |
+| **VPC Flow Logs** | Registro del tráfico IP que entra y sale de las interfaces de red de la VPC. Puede capturar todo, solo ACCEPT, o solo REJECT. Se almacena en CloudWatch Logs o S3 |
+| **ALB (Application Load Balancer)** | Balanceador de carga en Capa 7 (HTTP/HTTPS) que distribuye tráfico entre instancias en múltiples AZs |
 
 ## Requisitos previos
 
