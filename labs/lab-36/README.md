@@ -36,60 +36,13 @@ Al finalizar este laboratorio serás capaz de:
 
 ## Arquitectura
 
-```
-                         Internet
-                             │ HTTP :8080
-                             ▼
-┌─── VPC 10.32.0.0/16 ──────────────────────────────────────────────────────┐
-│                                                                           │
-│  ┌─ Subnet pública (us-east-1a) ────────────────────────────────────────┐ │
-│  │                                                                      │ │
-│  │  ┌─────────────────────────────────────────────────────────────────┐ │ │
-│  │  │  EC2 t4g.small  ·  Flask Product Catalog                        │ │ │
-│  │  │  Patrón Cache-Aside: HIT → Redis  /  MISS → DynamoDB + cache    │ │ │
-│  │  └──────────────────────┬──────────────────────────┬───────────────┘ │ │
-│  │                         │                          │                 │ │
-│  └─────────────────────────┼──────────────────────────┼─────────────────┘ │
-│        MISS (escribe cache)│                          │HIT (lectura local)│
-│                            │                          │                   │
-│  ┌─ Subnets privadas ──────┼──────────────────────────┼──────────────────┐│
-│  │  (us-east-1a / 1b)      │                          ▼                  ││
-│  │                         │          ┌───────────────────────────────┐  ││
-│  │                         │          │  ElastiCache Redis 7.1        │  ││
-│  │                         │          │  Primary  ·  us-east-1a       │  ││
-│  │                         │          │  Replica  ·  us-east-1b       │  ││
-│  │                         │          │  TLS enforced  ·  AUTH token  │  ││
-│  │                         │          └───────────────────────────────┘  ││
-│  └─────────────────────────┼─────────────────────────────────────────────┘│
-└───────────────────────────┬┼──────────────────────────────────────────────┘
-                            ││ API calls vía endpoint público
-          ┌─────────────────┘│
-          │                  │
-          ▼                  ▼
-┌──────────────────────────────────────┐   ┌──────────────────────────────┐
-│  DynamoDB · lab36-products           │   │  DynamoDB · lab36-events     │
-│  Billing: PAY_PER_REQUEST (On-Demand)│   │  Billing: PAY_PER_REQUEST    │
-│  PK: category (S)                    │   │  PK: event_date (S)          │
-│  SK: product_id (S)                  │   │  SK: event_id (S)            │
-│  ──────────────────────────────────  │   │  TTL: expires_at (7 días)    │
-│  GSI: by-status-index                │   └──────────────▲───────────────┘
-│    PK: status (S)                    │                  │ PutItem
-│    SK: price_cents (N)               │   ┌──────────────┴───────────────┐
-│    Projection: ALL                   │   │  Lambda · lab36-cdc-processor│
-│  ──────────────────────────────────  │   │  Runtime: python3.12         │
-│  Streams: NEW_AND_OLD_IMAGES ────────┼──►│  Trigger: DynamoDB Streams   │
-└──────────────────────────────────────┘   └──────────────────────────────┘
+![DynamoDB On-Demand con GSI + Streams → Lambda CDC → events table con TTL · Redis Multi-AZ con TLS+AUTH · EC2 Flask + Secrets + S3](arch/diagrama.svg)
 
-┌──────────────────────┐   ┌──────────────────────────────────────────────┐
-│  S3 · app-artifacts  │   │  CloudWatch Alarms                           │
-│  └─ app/app.py       │   │  ├─ EngineCPUUtilization > 65 % (10 min)     │
-└──────────────────────┘   │  └─ Evictions > 100 (1 min)                  │
-                           └──────────────────────┬───────────────────────┘
-┌──────────────────────┐                          │
-│  Secrets Manager     │              ┌───────────▼────────────┐
-│  redis/auth-token    │              │  SNS · lab36-alerts    │
-└──────────────────────┘              └────────────────────────┘
-```
+Tres componentes integrados sobre la misma cuenta:
+
+- **Catálogo en DynamoDB** (`products`, billing On-Demand) con un **GSI** `by-status-index` (`status` + `price_cents`) para consultas alternativas sin escaneo. **DynamoDB Streams** (`NEW_AND_OLD_IMAGES`) emite cada cambio.
+- **Lambda CDC processor** consume el stream (`event_source_mapping LATEST`, batch 10) y escribe cada cambio en una segunda tabla `events` cuyo **TTL** elimina los registros tras 7 días sin consumir WCU — auditoría barata y desacoplada del path crítico.
+- **Caché Redis** Multi-AZ con `automatic_failover`, **TLS** en tránsito, cifrado en reposo y **AUTH token** (`random_password` 32 chars en Secrets Manager). La EC2 lo recupera con `GetSecretValue` y aplica patrón cache-aside contra DynamoDB. Alarmas de `EngineCPUUtilization` y `Evictions` notifican a SNS.
 
 ---
 
@@ -208,6 +161,9 @@ resource "aws_cloudwatch_metric_alarm" "redis_cpu" {
 ```
 labs/lab-36/
 ├── README.md
+├── diagrama.drawio               # Fuente editable del diagrama de arquitectura
+├── arch/
+│   └── diagrama.svg              # Diagrama de arquitectura (referenciado en este README)
 └── aws/
     ├── app/
     │   └── app.py                 # Flask Product Catalog: CRUD DynamoDB + caché Redis

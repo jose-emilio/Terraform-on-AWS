@@ -71,7 +71,22 @@ export REGION="us-east-1"
 
 ## Arquitectura
 
+![Gobernanza CodeCommit en 3 capas: IAM preventiva + Approval Rule de proceso + notificaciones reactivas (CodeStar + EventBridge → SNS → Slack/email + alarma override)](arch/diagrama.svg)
+
+Tres capas complementarias sobre la rama `main` protegida:
+
+- **Capa 1 — IAM (preventiva):** el grupo `platform-developers` tiene `Allow` para clonar/push en `feature/*`, `develop`, etc., pero un `Deny` explícito sobre `GitPush`/`Merge*`/`Delete` cuando el target es `main`. Bloquea la API antes de que llegue a CodeCommit.
+- **Capa 2 — Approval Rule Template:** `DestinationReferences = ["refs/heads/main"]` y `ApprovalPoolMembers` con un ARN STS `assumed-role/.../*` (no se acepta role ARN directo). El botón Merge queda deshabilitado hasta N aprobaciones del pool.
+- **Capa 3 — Notificaciones (auditoría reactiva):** **CodeStar Notifications** captura el ciclo de vida de PRs y **EventBridge** detecta cualquier push directo a `main`; ambos publican en un **SNS Topic** cifrado con CMK y se reenvía a Slack/Teams (HTTPS) o email. Una **alarma CloudWatch** sobre `OverridePullRequestApprovalRules` (metric filter contra CloudTrail) avisa si alguien intenta saltar la regla de aprobación.
+
+### Estructura del proyecto
+
 ```
+labs/lab-41/
+├── diagrama.drawio     ── Fuente editable del diagrama de arquitectura
+└── arch/
+    └── diagrama.svg    ── Diagrama de arquitectura (referenciado en este README)
+
 labs/lab-41/aws/
 ├── providers.tf        ── Backend S3, proveedor AWS
 ├── variables.tf        ── Parámetros: repo, usuarios, ramas protegidas, webhooks

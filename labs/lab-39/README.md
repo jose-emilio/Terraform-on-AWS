@@ -58,52 +58,9 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 
 ## Arquitectura
 
-```
-Terraform CLI (maquina local)
-│
-├─► provider "aws" alias = "primary"  [us-east-1]
-│   │
-│   ├─► aws_s3_bucket.artifacts_primary
-│   │     lab39-artifacts-<ACCOUNT_ID>-use1
-│   │     Versionado habilitado · Acceso publico bloqueado
-│   │     Tags: Name, Project, Environment, Region, Owner  ◄── TARGET DEL DRIFT
-│   │
-│   ├─► aws_s3_bucket_versioning.artifacts_primary
-│   ├─► aws_s3_bucket_public_access_block.artifacts_primary
-│   │
-│   └─► aws_ssm_parameter.config_primary
-│         /${project}/config/primary-region = "us-east-1"
-│
-└─► provider "aws" alias = "secondary" [eu-west-3]
-    │
-    ├─► aws_s3_bucket.artifacts_secondary
-    │     lab39-artifacts-<ACCOUNT_ID>-euw3
-    │     Versionado habilitado · Acceso publico bloqueado
-    │
-    ├─► aws_s3_bucket_versioning.artifacts_secondary
-    ├─► aws_s3_bucket_public_access_block.artifacts_secondary
-    │
-    └─► aws_ssm_parameter.config_secondary
-          /${project}/config/secondary-region = "eu-west-3"
+![Multi-región con dos provider aliases (primary us-east-1 + secondary eu-west-3) + adopción de bucket legacy con bloque import {}](arch/diagrama.svg)
 
-── Flujo de adopción de infraestructura existente ────────────────────────────
-
-AWS CLI (fuera de Terraform)        Terraform state
-┌───────────────────────────────┐   ┌────────────────────────────────────────┐
-│  s3api create-bucket          │   │                                        │
-│  lab39-legacy-logs-<ACCOUNT>  │   │  aws_s3_bucket.legacy_logs             │
-│  (bucket sin gestion IaC)     │──►│  adoptado via bloque import {}         │
-│                               │   │  HCL generado con -generate-config-out │
-└───────────────────────────────┘   └────────────────────────────────────────┘
-
-Pasos del flujo de importacion:
-  1. Crear bucket con AWS CLI
-  2. Escribir bloque import {} en main.tf
-  3. terraform plan -generate-config-out=generated.tf
-  4. Revisar y mover generated.tf → main.tf
-  5. Eliminar bloque import {}
-  6. terraform apply  →  recurso adoptado (sin recreacion)
-```
+Un solo proyecto Terraform gestiona dos regiones simultáneamente con `provider "aws"` declarado dos veces con `alias = "primary"` y `alias = "secondary"`. Cada recurso de `main.tf` declara explícitamente `provider = aws.primary | aws.secondary` (no hay default — sin ambigüedad). En cada región se replica el mismo patrón: bucket S3 (sufijo `-use1` / `-euw3`) con versionado y `public_access_block` + un parámetro SSM con la región activa para descubrirse en runtime. Por separado, un **bucket legacy** creado fuera de Terraform con AWS CLI se adopta al state mediante `import { provider = aws.primary, to = ..., id = ... }` + `terraform plan -generate-config-out=generated.tf`, que escribe el bloque `resource` derivado para revisar y mover a `main.tf`. El recurso queda gestionado sin destruirse ni recrearse.
 
 ## Conceptos clave
 
@@ -278,6 +235,9 @@ un bloque `resource` completo en `generated.tf`. El fichero generado:
 
 ```
 lab-39/
+├── diagrama.drawio          # Fuente editable del diagrama de arquitectura
+├── arch/
+│   └── diagrama.svg         # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf        # Terraform >= 1.10 + dos alias de proveedor AWS ~> 6.0
 │   ├── variables.tf        # primary_region, secondary_region, project, environment, legacy_bucket_name

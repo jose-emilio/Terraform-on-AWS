@@ -77,62 +77,9 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 
 ## Arquitectura
 
-```
-var.vpc_config (mapa anidado)
-┌─────────────────────────────────────────────────────┐
-│  "networking"                                       │
-│    cidr: 10.39.0.0/16                               │
-│    subnets:                                         │
-│      "public-a"   10.39.1.0/24  us-east-1a  public  │
-│      "public-b"   10.39.2.0/24  us-east-1b  public  │
-│      "private-a"  10.39.10.0/24 us-east-1a  private │
-│  "data"                                             │
-│    cidr: 10.40.0.0/16                               │
-│    subnets:                                         │
-│      "db-a"       10.40.1.0/24  us-east-1a  private │
-│      "db-b"       10.40.2.0/24  us-east-1b  private │
-└─────────────────────────────────────────────────────┘
-          │
-          │  Flatten Pattern (locals.tf)
-          ▼
-local.subnets_map (mapa plano — 5 entradas)
-┌─────────────────────────────────────────────────────┐
-│  "networking/public-a"  → { cidr, az, public, ... } │
-│  "networking/public-b"  → { cidr, az, public, ... } │
-│  "networking/private-a" → { cidr, az, public, ... } │
-│  "data/db-a"            → { cidr, az, public, ... } │
-│  "data/db-b"            → { cidr, az, public, ... } │
-└─────────────────────────────────────────────────────┘
-          │
-          │  for_each + merge() de etiquetas
-          ▼
-┌─────────────────────────────────────────────────────┐
-│  aws_vpc.this["networking"]                         │
-│  aws_vpc.this["data"]                               │
-│                                                     │
-│  aws_subnet.this["networking/public-a"]  ───────────┤
-│  aws_subnet.this["networking/public-b"]             │◄── merge():
-│  aws_subnet.this["networking/private-a"]            │    tags corporativas
-│  aws_subnet.this["data/db-a"]                       │    + tags departamento
-│  aws_subnet.this["data/db-b"]            ───────────┤
-│                                                     │
-│  aws_internet_gateway.this["networking"]            │
-└─────────────────────────────────────────────────────┘
+![Flatten pattern (var.vpc_config jerárquico → maps planos) + ignore_changes en tags + EC2 monitoring con precondition/postcondition + check block final](arch/diagrama.svg)
 
-Instancia de monitoreo (cuando monitoring_config.enabled = true):
-┌────────────────────────────────────────────────────────────────┐
-│  aws_instance.monitoring[0]                                    │
-│    subnet: networking/public-a                                 │
-│                                                                │
-│  lifecycle {                                                   │
-│    precondition  → AZ en allowed_azs?  (falla en PLAN)         │
-│    postcondition → public_ip asignada? (falla en APPLY)        │
-│  }                                                             │
-│                                                                │
-│  opcional (si alarm_email != null):                            │
-│    aws_sns_topic + aws_sns_topic_subscription + cw_alarm       │
-└────────────────────────────────────────────────────────────────┘
-```
+`var.vpc_config` es una estructura jerárquica (entornos → VPCs → subredes); `locals.tf` la transforma con un **flatten pattern** en mapas planos (`vpcs_map` y `subnets_map` con clave compuesta `vpc_key/subnet_key`) para que un único bloque `aws_vpc.this` y un único `aws_subnet.this` con `for_each` generen todos los recursos. Cada VPC y subred lleva `lifecycle.ignore_changes` sobre tags concretas (`CreatedBy`, `aws:cloudformation:*`, `kubernetes.io/role/elb` …) — sin eso, el siguiente apply borraría tags añadidas por AWS Organizations / EKS. Una EC2 de monitoreo opcional combina **precondition** (AZ en lista autorizada, antes del plan), **postcondition** (`public_ip` no nula, tras crear) y un bloque **check** al final del apply que valida la ruta a Internet de la subred pública sin bloquear si falla — solo emite warning.
 
 ## Conceptos clave
 
@@ -390,6 +337,9 @@ completo) porque ocultaria cualquier cambio en las tags que si gestionas.
 
 ```
 lab-38/
+├── diagrama.drawio          # Fuente editable del diagrama de arquitectura
+├── arch/
+│   └── diagrama.svg         # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf        # Terraform >= 1.10 + default_tags corporativas
 │   ├── variables.tf        # vpc_config (mapa anidado), monitoring_config (optional)

@@ -7,13 +7,13 @@
 #  ┌─────────────────────────────────────────────────────────────────────────┐
 #  │                          CodeCommit                                     │
 #  │                                                                         │
-#  │  PR creado ──────────────────────────────────┐                         │
-#  │  PR actualizado ─── CodeStar Notifications ──┼──► SNS Topic            │
+#  │  PR creado ──────────────────────────────────┐                          │
+#  │  PR actualizado ─── CodeStar Notifications ──┼──► SNS Topic             │
 #  │  PR merged / cerrado ────────────────────────┘    pr-notifications      │
 #  │  Comentario en PR                                       │               │
 #  │  Aprobacion cambiada                                    │               │
 #  │                                                         ▼               │
-#  │  Push / merge a main ──── EventBridge ──────────────── SNS Topic       │
+#  │  Push / merge a main ──── EventBridge ──────────────── SNS Topic        │
 #  │  (auditoria de seguridad)                               │               │
 #  └─────────────────────────────────────────────────────────│───────────────┘
 #                                                            │
@@ -226,7 +226,7 @@ resource "aws_cloudwatch_log_group" "cloudtrail" {
 #
 # NOTA: Esta alarma solo funciona si CloudTrail esta activo y envia logs al
 # grupo /aws/cloudtrail/${var.project}. El grupo se crea arriba; los eventos
-# llegaran cuando configures CloudTrail para usar ese destino.
+# llegarán cuando configures CloudTrail para usar ese destino.
 resource "aws_cloudwatch_log_metric_filter" "approval_override_attempts" {
   name           = "${var.project}-approval-rule-override-attempts"
   log_group_name = aws_cloudwatch_log_group.cloudtrail.name
