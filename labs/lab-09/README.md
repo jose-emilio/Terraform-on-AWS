@@ -10,7 +10,7 @@
 
 En este laboratorio gestionarás entornos Dev y Prod desde una sola base de código usando workspaces de Terraform. Aprenderás a derivar configuración dinámica con `terraform.workspace`, a validar inconsistencias de forma declarativa con el bloque `check {}` y a proteger el plan con `lifecycle { precondition }`.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -29,7 +29,7 @@ Al finalizar este laboratorio serás capaz de:
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### `terraform.workspace`
 
@@ -153,11 +153,11 @@ lab-09/
 
 Una sola base de código que cambia su comportamiento según `terraform.workspace`: un `lookup()` selecciona el bloque de configuración (instance_type, CIDR) aplicable al entorno actual. El backend S3 separa los states automáticamente bajo `env:/<workspace>/`. El bloque `check {}` añade validaciones no bloqueantes (warnings) y `lifecycle.precondition` aborta el plan si el workspace activo no está mapeado (evita usar el `default` por accidente).
 
-> **Cuándo NO usar workspaces:** si los entornos divergen mucho (Dev tiene Aurora pero Prod tiene RDS), mejor usar **state splitting** ([lab-10](../lab-10/README.md)) o directorios separados con módulos compartidos.
+> **Cuándo NO usar workspaces:** si los entornos divergen mucho (Dev tiene Aurora pero Prod tiene RDS), mejor usar **state splitting** ([lab-11](../lab-11/README.md)) o directorios separados con módulos compartidos.
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Código Terraform
 

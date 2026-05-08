@@ -12,7 +12,7 @@ En este laboratorio crearás tu primer recurso de infraestructura en AWS usando 
 
 > ⚠️ **Este bucket NO se destruye al finalizar el laboratorio.** Se reutilizará como backend remoto en el lab07 (state locking con DynamoDB) y en el lab10 (state splitting). Guarda el nombre que elijas: lo necesitarás en ambos laboratorios.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -27,7 +27,7 @@ Al finalizar este laboratorio serás capaz de:
 - Laboratorio 01 completado (entorno configurado)
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### Bloque `terraform`
 
@@ -112,7 +112,7 @@ Cada subdirectorio es un proyecto Terraform independiente con su propio estado. 
 ![Bucket S3 fundacional con versionado, cifrado AES-256 y bloqueo de acceso público — backend de tfstate compartido](arch/diagrama.svg)
 
 Un único bucket `terraform-state-labs-<ACCOUNT_ID>` con tres recursos de configuración:
-- `aws_s3_bucket_versioning` (Enabled) — base para la recuperación de estado del lab-11.
+- `aws_s3_bucket_versioning` (Enabled) — base para la recuperación de estado del lab-12.
 - `aws_s3_bucket_server_side_encryption_configuration` (AES256) — cifrado at-rest.
 - `aws_s3_bucket_public_access_block` (4 flags `true`) — defensa contra exposición accidental.
 

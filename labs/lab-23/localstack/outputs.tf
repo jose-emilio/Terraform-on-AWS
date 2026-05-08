@@ -1,24 +1,29 @@
-output "vpc_id" {
-  description = "ID de la VPC"
-  value       = module.network.vpc_id
+output "logs_bucket_id" {
+  description = "Nombre del bucket de logs"
+  value       = module.logs_bucket.bucket_id
 }
 
-output "vpc_cidr" {
-  description = "CIDR de la VPC (validado como RFC 1918)"
-  value       = module.network.vpc_cidr
+output "logs_bucket_arn" {
+  description = "ARN del bucket de logs"
+  value       = module.logs_bucket.bucket_arn
 }
 
-output "bucket_id" {
-  description = "Nombre del bucket S3 (validado con prefijo corporativo)"
-  value       = module.corporate_bucket.bucket_id
+output "logs_bucket_domain_name" {
+  description = "Nombre de dominio del bucket de logs"
+  value       = module.logs_bucket.bucket_domain_name
 }
 
-output "db_config_summary" {
-  description = "Resumen de la configuración de la base de datos (sin contraseña)"
-  value       = module.database.config_summary
+output "data_bucket_id" {
+  description = "Nombre del bucket de datos"
+  value       = module.data_bucket.bucket_id
 }
 
-output "ssm_prefix" {
-  description = "Prefijo de los parámetros SSM de configuración de DB"
-  value       = module.database.ssm_prefix
+output "data_bucket_arn" {
+  description = "ARN del bucket de datos"
+  value       = module.data_bucket.bucket_arn
+}
+
+output "data_bucket_domain_name" {
+  description = "Nombre de dominio del bucket de datos"
+  value       = module.data_bucket.bucket_domain_name
 }

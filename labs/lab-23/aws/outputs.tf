@@ -1,39 +1,29 @@
-output "vpc_id" {
-  description = "ID de la VPC"
-  value       = module.network.vpc_id
+output "logs_bucket_id" {
+  description = "Nombre del bucket de logs"
+  value       = module.logs_bucket.bucket_id
 }
 
-output "vpc_cidr" {
-  description = "CIDR de la VPC (validado como RFC 1918)"
-  value       = module.network.vpc_cidr
+output "logs_bucket_arn" {
+  description = "ARN del bucket de logs"
+  value       = module.logs_bucket.bucket_arn
 }
 
-output "private_subnet_ids" {
-  description = "IDs de las subredes privadas"
-  value       = module.network.private_subnet_ids
+output "logs_bucket_domain_name" {
+  description = "Nombre de dominio del bucket de logs (formato <bucket>.s3.amazonaws.com)"
+  value       = module.logs_bucket.bucket_domain_name
 }
 
-output "bucket_id" {
-  description = "Nombre del bucket S3 (validado con prefijo corporativo)"
-  value       = module.corporate_bucket.bucket_id
+output "data_bucket_id" {
+  description = "Nombre del bucket de datos"
+  value       = module.data_bucket.bucket_id
 }
 
-output "bucket_arn" {
-  description = "ARN del bucket S3"
-  value       = module.corporate_bucket.bucket_arn
+output "data_bucket_arn" {
+  description = "ARN del bucket de datos"
+  value       = module.data_bucket.bucket_arn
 }
 
-output "db_config_summary" {
-  description = "Resumen de la configuración de la base de datos (sin contraseña)"
-  value       = module.database.config_summary
-}
-
-output "secret_arn" {
-  description = "ARN del secreto en Secrets Manager (la contraseña NO se expone en outputs)"
-  value       = module.database.secret_arn
-}
-
-output "ssm_prefix" {
-  description = "Prefijo de los parámetros SSM de configuración de DB"
-  value       = module.database.ssm_prefix
+output "data_bucket_domain_name" {
+  description = "Nombre de dominio del bucket de datos (formato <bucket>.s3.amazonaws.com)"
+  value       = module.data_bucket.bucket_domain_name
 }

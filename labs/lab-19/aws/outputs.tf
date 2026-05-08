@@ -1,64 +1,62 @@
-output "app_vpc_id" {
-  description = "ID de la VPC app"
-  value       = aws_vpc.app.id
+output "vpc_id" {
+  description = "ID de la VPC desplegada"
+  value       = aws_vpc.main.id
 }
 
-output "db_vpc_id" {
-  description = "ID de la VPC db"
-  value       = aws_vpc.db.id
+output "vpc_cidr" {
+  description = "CIDR block de la VPC"
+  value       = aws_vpc.main.cidr_block
 }
 
-output "c_vpc_id" {
-  description = "ID de la VPC C"
-  value       = aws_vpc.c.id
+output "alb_dns_name" {
+  description = "DNS publico del Application Load Balancer"
+  value       = aws_lb.main.dns_name
 }
 
-output "peering_app_db_id" {
-  description = "ID del VPC Peering app ↔ db"
-  value       = aws_vpc_peering_connection.app_to_db.id
+output "alb_sg_id" {
+  description = "ID del Security Group del ALB"
+  value       = aws_security_group.alb.id
 }
 
-output "peering_app_c_id" {
-  description = "ID del VPC Peering app ↔ vpc-c"
-  value       = aws_vpc_peering_connection.app_to_c.id
+output "app_sg_id" {
+  description = "ID del Security Group de las instancias de aplicacion"
+  value       = aws_security_group.app.id
 }
 
-output "db_sg_id" {
-  description = "ID del Security Group de db"
-  value       = aws_security_group.db.id
+output "public_nacl_id" {
+  description = "ID de la NACL de las subredes publicas"
+  value       = aws_network_acl.public.id
 }
 
-output "nat_public_ip" {
-  description = "IP pública del NAT Gateway de app"
-  value       = aws_eip.nat_app.public_ip
+output "private_nacl_id" {
+  description = "ID de la NACL de las subredes privadas"
+  value       = aws_network_acl.private.id
 }
 
-output "test_instance_app_id" {
-  description = "ID de la instancia de test en app"
-  value       = aws_instance.test_app.id
+output "flow_log_group" {
+  description = "Nombre del CloudWatch Log Group de VPC Flow Logs"
+  value       = aws_cloudwatch_log_group.flow_logs.name
 }
 
-output "test_instance_db_id" {
-  description = "ID de la instancia de test en db"
-  value       = aws_instance.test_db.id
+output "app_instance_ids" {
+  description = "IDs de las instancias de aplicacion"
+  value = {
+    for key, inst in aws_instance.app : key => inst.id
+  }
 }
 
-output "test_instance_c_id" {
-  description = "ID de la instancia de test en vpc-c"
-  value       = aws_instance.test_c.id
+output "public_subnet_ids" {
+  description = "IDs de las subredes publicas"
+  value = {
+    for key, subnet in aws_subnet.this :
+    key => subnet.id if local.subnets[key].public
+  }
 }
 
-output "test_instance_app_private_ip" {
-  description = "IP privada de la instancia de test en app"
-  value       = aws_instance.test_app.private_ip
-}
-
-output "test_instance_db_private_ip" {
-  description = "IP privada de la instancia de test en db"
-  value       = aws_instance.test_db.private_ip
-}
-
-output "test_instance_c_private_ip" {
-  description = "IP privada de la instancia de test en vpc-c"
-  value       = aws_instance.test_c.private_ip
+output "private_subnet_ids" {
+  description = "IDs de las subredes privadas"
+  value = {
+    for key, subnet in aws_subnet.this :
+    key => subnet.id if !local.subnets[key].public
+  }
 }

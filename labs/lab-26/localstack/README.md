@@ -1,46 +1,40 @@
-# Laboratorio 26 — LocalStack: Gobernanza, Documentación y Publicación
+# Laboratorio 26 — LocalStack: Framework de Pruebas
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-## Qué funciona sin AWS
+## Tests unitarios (sin AWS ni LocalStack)
 
-La mayor parte de este laboratorio **no requiere AWS**:
+Los tests unitarios con `mock_provider` **no necesitan ningún proveedor real**. Funcionan en cualquier máquina con Terraform >= 1.7:
 
-| Componente | ¿Necesita AWS? | Notas |
+```bash
+cd labs/lab-26/aws
+
+terraform init -backend=false
+terraform test -filter=tests/unit_naming.tftest.hcl
+```
+
+Esto ejecuta los tests de nombrado y etiquetado sin conectarse a AWS ni a LocalStack.
+
+## Tests de integración en LocalStack
+
+Los tests de integración (`integration.tftest.hcl`, `idempotency.tftest.hcl`) crean recursos reales. Para ejecutarlos contra LocalStack en lugar de AWS, necesitarías sobreescribir la configuración del proveedor en los archivos de test. Esto **no es posible directamente** porque:
+
+1. `terraform test` usa la configuración del proveedor de `providers.tf`
+2. Los archivos `.tftest.hcl` pueden definir un `provider`, pero no pueden configurar endpoints custom de forma práctica para LocalStack
+
+## Alternativas
+
+| Tipo de test | ¿Funciona sin AWS? | Cómo |
 |---|---|---|
-| terraform-docs | No | Genera docs del código HCL |
-| .terraform-docs.yml | No | Configuración local |
-| pre-commit hooks | No | terraform_fmt, terraform_validate, terraform_docs |
-| Git tags (versionado) | No | Operación local de Git |
-| CHANGELOG.md | No | Archivo de texto |
+| Análisis estático (checkov/trivy) | Sí | No necesita proveedor |
+| Unit test (mock_provider) | Sí | No necesita proveedor |
+| Integration test | No directamente | Requiere AWS o provider override |
+| Idempotencia | No directamente | Requiere AWS o provider override |
 
-## Qué funciona con LocalStack
+## Recomendación
 
-Los ejemplos `basic/` y `advanced/` funcionan con LocalStack ya que solo usan S3 (completamente soportado en Community):
-
-```bash
-cd labs/lab-26/aws/modules/secure-bucket/examples/basic
-
-# Adaptar el provider para LocalStack antes de ejecutar
-terraform init
-terraform apply
-terraform destroy
-```
-
-> **Nota:** Para usar LocalStack, necesitas adaptar el bloque `provider "aws"` de cada ejemplo con los endpoints de LocalStack. Consulta los labs anteriores (ej: [lab-22/localstack](../../lab-22/localstack/README.md) o [lab-25/localstack](../../lab-25/localstack/README.md)) para ver la configuración del proveedor.
-
-## Pipeline local recomendado
-
-Sin ningún proveedor:
-
-```bash
-# 1. Formatear
-terraform fmt -recursive modules/
-
-# 2. Generar docs
-terraform-docs markdown table --output-file README.md --output-mode inject modules/secure-bucket/
-
-# 3. Crear tag
-git tag -a v1.0.0 -m "Release v1.0.0"
-```
+Para un pipeline sin coste:
+1. `checkov -d modules/` — análisis estático
+2. `terraform test -filter=tests/unit_*` — tests unitarios con mock
+3. Los tests de integración e idempotencia se ejecutan solo en la cuenta de AWS de sandbox

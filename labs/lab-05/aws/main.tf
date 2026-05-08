@@ -53,19 +53,19 @@ resource "local_file" "app_config" {
     env      = ${var.env}
     db       = ${var.db_endpoint}
 
-    %{ if var.env == "prod" ~}
+    %{if var.env == "prod"~}
     [security]
     tls          = true
     min_tls      = TLSv1.2
     hsts         = true
-    %{ else ~}
+    %{else~}
     [security]
     tls          = false
-    %{ endif ~}
+    %{endif~}
 
     [services]
-    %{ for svc in var.services ~}
+    %{for svc in var.services~}
     ${svc} = enabled
-    %{ endfor ~}
+    %{endfor~}
   EOT
 }

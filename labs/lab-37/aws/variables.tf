@@ -1,6 +1,7 @@
 variable "region" {
-  type    = string
-  default = "us-east-1"
+  type        = string
+  description = "Region AWS donde se despliegan los recursos"
+  default     = "us-east-1"
 }
 
 variable "project" {
@@ -9,25 +10,20 @@ variable "project" {
   default     = "lab37"
 }
 
-variable "app_version" {
+variable "app_instance_type" {
   type        = string
-  description = "Version de la aplicacion a desplegar. Cambiarla fuerza una nueva ejecucion de los provisioners."
-  default     = "1.0.0"
+  description = "Tipo de instancia EC2 para la aplicacion web (ARM64)"
+  default     = "t4g.small"
 }
 
-variable "ssh_private_key_path" {
+variable "redis_node_type" {
   type        = string
-  description = "Ruta al fichero de clave privada SSH (sin .pub). La clave publica se lee de <ruta>.pub"
-  default     = "~/.ssh/lab37_key"
+  description = "Tipo de nodo de ElastiCache Redis"
+  default     = "cache.t3.micro"
 }
 
-variable "ssh_allowed_cidr" {
-  type        = string
-  description = "CIDR desde el que se permite SSH al puerto 22. Restringe siempre a tu IP: $(curl -s https://checkip.amazonaws.com)/32"
-  default     = "0.0.0.0/0"
-}
-
-variable "instance_type" {
-  type    = string
-  default = "t4g.small"
+variable "cache_ttl" {
+  type        = number
+  description = "TTL en segundos para las entradas de Redis"
+  default     = 60
 }

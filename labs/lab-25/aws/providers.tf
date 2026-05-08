@@ -7,9 +7,8 @@ terraform {
     }
   }
 
-  # Configuración parcial del backend. Para tests, usa:
-  #   terraform init -backend=false
-  # Para despliegue normal:
+  # Configuración parcial del backend. Todos los parámetros están en
+  # aws.s3.tfbackend. Úsalo así:
   #   terraform init -backend-config=aws.s3.tfbackend -backend-config="bucket=terraform-state-labs-<ACCOUNT_ID>"
   backend "s3" {}
 }

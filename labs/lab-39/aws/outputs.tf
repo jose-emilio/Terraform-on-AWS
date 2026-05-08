@@ -1,55 +1,92 @@
-# ── Region primaria ───────────────────────────────────────────────────────────
-output "primary_bucket_name" {
-  description = "Nombre del bucket S3 desplegado en la region primaria (us-east-1)"
-  value       = aws_s3_bucket.artifacts_primary.bucket
+# ── VPCs ──────────────────────────────────────────────────────────────────────
+output "vpc_ids" {
+  description = "IDs de los VPCs creados, indexados por nombre logico"
+  value       = { for k, v in aws_vpc.this : k => v.id }
 }
 
-output "primary_bucket_arn" {
-  description = "ARN del bucket S3 de la region primaria"
-  value       = aws_s3_bucket.artifacts_primary.arn
+# ── Subredes — resultado del Flatten Pattern ──────────────────────────────────
+# Este output demuestra que el for_each sobre local.subnets_map creo
+# correctamente una subred por cada entrada de la estructura anidada,
+# con claves compuestas "vpc/subred".
+output "subnet_ids" {
+  description = "IDs de todas las subredes, indexados por clave compuesta vpc/subred"
+  value       = { for k, v in aws_subnet.this : k => v.id }
 }
 
-output "primary_ssm_parameter_name" {
-  description = "Nombre del parametro SSM desplegado en us-east-1"
-  value       = aws_ssm_parameter.config_primary.name
+output "subnets_by_vpc" {
+  description = "IDs de subredes agrupados por VPC para facilitar la consulta"
+  value = {
+    for vpc_key in keys(local.vpcs_map) : vpc_key => {
+      for subnet_key, subnet in aws_subnet.this :
+      subnet_key => subnet.id
+      if startswith(subnet_key, "${vpc_key}/")
+    }
+  }
 }
 
-# ── Region secundaria ─────────────────────────────────────────────────────────
-output "secondary_bucket_name" {
-  description = "Nombre del bucket S3 desplegado en la region secundaria (eu-west-3)"
-  value       = aws_s3_bucket.artifacts_secondary.bucket
+# ── Flatten Pattern — estructura interna para inspeccion ──────────────────────
+output "flattened_subnets_count" {
+  description = "Numero total de subredes creadas a partir del mapa anidado"
+  value       = length(local.subnets_map)
 }
 
-output "secondary_bucket_arn" {
-  description = "ARN del bucket S3 de la region secundaria"
-  value       = aws_s3_bucket.artifacts_secondary.arn
+output "flattened_subnets_keys" {
+  description = "Claves compuestas generadas por el Flatten Pattern"
+  value       = keys(local.subnets_map)
 }
 
-output "secondary_ssm_parameter_name" {
-  description = "Nombre del parametro SSM desplegado en eu-west-3"
-  value       = aws_ssm_parameter.config_secondary.name
+# ── Instancia de monitoreo ─────────────────────────────────────────────────────
+output "monitoring_instance_id" {
+  description = "ID de la instancia de monitoreo (null si monitoring_config.enabled = false)"
+  value       = var.monitoring_config.enabled ? aws_instance.monitoring[0].id : null
 }
 
-# ── Informacion de cuenta ─────────────────────────────────────────────────────
+output "monitoring_public_ip" {
+  description = "IP publica de la instancia de monitoreo — verificada por postcondition"
+  value       = var.monitoring_config.enabled ? aws_instance.monitoring[0].public_ip : null
+}
+
+output "monitoring_instance_type" {
+  description = "Tipo de instancia usado — refleja el valor por defecto de optional() si no se especifico"
+  value       = var.monitoring_config.instance_type
+}
+
+# ── merge() — etiquetas resultantes para inspeccion ──────────────────────────
+output "sample_subnet_tags" {
+  description = "Etiquetas de una subred de muestra para verificar el resultado del merge()"
+  value       = local.subnet_tags["networking/public-a"]
+}
+
+# ── Route tables publicas ─────────────────────────────────────────────────────
+output "public_route_table_ids" {
+  description = "IDs de las route tables publicas, indexados por VPC"
+  value       = { for k, v in aws_route_table.public : k => v.id }
+}
+
+# ── try() / can() — valores calculados de forma segura ───────────────────────
+output "monitoring_alarm_enabled" {
+  description = "Indica si la alarma de monitoreo esta activa (calculado con can() en locals.tf)"
+  value       = local.monitoring_alarm_enabled
+}
+
+output "subnet_billing_codes" {
+  description = "Codigos de facturacion por subred — obtenidos con try() para mayor resiliencia"
+  value       = local.subnet_billing_codes
+}
+
+# ── ignore_changes — tags gestionadas externamente ───────────────────────────
+output "ignored_tag_keys" {
+  description = "Tags que Terraform ignora en VPCs y subredes para evitar conflictos con herramientas de gobernanza"
+  value = [
+    "CreatedBy",
+    "aws:cloudformation:stack-name",
+    "aws:organizations:delegated-administrator",
+    "kubernetes.io/role/elb",
+    "kubernetes.io/role/internal-elb",
+  ]
+}
+
 output "account_id" {
-  description = "ID de la cuenta AWS activa (usado como sufijo en los nombres de bucket)"
+  description = "ID de la cuenta AWS activa"
   value       = data.aws_caller_identity.current.account_id
-}
-
-# ── Comandos de verificacion rapida ───────────────────────────────────────────
-output "verify_commands" {
-  description = "Comandos AWS CLI para verificar los recursos desplegados en ambas regiones"
-  value       = <<-EOT
-    # Verificar bucket primario (us-east-1)
-    aws s3api get-bucket-location --bucket ${aws_s3_bucket.artifacts_primary.bucket}
-    aws s3api get-bucket-tagging  --bucket ${aws_s3_bucket.artifacts_primary.bucket}
-
-    # Verificar bucket secundario (eu-west-3)
-    aws s3api get-bucket-location --bucket ${aws_s3_bucket.artifacts_secondary.bucket} --region eu-west-3
-    aws s3api get-bucket-tagging  --bucket ${aws_s3_bucket.artifacts_secondary.bucket} --region eu-west-3
-
-    # Verificar parametros SSM
-    aws ssm get-parameter --name ${aws_ssm_parameter.config_primary.name} --region us-east-1
-    aws ssm get-parameter --name ${aws_ssm_parameter.config_secondary.name} --region eu-west-3
-  EOT
 }

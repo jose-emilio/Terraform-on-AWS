@@ -1,68 +1,46 @@
-# Laboratorio 27 — LocalStack: Cimientos de EC2: Despliegue Dinámico y Seguro
+# Laboratorio 27 — LocalStack: Gobernanza, Documentación y Publicación
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guía adapta el lab27 para ejecutarse íntegramente en LocalStack. La configuración es idéntica a la de AWS real: data source `aws_ami`, IAM Instance Profile, Security Group e instancia EC2 con IMDSv2. Sólo cambia el `providers.tf`.
+## Qué funciona sin AWS
 
-## Requisitos previos
+La mayor parte de este laboratorio **no requiere AWS**:
 
-- LocalStack corriendo: `localstack start -d`
-- AWS CLI configurado para LocalStack:
+| Componente | ¿Necesita AWS? | Notas |
+|---|---|---|
+| terraform-docs | No | Genera docs del código HCL |
+| .terraform-docs.yml | No | Configuración local |
+| pre-commit hooks | No | terraform_fmt, terraform_validate, terraform_docs |
+| Git tags (versionado) | No | Operación local de Git |
+| CHANGELOG.md | No | Archivo de texto |
 
-```bash
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_DEFAULT_REGION=us-east-1
-alias awslocal='aws --endpoint-url=http://localhost.localstack.cloud:4566'
-```
+## Qué funciona con LocalStack
 
-## Diferencias con AWS
-
-### `localstack/providers.tf`
-
-```hcl
-provider "aws" {
-  region                      = "us-east-1"
-  access_key                  = "test"
-  secret_key                  = "test"
-  skip_credentials_validation = true
-  skip_metadata_api_check     = true
-  skip_requesting_account_id  = true
-
-  endpoints {
-    ec2 = "http://localhost.localstack.cloud:4566"
-    iam = "http://localhost.localstack.cloud:4566"
-    sts = "http://localhost.localstack.cloud:4566"
-  }
-}
-```
-
-> **Nota:** El data source `aws_ami` en LocalStack devuelve AMIs simuladas. El filtro se mantiene idéntico para validar la sintaxis, pero el ID devuelto no corresponde a una imagen real.
-
-## Despliegue
+Los ejemplos `basic/` y `advanced/` funcionan con LocalStack ya que solo usan S3 (completamente soportado en Community):
 
 ```bash
-cd labs/lab-27/localstack
+cd labs/lab-27/aws/modules/secure-bucket/examples/basic
 
-terraform fmt
+# Adaptar el provider para LocalStack antes de ejecutar
 terraform init
-terraform plan
 terraform apply
-```
-
-## Verificación
-
-```bash
-awslocal ec2 describe-instances --filters "Name=tag:Name,Values=corp-lab27-web"
-awslocal iam list-instance-profiles
-awslocal ec2 describe-security-groups --group-names corp-lab27-web-sg
-```
-
-## Limpieza
-
-```bash
 terraform destroy
 ```
 
-Consulta la guía principal en [../README.md](../README.md) para los conceptos y el despliegue en AWS.
+> **Nota:** Para usar LocalStack, necesitas adaptar el bloque `provider "aws"` de cada ejemplo con los endpoints de LocalStack. Consulta los labs anteriores (ej: [lab-23/localstack](../../lab-23/localstack/README.md) o [lab-26/localstack](../../lab-26/localstack/README.md)) para ver la configuración del proveedor.
+
+## Pipeline local recomendado
+
+Sin ningún proveedor:
+
+```bash
+# 1. Formatear
+terraform fmt -recursive modules/
+
+# 2. Generar docs
+terraform-docs markdown table --output-file README.md --output-mode inject modules/secure-bucket/
+
+# 3. Crear tag
+git tag -a v1.0.0 -m "Release v1.0.0"
+```

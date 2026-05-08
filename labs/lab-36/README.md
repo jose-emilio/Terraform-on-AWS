@@ -1,4 +1,4 @@
-# Laboratorio 36 — Arquitectura Moderna NoSQL: DynamoDB con Caché y Eventos
+# Laboratorio 36 — Base de Datos Relacional Crítica: RDS Multi-AZ y Replicación
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,151 +8,170 @@
 
 ## Visión general
 
-En este laboratorio construirás una capa de datos NoSQL ultra-rápida y orientada a eventos. Desplegarás una **tabla DynamoDB On-Demand** con un **Global Secondary Index** para consultas flexibles, activarás **DynamoDB Streams** y conectarás una **Lambda** que procesa cada cambio en tiempo real. Para acelerar las lecturas, desplegarás un **cluster Redis de ElastiCache** con cifrado en tránsito y autenticación AUTH. Toda la infraestructura se monitoriza con **alarmas de CloudWatch** que notifican vía **SNS**.
+En este laboratorio aprovisionarás una base de datos PostgreSQL de nivel empresarial con alta disponibilidad, seguridad en capas y escalado de lectura. La capa de aplicación es un CRM Dashboard Flask que se despliega en un **Auto Scaling Group** detrás de un **Application Load Balancer** y demuestra en tiempo real el failover de RDS Multi-AZ, la AZ activa de la primaria y la lectura desde la réplica.
 
-La capa de aplicación es un **Product Catalog** Flask desplegado en EC2 que demuestra en tiempo real la diferencia de latencia entre una lectura desde Redis (< 5 ms) y una lectura directa a DynamoDB (~30-80 ms), con contadores de hits/misses y un feed de eventos CDC en vivo.
+Aprenderás a configurar un **DB Subnet Group** y un **Parameter Group** que fuerza SSL, a desplegar RDS con **Multi-AZ** para failover automático en menos de 60 segundos, a habilitar la **autenticación IAM** con tokens efímeros, a gestionar credenciales con **Secrets Manager** cifrado con CMK propia, y a crear una **Read Replica** en una AZ distinta para descargar lecturas.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Crear un `aws_dynamodb_table` con modo `PAY_PER_REQUEST` (On-Demand), Partition Key y Sort Key
-- Añadir un `global_secondary_index` con proyección `ALL` para consultas por atributo secundario
-- Activar `stream_enabled = true` con `stream_view_type = "NEW_AND_OLD_IMAGES"`
-- Conectar un `aws_lambda_event_source_mapping` al stream para procesar cambios en tiempo real
-- Desplegar un `aws_elasticache_replication_group` Redis con `transit_encryption_enabled` y `auth_token`
-- Implementar el patrón **Cache-Aside** en Python: Redis como capa de lectura sobre DynamoDB
-- Crear `aws_cloudwatch_metric_alarm` para `EngineCPUUtilization` y `Evictions` de Redis
-- Usar `aws_sns_topic` como destino de notificaciones de alarmas
-- Medir y visualizar la diferencia de latencia entre cache hit (~2 ms) y cache miss (~50 ms)
+- Crear un `aws_db_subnet_group` en subnets privadas y entender por qué RDS requiere subnets en múltiples AZs
+- Configurar un `aws_db_parameter_group` con `rds.force_ssl = 1` para rechazar conexiones sin cifrado
+- Desplegar `aws_db_instance` con `multi_az = true` y comprender el mecanismo de failover automático
+- Activar `max_allocated_storage` para el autoscaling de almacenamiento sin tiempo de inactividad
+- Habilitar `iam_database_authentication_enabled` y generar tokens de autenticación temporales con la CLI
+- Gestionar la contraseña maestra con `aws_secretsmanager_secret` cifrado con CMK propia de KMS
+- Crear una `aws_db_instance` como read replica con `replicate_source_db` en una AZ distinta
+- Desplegar un `aws_launch_template` + `aws_autoscaling_group` con target tracking scaling
+- Observar el cambio de AZ de la primaria en la aplicación web antes y después de un failover
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre DynamoDB, ElastiCache, Lambda, EC2, S3, Secrets Manager, IAM, CloudWatch y SNS
+- Perfil AWS con permisos sobre RDS, KMS, Secrets Manager, IAM, EC2, S3 y Auto Scaling
 
 ---
 
 ## Arquitectura
 
-![DynamoDB On-Demand con GSI + Streams → Lambda CDC → events table con TTL · Redis Multi-AZ con TLS+AUTH · EC2 Flask + Secrets + S3](arch/diagrama.svg)
+![ALB → ASG con Flask CRM en privadas a/b → RDS PostgreSQL Multi-AZ + Read Replica en AZ-c · Secrets Manager + KMS CMK + S3 app artifacts](arch/diagrama.svg)
 
-Tres componentes integrados sobre la misma cuenta:
+Tres mecanismos de continuidad combinados sobre la misma VPC:
 
-- **Catálogo en DynamoDB** (`products`, billing On-Demand) con un **GSI** `by-status-index` (`status` + `price_cents`) para consultas alternativas sin escaneo. **DynamoDB Streams** (`NEW_AND_OLD_IMAGES`) emite cada cambio.
-- **Lambda CDC processor** consume el stream (`event_source_mapping LATEST`, batch 10) y escribe cada cambio en una segunda tabla `events` cuyo **TTL** elimina los registros tras 7 días sin consumir WCU — auditoría barata y desacoplada del path crítico.
-- **Caché Redis** Multi-AZ con `automatic_failover`, **TLS** en tránsito, cifrado en reposo y **AUTH token** (`random_password` 32 chars en Secrets Manager). La EC2 lo recupera con `GetSecretValue` y aplica patrón cache-aside contra DynamoDB. Alarmas de `EngineCPUUtilization` y `Evictions` notifican a SNS.
+- **RDS Multi-AZ** — la primaria tiene una standby síncrona en otra AZ; el failover es automático y el endpoint DNS no cambia.
+- **Read Replica** asíncrona en AZ-c — descarga las consultas de lectura para no saturar la primaria.
+- **Secrets Manager** con CMK propia — la contraseña la genera Terraform con `random_password` y se almacena cifrada; la EC2 la recupera en el `user_data` con permisos vía Instance Profile (sin secretos en el código). La rotación opcional vía Lambda se activa con `var.rotation_lambda_arn`.
+
+El parameter group personalizado fuerza `rds.force_ssl = 1`. La app Flask se descarga desde S3 en cada arranque del ASG, lo que permite actualizar el código publicando una nueva versión sin tocar el Launch Template.
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### DynamoDB On-Demand: sin aprovisionamiento de capacidad
+### DB Subnet Group: enrutamiento de red de RDS
 
-Con `billing_mode = "PAY_PER_REQUEST"`, DynamoDB escala automáticamente para cualquier volumen de tráfico. No hay que estimar RCU/WCU: pagas por cada operación de lectura/escritura real. Es la opción ideal para cargas impredecibles o laboratorios.
+Un `aws_db_subnet_group` es el contrato de red de RDS: le indica al motor en qué subnets (y por tanto en qué AZs) puede colocar la instancia primaria y la standby de Multi-AZ. Debe incluir subnets en al menos dos AZs distintas. Sin él, RDS no puede desplegarse en una VPC.
 
 ```hcl
-resource "aws_dynamodb_table" "products" {
-  name         = "lab36-products"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "category"
-  range_key    = "product_id"
-  # ...
+resource "aws_db_subnet_group" "main" {
+  name       = "lab36-subnet-group"
+  subnet_ids = [for s in aws_subnet.private : s.id]
 }
 ```
 
-### Global Secondary Index: consultas flexibles
+### Parameter Group: SSL forzado
 
-Un GSI permite consultar la tabla por atributos que no son la Primary Key. En este lab, el GSI `by-status-index` con `PK=status` y `SK=price_cents` permite obtener todos los productos con un estado concreto, ordenados por precio de menor a mayor:
-
-```python
-# Consulta via GSI: productos activos ordenados por precio
-resp = products_table.query(
-    IndexName="by-status-index",
-    KeyConditionExpression=Key("status").eq("active"),
-)
-```
-
-Sin el GSI, esta consulta requeriría un `Scan` con `FilterExpression`, mucho menos eficiente a medida que crece la tabla.
-
-### DynamoDB Streams y CDC
-
-Al activar `stream_enabled = true`, DynamoDB publica cada INSERT, MODIFY y REMOVE en un stream de tiempo real. El `stream_view_type = "NEW_AND_OLD_IMAGES"` incluye el estado antes y después de cada modificación, lo que permite detectar exactamente qué cambió:
+Un `aws_db_parameter_group` sobreescribe los parámetros del motor PostgreSQL. El parámetro `rds.force_ssl = 1` hace que el servidor rechace cualquier intento de conexión que no use TLS/SSL:
 
 ```
-Evento MODIFY:
-  OldImage: { name: "Laptop", price_cents: 99900, status: "active" }
-  NewImage: { name: "Laptop", price_cents: 94900, status: "active" }
-  → El precio bajó de $999 a $949
+FATAL: no pg_hba.conf entry for host "...", user "dbadmin", database "appdb", no encryption
 ```
 
-### Lambda Event Source Mapping
+Usar un Parameter Group propio (en lugar del `default.postgres15`) es obligatorio para poder modificar parámetros sin afectar otras instancias.
 
-`aws_lambda_event_source_mapping` conecta el stream de DynamoDB con la Lambda. DynamoDB gestiona automáticamente la entrega en batches, los reintentos y el checkpointing del shard. La Lambda solo necesita permisos de `AWSLambdaDynamoDBExecutionRole` para leer del stream:
+### Multi-AZ: alta disponibilidad y failover automático
+
+Con `multi_az = true`, RDS despliega una instancia standby en una AZ distinta y replica los datos de forma síncrona. El failover es automático en menos de 60 segundos y transparente para la aplicación: el endpoint DNS no cambia, solo la AZ donde corre la primaria.
+
+```
+┌──────────────────────────────────────┐
+│  Endpoint DNS (no cambia en failover)│
+│  lab36-main.xxx.us-east-1.rds.aws    │
+└───────────────┬──────────────────────┘
+                │
+    ┌───────────┴────────────┐
+    │                        │
+┌───▼────────────┐    ┌──────▼─────────────┐
+│  PRIMARY       │    │  STANDBY (Multi-AZ)│
+│  us-east-1a    │◄───│  us-east-1b        │
+│  (escrituras)  │sync│  (no sirve lecturas│
+└────────────────┘    │   hasta failover)  │
+                      └────────────────────┘
+```
+
+El standby **no sirve lecturas** en condiciones normales — solo existe para failover. Para escalar lecturas se usa la Read Replica.
+
+### Auto Scaling Group + Launch Template
+
+El ASG gestiona el ciclo de vida de las instancias EC2 de la capa de aplicación:
+
+- **`aws_launch_template`**: define AMI, tipo de instancia, perfil IAM y `user_data`. Cada nueva versión del template puede aplicarse mediante un *instance refresh* sin tiempo de inactividad.
+- **Target Tracking Scaling**: el ASG escala para mantener la CPU media en el 60%. AWS gestiona automáticamente el cooldown entre escalados.
+- **`health_check_type = "ELB"`**: el ASG reemplaza instancias que el ALB marca como `unhealthy` (endpoint `/health` devuelve un código distinto de 200), no solo instancias apagadas.
+- **`health_check_grace_period = 600`**: da 10 minutos a cada instancia para completar el `user_data` (instalar dependencias, esperar a RDS, arrancar Flask) antes de evaluar su salud.
 
 ```hcl
-resource "aws_lambda_event_source_mapping" "dynamodb_stream" {
-  event_source_arn  = aws_dynamodb_table.products.stream_arn
-  function_name     = aws_lambda_function.cdc_processor.arn
-  starting_position = "LATEST"
-  batch_size        = 10
-}
-```
-
-### ElastiCache Redis con TLS y AUTH
-
-`transit_encryption_enabled = true` exige TLS en todas las conexiones (los clientes deben usar `rediss://` en lugar de `redis://`). `auth_token` añade una capa de autenticación: el cliente debe presentar el token además de la conexión TLS.
-
-La combinación de ambas garantiza:
-- **Confidencialidad**: los datos en tránsito van cifrados (TLS)
-- **Autenticación**: solo clientes con el token correcto pueden conectar (AUTH)
-
-```python
-r = redis.Redis(
-    host=REDIS_HOST, port=6379,
-    password=REDIS_AUTH,
-    ssl=True, ssl_cert_reqs=None,
-)
-```
-
-### Patrón Cache-Aside
-
-La aplicación sigue el patrón Cache-Aside (Lazy Loading):
-
-```
-READ:
-  1. Consultar Redis
-  2a. HIT  → devolver datos del cache (< 5 ms)
-  2b. MISS → consultar DynamoDB (~50 ms)
-           → almacenar resultado en Redis con TTL
-           → devolver datos
-
-WRITE/UPDATE/DELETE:
-  1. Escribir en DynamoDB
-  2. Invalidar clave del cache afectada
-```
-
-La invalidación reactiva evita servir datos obsoletos. El TTL de 60 segundos es la red de seguridad final.
-
-### CloudWatch Alarms para Redis
-
-`EngineCPUUtilization` mide el CPU exclusivo del proceso Redis, no del sistema operativo. Redis es single-threaded, por lo que su CPU determina el throughput máximo. Por encima del 65% durante 10 minutos es una señal temprana de saturación:
-
-```hcl
-resource "aws_cloudwatch_metric_alarm" "redis_cpu" {
-  metric_name         = "EngineCPUUtilization"
-  namespace           = "AWS/ElastiCache"
-  threshold           = 65
-  evaluation_periods  = 2
-  period              = 300
-  dimensions = {
-    ReplicationGroupId = aws_elasticache_replication_group.redis.id
+resource "aws_autoscaling_policy" "cpu" {
+  policy_type            = "TargetTrackingScaling"
+  autoscaling_group_name = aws_autoscaling_group.app.name
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 60.0
   }
 }
 ```
 
-`Evictions` indica que Redis alcanzó su límite de memoria y está expulsando claves. En un cache de aplicación, las evictions generan un pico de cache misses y mayor presión sobre DynamoDB.
+### S3 para artefactos de la aplicación
+
+El código de la aplicación (`app.py`) se almacena en S3 en lugar de embeberse en el `user_data`. Esto resuelve el límite de 16 KB de EC2 `user_data` y permite actualizar la app sin modificar el Launch Template:
+
+```bash
+# Actualizar la app sin recrear el ASG:
+# 1. Modifica app.py
+# 2. terraform apply  → sube la nueva versión a S3
+# 3. Lanza un instance refresh en el ASG
+aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name lab36-asg \
+  --preferences '{"MinHealthyPercentage":50}'
+```
+
+### Autoscaling de almacenamiento
+
+`max_allocated_storage` activa el autoscaling: cuando el espacio libre cae por debajo del 10% durante 5 minutos, RDS amplía el volumen automáticamente hasta el límite configurado sin tiempo de inactividad.
+
+```hcl
+allocated_storage     = 20    # inicial
+max_allocated_storage = 100   # máximo alcanzable automáticamente
+```
+
+### IAM Database Authentication: tokens temporales
+
+Con `iam_database_authentication_enabled = true`, las aplicaciones pueden autenticarse en PostgreSQL usando un token IAM en lugar de una contraseña estática. El token caduca a los 15 minutos:
+
+```bash
+aws rds generate-db-auth-token \
+  --hostname ENDPOINT --port 5432 \
+  --region us-east-1 --username dbadmin
+```
+
+### Secrets Manager: credenciales centralizadas con CMK
+
+El secreto se cifra con una Customer Managed Key de KMS. Esto permite auditar cada operación de descifrado en CloudTrail y revocar el acceso deshabilitando la clave. La instancia EC2 necesita tanto `secretsmanager:GetSecretValue` como `kms:Decrypt` sobre la CMK:
+
+```python
+import boto3, json
+secret = boto3.client('secretsmanager').get_secret_value(SecretId='lab36/db/master-password')
+creds  = json.loads(secret['SecretString'])
+# creds['host'], creds['port'], creds['password'], etc.
+```
+
+### Read Replica: escalado de lecturas
+
+Copia de solo lectura con replicación asíncrona. El CRM Dashboard dirige todas las consultas SELECT a la réplica y las escrituras al primario:
+
+```
+┌─────────────────┐   async   ┌──────────────────────┐
+│  PRIMARY        │──────────►│  READ REPLICA        │
+│  us-east-1a     │           │  us-east-1c          │
+│  escrituras     │           │  lecturas (CRM)      │
+└─────────────────┘           └──────────────────────┘
+```
+
+La replicación es asíncrona — puede haber un lag de milisegundos. Para datos que requieren consistencia inmediata, usa siempre el endpoint principal.
 
 ---
 
@@ -161,30 +180,16 @@ resource "aws_cloudwatch_metric_alarm" "redis_cpu" {
 ```
 labs/lab-36/
 ├── README.md
-├── diagrama.drawio               # Fuente editable del diagrama de arquitectura
 ├── arch/
-│   └── diagrama.svg              # Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg                       # Diagrama de arquitectura (referenciado en este README)
 └── aws/
-    ├── app/
-    │   └── app.py                 # Flask Product Catalog: CRUD DynamoDB + caché Redis
-    ├── lambda/
-    │   └── lambda_function.py     # CDC processor: consume DynamoDB Streams → escribe eventos
-    ├── scripts/
-    │   └── user_data.sh.tpl       # Bootstrap EC2: instala deps, seed DynamoDB, inicia systemd
-    │
-    ├── locals.tf                  # locals (tags, CIDRs) + data sources (AMI, account_id)
-    ├── networking.tf              # VPC, IGW, subnets públicas/privadas, route tables, SGs
-    ├── iam.tf                     # Roles e instance profiles para EC2 y Lambda
-    ├── dynamodb.tf                # Tabla products (GSI + Streams) y tabla events (TTL)
-    ├── elasticache.tf             # random_password, Secrets Manager, subnet group, Redis cluster
-    ├── lambda.tf                  # archive_file, función CDC, event source mapping
-    ├── monitoring.tf              # SNS topic + CloudWatch alarms (CPU y Evictions)
-    ├── ec2.tf                     # S3 bucket/object (app.py) + instancia EC2
-    │
-    ├── outputs.tf                 # 18 outputs con endpoints, ARNs y comandos de verificación
-    ├── providers.tf               # AWS ~> 6.0 + random + archive
-    ├── variables.tf               # region, project, instance_type, redis_node_type, cache_ttl
-    └── aws.s3.tfbackend           # Configuración del backend S3
+    ├── providers.tf
+    ├── variables.tf
+    ├── main.tf
+    ├── outputs.tf
+    ├── app.py
+    ├── user_data.sh.tpl
+    └── aws.s3.tfbackend
 ```
 
 ---
@@ -204,9 +209,9 @@ terraform plan
 terraform apply
 ```
 
-> **Nota**: `terraform apply` puede tardar más de 20 minutos. El cuello de botella es el cluster de Redis — `aws_elasticache_replication_group` con Multi-AZ puede superar los **20 minutos** en pasar a estado `available`. DynamoDB, Lambda y la instancia EC2 se aprovisionan en paralelo en cuestión de segundos.
+> **Nota**: `terraform apply` puede tardar entre 20 y 30 minutos. RDS Multi-AZ y la read replica requieren tiempo para aprovisionar y sincronizar los volúmenes. El ASG espera a que RDS esté disponible antes de lanzar instancias.
 
-Una vez completado, obtén la URL:
+Una vez completado, obtén la URL de la aplicación:
 
 ```bash
 terraform output app_url
@@ -216,310 +221,303 @@ terraform output app_url
 
 ## Verificación final
 
-### Aplicación web — Product Catalog
+### Aplicación web — CRM Dashboard
 
 ```bash
 APP_URL=$(terraform output -raw app_url)
 
 # Health check
 curl -s "$APP_URL/health"
-# {"status": "ok"}
+# Debe devolver: {"status": "ok"}
 
-# Abre el dashboard
+# Abre el dashboard en el navegador
 echo "$APP_URL"
 ```
 
 El dashboard muestra:
-- **Stats bar**: hits, misses, hit rate %, latencia media Redis (ms), latencia media DynamoDB (ms), latencia media escritura
-- **Badge de fuente**: `⚡ REDIS HIT · X ms` o `◎ CACHE MISS — DynamoDB: X ms`
-- **Tabla de productos**: 15 productos precargados, filtrables por categoría y estado
-- **Latencia comparada**: barras visuales de rendimiento en la barra lateral
-- **Feed de eventos CDC**: cambios procesados por Lambda en tiempo real
+- **Tarjetas de estadísticas**: total de clientes, distribución por plan y MRR total
+- **Estado de conexiones**: primaria (escritura) y réplica (lectura) con indicador verde/rojo
+- **Card RDS Multi-AZ**: AZ actual de la instancia primaria, estado y botón **Failover**
+- **Tabla de clientes**: 15 clientes precargados, filtrables por nombre/email/país y plan
 
-### Demostración de latencia
+### Instancia RDS y Multi-AZ
 
 ```bash
-# Primera carga (CACHE MISS → DynamoDB): ~50-80 ms
-curl -s "$APP_URL/" | grep "src-badge"
+# Estado, AZ y configuración de la primaria
+aws rds describe-db-instances \
+  --db-instance-identifier lab36-main \
+  --query 'DBInstances[0].{Estado:DBInstanceStatus,MultiAZ:MultiAZ,AZ:AvailabilityZone,AZStandby:SecondaryAvailabilityZone,Clase:DBInstanceClass,Motor:EngineVersion}'
 
-# Segunda carga (CACHE HIT → Redis): ~1-5 ms
-curl -s "$APP_URL/" | grep "src-badge"
+# Endpoint DNS
+aws rds describe-db-instances \
+  --db-instance-identifier lab36-main \
+  --query 'DBInstances[0].Endpoint'
 ```
 
-En el interfaz, recarga la misma página varias veces y observa cómo la latencia cae drásticamente en el segundo request.
-
-### DynamoDB: tabla y schema
+### Auto Scaling Group
 
 ```bash
-TABLE=$(terraform output -raw dynamo_table_name)
+# Estado del ASG y número de instancias
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names lab36-asg \
+  --query 'AutoScalingGroups[0].{Min:MinSize,Deseado:DesiredCapacity,Max:MaxSize,Instancias:Instances[*].{ID:InstanceId,Estado:LifecycleState,Health:HealthStatus}}'
 
-# Describe la tabla (modo On-Demand, stream, GSI)
-aws dynamodb describe-table \
-  --table-name "$TABLE" \
-  --query 'Table.{Modo:BillingModeSummary.BillingMode,Stream:StreamSpecification,GSI:GlobalSecondaryIndexes[*].{Nombre:IndexName,PK:KeySchema[0].AttributeName,SK:KeySchema[1].AttributeName}}'
+# Instancias registradas en el target group del ALB
+TG_ARN=$(aws elbv2 describe-target-groups \
+  --names lab36-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
 
-# Escanea todos los productos
-aws dynamodb scan --table-name "$TABLE" \
-  --query 'Items[*].{Cat:category.S,Nombre:name.S,Precio:price_cents.N,Estado:status.S}'
+aws elbv2 describe-target-health \
+  --target-group-arn "$TG_ARN" \
+  --query 'TargetHealthDescriptions[*].{ID:Target.Id,Puerto:Target.Port,Estado:TargetHealth.State}'
+# Ambas instancias deben aparecer como "healthy"
 ```
 
-### GSI: consulta por estado y precio
+### SSL forzado (Parameter Group)
 
 ```bash
-# Productos activos ordenados por precio (via GSI)
-aws dynamodb query \
-  --table-name "$TABLE" \
-  --index-name by-status-index \
-  --key-condition-expression "#s = :v" \
-  --expression-attribute-names '{"#s":"status"}' \
-  --expression-attribute-values '{":v":{"S":"active"}}' \
-  --query 'Items[*].{Estado:status.S,Precio:price_cents.N,Nombre:name.S}' \
-  --region us-east-1
-# Los items vienen ordenados por price_cents de menor a mayor
+aws rds describe-db-parameters \
+  --db-parameter-group-name lab36-pg15 \
+  --query 'Parameters[?ParameterName==`rds.force_ssl`].{Nombre:ParameterName,Valor:ParameterValue,Fuente:Source}'
+# Valor debe ser "1"
 ```
 
-### DynamoDB Streams y Lambda CDC
+### Autoscaling de almacenamiento
 
 ```bash
-LAMBDA=$(terraform output -raw lambda_function_name)
-STREAM_ARN=$(terraform output -raw dynamo_stream_arn)
-
-# Estado del event source mapping
-aws lambda list-event-source-mappings \
-  --function-name "$LAMBDA" \
-  --query 'EventSourceMappings[0].{Estado:State,Fuente:EventSourceArn,Batch:BatchSize}'
-# Estado debe ser "Enabled"
-
-# Crea un producto desde la UI, luego verifica los logs de Lambda
-aws logs describe-log-groups \
-  --log-group-name-prefix "/aws/lambda/$LAMBDA" \
-  --query 'logGroups[0].logGroupName' --output text | \
-  xargs -I{} aws logs tail {} --follow --since 5m
+aws rds describe-db-instances \
+  --db-instance-identifier lab36-main \
+  --query 'DBInstances[0].{Asignado:AllocatedStorage,MaxAsignado:MaxAllocatedStorage,Tipo:StorageType,Cifrado:StorageEncrypted}'
+# Debe mostrar: 20, 100, gp3, true
 ```
 
-### ElastiCache Redis
+### Secrets Manager
 
 ```bash
-# Estado del cluster Redis
-aws elasticache describe-replication-groups \
-  --replication-group-id lab36-redis \
-  --query 'ReplicationGroups[0].{Estado:Status,TLS:TransitEncryptionEnabled,AtRest:AtRestEncryptionEnabled,MultiAZ:MultiAZ,Nodos:NodeGroups[0].NodeGroupMembers[*].{ID:CacheClusterId,Rol:CurrentRole,AZ:PreferredAvailabilityZone}}'
+SECRET=$(terraform output -raw secret_name)
 
-# Endpoint primario
-aws elasticache describe-replication-groups \
-  --replication-group-id lab36-redis \
-  --query 'ReplicationGroups[0].NodeGroups[0].PrimaryEndpoint'
-```
-
-### AUTH token de Redis
-
-```bash
-SECRET=$(terraform output -raw redis_secret_name)
-
-# Recupera el AUTH token
-TOKEN=$(aws secretsmanager get-secret-value \
+# Describe el secreto (cifrado con CMK)
+aws secretsmanager describe-secret \
   --secret-id "$SECRET" \
-  --query SecretString --output text)
+  --query '{Nombre:Name,KMS:KmsKeyId,RotacionActiva:RotationEnabled}'
 
-REDIS_HOST=$(terraform output -raw redis_primary_endpoint)
-
-# Conecta al cluster Redis (desde la instancia EC2 via SSM)
-# En el EC2 (usa el paquete Python redis ya instalado):
-# python3 -c "import redis; r = redis.Redis(host='$REDIS_HOST', port=6379, password='$TOKEN', ssl=True, ssl_cert_reqs=None); print(r.ping())"
-# Debe devolver: True
+# Recupera las credenciales
+aws secretsmanager get-secret-value \
+  --secret-id "$SECRET" \
+  --query SecretString --output text | python3 -m json.tool
+# Debe mostrar: engine, host, port, dbname, username, password
 ```
 
-### CloudWatch Alarms y SNS
+### IAM Database Authentication
 
 ```bash
-# Estado de las alarmas
-aws cloudwatch describe-alarms \
-  --alarm-names lab36-redis-cpu-high lab36-redis-evictions \
-  --query 'MetricAlarms[*].{Nombre:AlarmName,Estado:StateValue,Umbral:Threshold,Metrica:MetricName}'
+DB_HOST=$(terraform output -raw db_host)
+DB_USER=$(terraform output -raw db_username)
 
-# Suscribirse al topic SNS para recibir notificaciones por email
-SNS_ARN=$(terraform output -raw sns_topic_arn)
-aws sns subscribe \
-  --topic-arn "$SNS_ARN" \
-  --protocol email \
-  --notification-endpoint TU_EMAIL@ejemplo.com \
-  --region us-east-1
-# Confirma el email de verificacion que recibiras
+# Genera un token IAM (caduca en 15 minutos)
+TOKEN=$(aws rds generate-db-auth-token \
+  --hostname "$DB_HOST" \
+  --port 5432 \
+  --region us-east-1 \
+  --username "$DB_USER")
+
+echo "Token generado (primeros 50 chars): ${TOKEN:0:50}..."
+
+# El token se usa como contraseña desde una instancia en la misma VPC:
+# PGPASSWORD="$TOKEN" psql "host=$DB_HOST port=5432 dbname=appdb user=$DB_USER sslmode=require"
 ```
+
+### Read Replica
+
+```bash
+# Estado y AZ de la réplica
+aws rds describe-db-instances \
+  --db-instance-identifier lab36-replica \
+  --query 'DBInstances[0].{Estado:DBInstanceStatus,AZ:AvailabilityZone,Fuente:ReadReplicaSourceDBInstanceIdentifier}'
+
+# Lag de replicación en segundos (0 = sin lag)
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name ReplicaLag \
+  --dimensions Name=DBInstanceIdentifier,Value=lab36-replica \
+  --start-time "$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --period 60 --statistics Average \
+  --query 'Datapoints[*].Average'
+```
+
+### Demostración de failover Multi-AZ
+
+El CRM Dashboard incluye un botón **⚡ Failover** que dispara un `reboot_db_instance` con `ForceFailover=True` desde la propia aplicación.
+
+**Procedimiento**:
+
+1. Abre el dashboard en el navegador: `terraform output app_url`
+2. Anota la AZ mostrada en el card **RDS Multi-AZ** (p. ej. `us-east-1a`)
+3. Pulsa el botón **⚡ Failover** y confirma el diálogo
+4. El banner verde indica que el failover se ha iniciado
+5. Espera ~60 segundos y recarga la página
+6. La AZ del card debe haber cambiado a la AZ del standby (p. ej. `us-east-1b`)
+7. El endpoint DNS de RDS no ha cambiado — la aplicación siguió funcionando
+
+Verifica los eventos de RDS para confirmar el failover:
+
+```bash
+aws rds describe-events \
+  --source-identifier lab36-main \
+  --source-type db-instance \
+  --duration 30 \
+  --query 'Events[*].{Hora:Date,Mensaje:Message}' \
+  --output table
+```
+
+Debes ver: `Multi-AZ instance failover started` → `DB instance restarted` → `Multi-AZ instance failover completed` (~55 segundos).
 
 ---
 
 ## Retos
 
-### Reto 1 — TTL en la tabla de productos
+### Reto 1 — Enhanced Monitoring
 
-La tabla `lab36-events` tiene TTL configurado (7 días). La tabla de productos no lo tiene: los registros eliminados vía la UI desaparecen de inmediato con `DeleteItem`, pero no existe ningún mecanismo de expiración automática para productos que deberían caducar por tiempo.
-
-**Requisitos**
-
-Modifica únicamente `dynamodb.tf`:
-
-1. Añade un bloque `ttl` en `aws_dynamodb_table.products` que use el atributo `expires_at` (tipo Number, epoch en segundos)
-2. Aplica el cambio con `terraform apply` — DynamoDB activa el TTL sin interrupciones ni recreación de la tabla
-
-**Criterios de éxito**
-
-```bash
-# Debe mostrar TimeToLiveStatus: ENABLED y AttributeName: expires_at
-aws dynamodb describe-time-to-live \
-  --table-name lab36-products \
-  --query 'TimeToLiveDescription'
-
-# Inserta manualmente un item con expires_at en el pasado
-aws dynamodb put-item \
-  --table-name lab36-products \
-  --item '{
-    "category":   {"S": "Test"},
-    "product_id": {"S": "ttl-test-01"},
-    "name":       {"S": "Producto caducado"},
-    "status":     {"S": "inactive"},
-    "price_cents":{"N": "0"},
-    "stock":      {"N": "0"},
-    "expires_at": {"N": "1"}
-  }'
-# En las proximas 24-48h el item desaparece automaticamente (TTL es eventual)
-```
-
-- `terraform plan` muestra `~ update in-place` — no hay destroy/create de la tabla
-- La tabla de eventos sigue funcionando con su TTL propio de 7 días sin cambios
-
-### Reto 2 — Point-in-Time Recovery en la tabla de productos
-
-La tabla de productos almacena el catálogo activo del negocio. Actualmente no tiene ninguna protección frente a borrados accidentales masivos — un `terraform apply` erróneo o un bug en la aplicación podría eliminar todos los productos de forma irrecuperable. **Point-in-Time Recovery (PITR)** activa backups continuos y permite restaurar la tabla a cualquier segundo dentro de los últimos 35 días.
+RDS ofrece métricas estándar a nivel de hipervisor en CloudWatch. **Enhanced Monitoring** proporciona métricas del sistema operativo (CPU por proceso, memoria libre, IOPS de disco) con granularidad de hasta 1 segundo — imprescindible para diagnosticar cuellos de botella reales.
 
 **Requisitos**
 
-Modifica únicamente `dynamodb.tf`:
-
-1. Añade un bloque `point_in_time_recovery` en `aws_dynamodb_table.products` con `enabled = true`
-2. Aplica con `terraform apply` — DynamoDB activa PITR sin interrupciones ni recreación de la tabla
-3. Con la CLI, simula una recuperación restaurando la tabla a su estado de hace 5 minutos en una tabla nueva `lab36-products-restored`
-4. Verifica el contenido de la tabla restaurada y elimínala al terminar
+1. Crea un rol IAM con la política `AmazonRDSEnhancedMonitoringRole` que permita al agente de RDS enviar métricas a CloudWatch.
+2. Configura `monitoring_interval = 60` en `aws_db_instance.main` (valores válidos: 1, 5, 10, 15, 30, 60 segundos).
+3. Asocia el rol con `monitoring_role_arn`.
+4. Añade un output `monitoring_role_arn`.
 
 **Criterios de éxito**
 
-```bash
-# PITR debe aparecer como ENABLED con ventana de 35 dias
-aws dynamodb describe-continuous-backups \
-  --table-name lab36-products \
-  --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription'
-# {
-#   "PointInTimeRecoveryStatus": "ENABLED",
-#   "EarliestRestorableDateTime": "...",
-#   "LatestRestorableDateTime":  "..."
-# }
+- `aws rds describe-db-instances --query '..MonitoringInterval'` muestra `60`
+- La pestaña **Monitoring** de `lab36-main` en la consola RDS muestra métricas de OS: `Active Memory`, `CPU User`, `Free Memory`, etc.
+- Puedes explicar la diferencia entre métricas de hipervisor (CloudWatch estándar) y métricas de agente OS (Enhanced Monitoring)
 
-# Restaura a "ahora mismo" en una tabla nueva (tarda ~3-5 min)
-aws dynamodb restore-table-to-point-in-time \
-  --source-table-name lab36-products \
-  --target-table-name lab36-products-restored \
-  --use-latest-restorable-time
+### Reto 2 — Snapshot manual y restauración
 
-aws dynamodb wait table-exists --table-name lab36-products-restored
+`backup_retention_period = 7` habilita los backups automáticos y la restauración a cualquier punto en el tiempo dentro de esa ventana. Practicar la restauración antes de necesitarla es esencial en producción.
 
-# Verifica que los productos estan intactos en la tabla restaurada
-aws dynamodb scan \
-  --table-name lab36-products-restored \
-  --select COUNT \
-  --query 'Count'
-# Debe devolver 15
+### Requisitos
 
-# Limpieza
-aws dynamodb delete-table --table-name lab36-products-restored
-```
+1. Crea un snapshot manual de la instancia principal con `aws rds create-db-snapshot`
+2. Espera a que el snapshot esté en estado `available`
+3. Restaura el snapshot en una instancia nueva `lab36-restored`
+4. Verifica que arranca y contiene la base de datos `appdb`
+5. Elimina la instancia restaurada al terminar
 
-- `terraform plan` muestra `~ update in-place` — la tabla no se destruye ni recrea
-- La tabla `lab36-events` **no** requiere PITR (los eventos tienen TTL de 7 días y son regenerables por el stream)
+> Este reto se realiza completamente con la CLI — no es necesario modificar Terraform.
+
+**Criterios de éxito**
+
+- `aws rds describe-db-snapshots` muestra el snapshot con `Status: available`
+- `aws rds describe-db-instances --db-instance-identifier lab36-restored` muestra estado `available`
+- La instancia restaurada contiene la tabla `customers` con los datos originales
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — TTL en la tabla de productos</strong></summary>
+<summary><strong>Solución al Reto 1 — Enhanced Monitoring</strong></summary>
 
-### Solución al Reto 1 — TTL en la tabla de productos
+### Solución al Reto 1 — Enhanced Monitoring
 
-En `aws/dynamodb.tf`, añade el bloque `ttl` dentro de `aws_dynamodb_table.products`:
+Añade en `aws/main.tf`:
 
 ```hcl
-resource "aws_dynamodb_table" "products" {
-  # ... resto de la configuracion sin cambios ...
+resource "aws_iam_role" "rds_monitoring" {
+  name = "${var.project}-rds-monitoring-role"
 
-  ttl {
-    attribute_name = "expires_at"
-    enabled        = true
-  }
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "monitoring.rds.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
 
   tags = local.tags
 }
+
+resource "aws_iam_role_policy_attachment" "rds_monitoring" {
+  role       = aws_iam_role.rds_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
 ```
 
-Aplica y verifica:
+Modifica `aws_db_instance.main` añadiendo:
+
+```hcl
+monitoring_interval = 60
+monitoring_role_arn = aws_iam_role.rds_monitoring.arn
+```
+
+Añade en `aws/outputs.tf`:
+
+```hcl
+output "monitoring_role_arn" {
+  description = "ARN del rol IAM para Enhanced Monitoring"
+  value       = aws_iam_role.rds_monitoring.arn
+}
+```
+
+Verifica:
 
 ```bash
 terraform apply
 
-aws dynamodb describe-time-to-live \
-  --table-name lab36-products \
-  --query 'TimeToLiveDescription'
-# { "TimeToLiveStatus": "ENABLED", "AttributeName": "expires_at" }
+aws rds describe-db-instances \
+  --db-instance-identifier lab36-main \
+  --query 'DBInstances[0].{Intervalo:MonitoringInterval,RolARN:MonitoringRoleArn}'
 ```
-
-> DynamoDB activa el TTL como operación `in-place`: no hay downtime ni recreación de la tabla. Los items sin el atributo `expires_at` no se ven afectados.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Point-in-Time Recovery en la tabla de productos</strong></summary>
+<summary><strong>Solución al Reto 2 — Snapshot manual y restauración</strong></summary>
 
-### Solución al Reto 2 — Point-in-Time Recovery en la tabla de productos
-
-En `aws/dynamodb.tf`, añade el bloque `point_in_time_recovery` dentro de `aws_dynamodb_table.products`:
-
-```hcl
-resource "aws_dynamodb_table" "products" {
-  # ... resto de la configuracion sin cambios ...
-
-  point_in_time_recovery {
-    enabled = true
-  }
-
-  tags = local.tags
-}
-```
-
-Aplica y verifica:
+### Solución al Reto 2 — Snapshot manual y restauración
 
 ```bash
-terraform apply
+# Paso 1: Crea el snapshot manual
+aws rds create-db-snapshot \
+  --db-instance-identifier lab36-main \
+  --db-snapshot-identifier lab36-manual-snap-01
 
-aws dynamodb describe-continuous-backups \
-  --table-name lab36-products \
-  --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription'
+# Paso 2: Espera a que esté disponible (5-10 minutos)
+aws rds wait db-snapshot-available \
+  --db-snapshot-identifier lab36-manual-snap-01
+
+aws rds describe-db-snapshots \
+  --db-snapshot-identifier lab36-manual-snap-01 \
+  --query 'DBSnapshots[0].{ID:DBSnapshotIdentifier,Estado:Status,GB:AllocatedStorage,Fecha:SnapshotCreateTime}'
+
+# Paso 3: Restaura en una instancia nueva
+DB_SUBNET_GROUP=$(aws rds describe-db-instances \
+  --db-instance-identifier lab36-main \
+  --query 'DBInstances[0].DBSubnetGroup.DBSubnetGroupName' --output text)
+
+aws rds restore-db-instance-from-db-snapshot \
+  --db-instance-identifier lab36-restored \
+  --db-snapshot-identifier lab36-manual-snap-01 \
+  --db-instance-class db.t4g.small \
+  --db-subnet-group-name "$DB_SUBNET_GROUP" \
+  --no-publicly-accessible
+
+# Paso 4: Espera a que esté disponible
+aws rds wait db-instance-available \
+  --db-instance-identifier lab36-restored
+
+aws rds describe-db-instances \
+  --db-instance-identifier lab36-restored \
+  --query 'DBInstances[0].{ID:DBInstanceIdentifier,Estado:DBInstanceStatus,Motor:EngineVersion}'
+
+# Limpieza
+aws rds delete-db-instance \
+  --db-instance-identifier lab36-restored \
+  --skip-final-snapshot
 ```
-
-Restaura y comprueba la integridad:
-
-```bash
-aws dynamodb restore-table-to-point-in-time \
-  --source-table-name lab36-products \
-  --target-table-name lab36-products-restored \
-  --use-latest-restorable-time
-
-aws dynamodb wait table-exists --table-name lab36-products-restored
-
-aws dynamodb scan --table-name lab36-products-restored --select COUNT --query 'Count'
-
-aws dynamodb delete-table --table-name lab36-products-restored
-```
-
-> PITR se activa como operación `in-place` — no hay downtime. DynamoDB mantiene backups continuos incrementales; la restauración genera una tabla nueva independiente, sin afectar a la tabla de origen.
 
 </details>
 
@@ -532,29 +530,67 @@ aws dynamodb delete-table --table-name lab36-products-restored
 terraform destroy
 ```
 
-> ElastiCache tarda ~5-10 minutos en eliminarse. DynamoDB y Lambda se eliminan en segundos.
+> `terraform destroy` puede tardar 15-20 minutos. RDS espera a que la primaria, la réplica y el Multi-AZ standby estén completamente detenidos antes de eliminarlos.
+
+---
+
+## Gestión de Secretos: configurar la rotación automática
+
+La rotación automática requiere una Lambda de rotación. Para desplegarla desde Serverless Application Repository:
+
+> **Requisito previo — conectividad de la Lambda a la VPC**: la Lambda de rotación necesita acceso de red a la instancia RDS (puerto 5432) y a la API de Secrets Manager. Para ello debe desplegarse dentro de la VPC del laboratorio, en las subnets privadas, con un Security Group que permita el tráfico saliente a RDS y a Secrets Manager (ya sea a través del NAT Gateway o mediante VPC Endpoints). Sin esta configuración la rotación fallará con un error de timeout al intentar conectar con la base de datos.
+
+```bash
+# Paso 1: Crea el change set desde Serverless Application Repository
+CHANGE_SET_ID=$(aws serverlessrepo create-cloud-formation-change-set \
+  --application-id arn:aws:serverlessrepo:us-east-1:297356227824:applications/SecretsManagerRDSPostgreSQLRotationSingleUser \
+  --stack-name secrets-rotation-pg \
+  --parameter-overrides \
+    '[{"Name":"endpoint","Value":"https://secretsmanager.us-east-1.amazonaws.com"},
+      {"Name":"functionName","Value":"SecretsManagerRDSPostgreSQLRotation"}]' \
+  --capabilities CAPABILITY_IAM CAPABILITY_RESOURCE_POLICY \
+  --query ChangeSetId --output text)
+
+# Paso 2: Ejecuta el change set
+aws cloudformation execute-change-set --change-set-name "$CHANGE_SET_ID"
+
+# Paso 3: Espera a que el stack esté desplegado (~2 minutos)
+aws cloudformation wait stack-create-complete \
+  --stack-name secrets-rotation-pg
+
+# Paso 4: Obtén el ARN de la Lambda desplegada
+ROTATION_LAMBDA_ARN=$(aws lambda get-function \
+  --function-name SecretsManagerRDSPostgreSQLRotation \
+  --query 'Configuration.FunctionArn' --output text)
+
+echo "Lambda ARN: $ROTATION_LAMBDA_ARN"
+
+# Paso 5: Aplica con rotación habilitada
+terraform apply -var="rotation_lambda_arn=$ROTATION_LAMBDA_ARN"
+```
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Cache-Aside vs Write-Through**: Cache-Aside es más simple pero puede servir datos obsoletos durante el TTL. Write-Through actualiza el cache en cada escritura — reduce misses pero aumenta la latencia de escritura.
-- **TTL del cache**: Un TTL de 60 segundos es conservador. Para datos que cambian poco (catálogo de productos), puedes aumentarlo a 5-15 minutos. Para datos financieros o de inventario, mantenlo bajo (10-30s).
-- **`ssl_cert_reqs=None`** en el cliente Redis de laboratorio: en producción usa `ssl_cert_reqs=ssl.CERT_REQUIRED` con el certificado de la CA de AWS (`AmazonRootCA1.pem`).
-- **Nunca expongas el AUTH token en variables de entorno del proceso**: guárdalo en Secrets Manager y recupéralo al arrancar, como hace este lab.
-- **GSI no es gratis**: en modo On-Demand, un GSI duplica el costo de escritura porque cada write a la tabla base se replica al índice. Crea solo los GSI que vayas a usar.
-- **DynamoDB Streams tiene 24 horas de retención**: si la Lambda falla durante más de 24 horas, los registros del stream se pierden. Considera DLQ (Dead Letter Queue) para capturar errores.
-- **Evictions = problema de memoria**: si ves evictions frecuentes, aumenta el `node_type` del cluster Redis o reduce el TTL del cache para liberar memoria antes.
+- Nunca uses `publicly_accessible = true` en instancias de producción. RDS debe ser accesible solo desde dentro de la VPC a través de subnets privadas.
+- Activa `deletion_protection = true` en producción para evitar borrados accidentales con `terraform destroy`.
+- Usa `skip_final_snapshot = false` con `final_snapshot_identifier` en producción — el snapshot final es la última línea de defensa ante una eliminación accidental.
+- Prefiere IAM Database Authentication sobre contraseñas estáticas en EC2, ECS o Lambda — los tokens son efímeros y no necesitan rotación explícita.
+- Monitoriza `ReplicaLag` en CloudWatch. Un lag creciente indica que la primaria escribe más rápido de lo que la réplica puede procesar.
+- El standby Multi-AZ **no sirve lecturas** — solo existe para failover. Para escalar lecturas usa exclusivamente la Read Replica.
+- Cifra los secretos con una CMK propia en lugar de la clave gestionada por AWS. Esto permite auditar cada operación de descifrado en CloudTrail y revocar el acceso deshabilitando la clave.
+- Expón el botón de failover **solo en entornos de laboratorio**. En producción, el failover manual debe requerir autenticación adicional o ejecutarse desde herramientas de runbook.
 
 ---
 
 ## Recursos
 
-- [DynamoDB On-Demand — AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/capacity-mode.html)
-- [Global Secondary Indexes — AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html)
-- [DynamoDB Streams — AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html)
-- [ElastiCache for Redis — Auth Token](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth.html)
-- [Cache-Aside Pattern — Microsoft](https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside)
-- [Terraform: aws_dynamodb_table](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dynamodb_table)
-- [Terraform: aws_elasticache_replication_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elasticache_replication_group)
-- [Terraform: aws_lambda_event_source_mapping](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_event_source_mapping)
+- [RDS Multi-AZ — AWS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html)
+- [RDS IAM Database Authentication — AWS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)
+- [Secrets Manager Rotation — AWS](https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html)
+- [RDS Storage Autoscaling — AWS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIOPS.StorageTypes.html#USER_PIOPS.Autoscaling)
+- [EC2 Auto Scaling Target Tracking — AWS](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
+- [Terraform: aws_db_instance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/db_instance)
+- [Terraform: aws_autoscaling_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_group)
+- [Terraform: aws_secretsmanager_secret_rotation](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/secretsmanager_secret_rotation)

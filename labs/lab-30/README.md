@@ -1,4 +1,4 @@
-# Laboratorio 30 — Procesamiento Asíncrono y Resiliencia de Eventos
+# Laboratorio 30 — Microservicios con ECS Fargate y Malla de Servicios
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,146 +8,175 @@
 
 ## Visión general
 
-En este laboratorio construirás un sistema de procesamiento asíncrono de órdenes sobre AWS usando SQS y Lambda. Aprenderás a configurar el **polling automático de colas** con `aws_lambda_event_source_mapping`, a reducir invocaciones innecesarias mediante **filtros de eventos** (`filter_criteria`) que descartan mensajes que no cumplen los criterios de negocio, y a implementar dos mecanismos de resiliencia complementarios: las **Lambda Destinations** para capturar el resultado de invocaciones asíncronas directas, y la **Dead Letter Queue** con `redrive_policy` para aislar los mensajes que fallan repetidamente en el polling SQS.
+En este laboratorio desplegarás dos microservicios dockerizados sin gestionar servidores físicos: un servicio **Web** que sirve una interfaz HTML y un microservicio **API** que responde JSON. El servicio Web llama al API internamente usando Service Connect, adjuntando una clave de API como header `X-API-Key` que el microservicio API valida en cada petición mediante un bloque `map{}` de nginx generado dinámicamente en tiempo de arranque. Combinarás un repositorio ECR con etiquetas inmutables y política de limpieza, dos task definitions definidas con `jsonencode()`, la inyección del secreto compartido desde SSM Parameter Store, Service Connect para la comunicación interna Web→API y el Deployment Circuit Breaker para revertir automáticamente despliegues defectuosos.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Configurar `aws_lambda_event_source_mapping` para que Lambda consuma mensajes SQS automáticamente con un `batch_size` de hasta 10 mensajes por invocación
-- Aplicar `filter_criteria` para que Lambda solo procese mensajes cuyo cuerpo JSON cumpla condiciones específicas (como `order_type = "premium"`), eliminando el resto sin invocación
-- Implementar `aws_lambda_function_event_invoke_config` con `destination_config` para enrutar el resultado de invocaciones asíncronas a colas de éxito o fallo
-- Crear una Dead Letter Queue con `aws_sqs_queue` y `redrive_policy` que capture los mensajes que fallan tras `maxReceiveCount` intentos de procesamiento
-- Dimensionar correctamente el `visibility_timeout_seconds` de SQS respecto al `timeout` de Lambda para evitar reprocesamientos accidentales
-- Distinguir cuándo actúan las Lambda Destinations (invocación asíncrona directa) vs cuándo actúa la DLQ (path de Event Source Mapping)
+- Crear un repositorio ECR con `image_tag_mutability = "IMMUTABLE"` y definir una política de limpieza con `aws_ecr_lifecycle_policy` para mantener solo las 10 imágenes más recientes
+- Usar `jsonencode()` en HCL para definir los `container_definitions` de una task definition de Fargate, asignando límites de CPU y memoria
+- Almacenar una clave de API en SSM Parameter Store como `SecureString` y referenciarla en la task definition para que ECS la inyecte como variable de entorno sin exponerla en el estado
+- Configurar dos servicios ECS con Service Connect: el servicio Web como cliente que llama a `http://api:8080` y el microservicio API como servidor que se registra con ese nombre DNS privado
+- Implementar autenticación basada en header entre microservicios: el servicio Web adjunta `X-API-Key` en cada `proxy_pass` al API; el microservicio API usa un bloque `map{}` de nginx generado en tiempo de arranque para validar el header sin exponer el secreto en configuración estática
+- Habilitar el Deployment Circuit Breaker con `rollback = true` para revertir automáticamente si los nuevos contenedores fallan el health check durante un despliegue
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre Lambda, SQS, IAM y CloudWatch Logs
+- Perfil AWS con permisos sobre VPC, ECR, ECS, SSM, IAM y CloudWatch Logs
+- Docker instalado (para hacer push de imágenes a ECR en la sección opcional)
 - LocalStack en ejecución (para la sección de LocalStack)
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### Event Source Mapping y Polling de Colas SQS
+### Ciclo de Vida de Imágenes en ECR
 
-`aws_lambda_event_source_mapping` configura Lambda para que pida mensajes a SQS periódicamente sin necesidad de código de polling propio. Lambda gestiona el ciclo completo: recibe el lote, invoca la función y, si la función retorna con éxito, elimina los mensajes de la cola.
+`aws_ecr_repository` con `image_tag_mutability = "IMMUTABLE"` rechaza cualquier intento de sobreescribir una etiqueta existente. Si `api:v1.0.0` ya está en el repositorio, un segundo `docker push` con la misma etiqueta falla inmediatamente, garantizando que cada etiqueta corresponde a exactamente un artefacto.
 
 ```hcl
-resource "aws_lambda_event_source_mapping" "orders" {
-  event_source_arn = aws_sqs_queue.orders.arn
-  function_name    = aws_lambda_function.processor.arn
-  batch_size       = 10
-  enabled          = true
+resource "aws_ecr_repository" "app" {
+  name                 = "lab30/api"
+  image_tag_mutability = "IMMUTABLE"
 }
 ```
 
-El evento que llega al handler tiene la forma `{"Records": [...]}`, donde cada elemento es un mensaje SQS. El handler debe procesar todos los mensajes del lote:
-
-```python
-def lambda_handler(event, context):
-    for record in event["Records"]:
-        body = json.loads(record["body"])
-        # procesar body...
-```
-
-Un `batch_size` de 10 reduce el número de invocaciones Lambda comparado con procesar un mensaje a la vez, optimizando tanto el coste como la latencia.
-
-### Filtros de Eventos con filter_criteria
-
-`filter_criteria` permite descartar mensajes en el lado de AWS antes de que Lambda se invoque. Los mensajes que no coinciden con el patrón se eliminan automáticamente de la cola — no se reencolan ni van a la DLQ.
+La política de limpieza controla el coste de almacenamiento eliminando imágenes antiguas automáticamente. La regla `imageCountMoreThan` elimina las imágenes más antiguas cuando el total supera el umbral definido:
 
 ```hcl
-filter_criteria {
-  filter {
-    pattern = jsonencode({
-      body = {
-        order_type = ["premium"]
-      }
-    })
-  }
-}
-```
-
-AWS parsea el `body` del mensaje SQS como JSON para evaluar el filtro. El valor `["premium"]` es una lista de valores aceptados (equivale a `order_type == "premium"`). Si el body no es JSON válido o no contiene el campo, el mensaje no coincide y se descarta.
-
-Se pueden definir múltiples `filter` dentro de un mismo `filter_criteria`: los filtros actúan como un OR lógico — un mensaje activa Lambda si coincide con **cualquiera** de los filtros.
-
-### Lambda Destinations: Destinos Post-Ejecución
-
-`aws_lambda_function_event_invoke_config` configura los destinos a los que Lambda envía el resultado de una invocación **asíncrona** (cuando el cliente invoca con `InvocationType = Event` y no espera respuesta). Lambda genera automáticamente un registro de invocación y lo envía al destino correspondiente:
-
-```hcl
-resource "aws_lambda_function_event_invoke_config" "processor" {
-  function_name = aws_lambda_function.processor.function_name
-
-  destination_config {
-    on_success {
-      destination = aws_sqs_queue.success.arn  # función retornó con éxito
-    }
-    on_failure {
-      destination = aws_sqs_queue.failure.arn  # función lanzó una excepción
-    }
-  }
-}
-```
-
-El registro enviado al destino incluye el input original, el output (o el error), metadatos de la invocación y el ARN de la función. Es más rico que una DLQ porque también captura los éxitos.
-
-> **Importante**: Las Lambda Destinations **no** se activan en el path de SQS Event Source Mapping, porque ese path usa invocación síncrona desde el servicio de SQS. Para el path de polling, los fallos se gestionan con la `redrive_policy` de la cola.
-
-### Dead Letter Queue y Política de Redrive
-
-La DLQ es el mecanismo de resiliencia para el path de **SQS Event Source Mapping**. Si Lambda lanza una excepción al procesar un mensaje, SQS lo reencola. Tras `maxReceiveCount` intentos fallidos, SQS mueve el mensaje a la DLQ automáticamente:
-
-```hcl
-resource "aws_sqs_queue" "dlq" {
-  name                      = "${var.project}-dlq"
-  message_retention_seconds = 1209600  # 14 días para análisis post-mortem
-}
-
-resource "aws_sqs_queue" "orders" {
-  name                       = "${var.project}-orders"
-  visibility_timeout_seconds = 30  # debe ser >= timeout de la función Lambda
-
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.dlq.arn
-    maxReceiveCount     = 3
-  })
-}
-```
-
-`visibility_timeout_seconds` es el tiempo durante el que un mensaje es invisible para otros consumidores después de ser recibido. Debe ser mayor o igual al timeout de Lambda para evitar que el mensaje vuelva a ser visible (y se reencole) mientras Lambda todavía lo está procesando.
-
-### IAM para Event Source Mapping
-
-Lambda necesita permisos explícitos para leer de SQS y para escribir en las colas de destino. El Event Source Mapping no se puede activar sin `sqs:ReceiveMessage`, `sqs:DeleteMessage` y `sqs:GetQueueAttributes` en la cola de origen:
-
-```hcl
-resource "aws_iam_role_policy" "sqs" {
-  name = "${var.project}-sqs-policy"
-  role = aws_iam_role.lambda.id
+resource "aws_ecr_lifecycle_policy" "app" {
+  repository = aws_ecr_repository.app.name
 
   policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
-        Resource = aws_sqs_queue.orders.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["sqs:SendMessage"]
-        Resource = [aws_sqs_queue.success.arn, aws_sqs_queue.failure.arn]
-      },
-    ]
+    rules = [{
+      rulePriority = 1
+      description  = "Mantener solo las 10 imagenes mas recientes"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
   })
 }
 ```
+
+### Definición de Tareas con jsonencode()
+
+`jsonencode()` convierte una estructura HCL nativa a JSON válido para la API de ECS. Frente a un heredoc (`<<EOF`), tiene dos ventajas clave: Terraform valida los tipos en tiempo de `plan` (no en `apply`) y los valores de otros recursos se pueden interpolar directamente sin manipulación de cadenas.
+
+```hcl
+resource "aws_ecs_task_definition" "api" {
+  family                   = "lab30-api"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"   # 0.25 vCPU
+  memory                   = "512"   # 0.5 GB
+
+  container_definitions = jsonencode([{
+    name  = "api"
+    image = var.container_image
+    cpu   = 256
+    memory = 512
+    # ...
+  }])
+}
+```
+
+En Fargate, `cpu` y `memory` se declaran a nivel de tarea (requerido) y opcionalmente a nivel de contenedor. Las combinaciones válidas están documentadas en la referencia de AWS ECS.
+
+### Inyección de Secretos desde SSM
+
+Almacenar secretos en código fuente o variables de entorno en texto plano es un riesgo de seguridad. El flujo correcto con ECS es:
+
+1. El secreto se almacena en SSM Parameter Store como `SecureString` (cifrado con KMS)
+2. La task definition referencia el ARN del parámetro en el bloque `secrets`
+3. El agente ECS descifra el valor con KMS **antes** de lanzar el contenedor
+4. El contenedor recibe el secreto como variable de entorno ya descifrada
+
+```hcl
+resource "aws_ssm_parameter" "api_key" {
+  name  = "/lab30/api-key"
+  type  = "SecureString"   # KMS cifra el valor en reposo con la clave aws/ssm
+  value = var.api_key
+}
+```
+
+En la task definition:
+
+```hcl
+secrets = [{
+  name      = "API_KEY"          # Nombre de la variable de entorno en el contenedor
+  valueFrom = aws_ssm_parameter.api_key.arn  # ARN del parámetro SSM
+}]
+```
+
+El rol de ejecución (`execution_role_arn`) necesita los permisos `ssm:GetParameters` y `kms:Decrypt` sobre el parámetro y la clave KMS correspondiente.
+
+En este laboratorio el mismo parámetro SSM se inyecta en **ambos** microservicios, pero cada uno lo usa de forma diferente:
+
+| Microservicio | Uso de `API_KEY` |
+|---|---|
+| **Web** | `startup.sh` lo incrusta en la config de nginx como `proxy_set_header X-API-Key "$API_KEY"` → se envía en cada petición al API |
+| **API** | `startup-api.sh` lo incrusta en el bloque `map{}` de nginx → valida el header `X-API-Key` en cada petición entrante |
+
+El secreto **nunca aparece en texto plano** en archivos de configuración estáticos ni en el estado de Terraform: el shell lo expande en tiempo de arranque del contenedor y nginx lo recibe ya como cadena literal.
+
+### Malla de Servicios con Service Connect
+
+Service Connect es la solución nativa de ECS para la comunicación entre microservicios. A diferencia de un ALB (que opera en capa 7 y tiene coste por hora), Service Connect usa un proxy Envoy que ECS inyecta automáticamente como sidecar en cada tarea.
+
+| Característica | Service Connect | ALB interno |
+|---|---|---|
+| Coste | Sin cargo adicional | $0.008/hora + datos |
+| Descubrimiento | DNS privado automático | Requiere target group |
+| Balanceo | Envoy (L7) por tarea | ALB entre todas las tareas |
+| Visibilidad | Métricas Envoy en CloudWatch | Métricas ALB en CloudWatch |
+| Uso típico | Comunicación este-oeste (microservicio→microservicio) | Tráfico norte-sur (usuario→API) |
+
+Para configurar un servicio como **servidor** (accesible por nombre DNS), se añade el bloque `service` dentro de `service_connect_configuration`. Para un servicio que solo **consume** otros servicios (cliente puro), basta con `enabled = true` y `namespace` sin bloque `service`.
+
+En este laboratorio, el microservicio **API** se registra como servidor en el puerto 8080:
+
+```hcl
+service_connect_configuration {
+  enabled   = true
+  namespace = aws_service_discovery_http_namespace.main.arn
+
+  service {
+    port_name      = "api-http"    # Debe coincidir con portMappings[].name
+    discovery_name = "api"         # DNS privado: http://api:8080
+
+    client_alias {
+      port     = 8080
+      dns_name = "api"
+    }
+  }
+}
+```
+
+El servicio **Web** también declara el bloque `service` (se registra como `web:80`) y actúa a la vez como **cliente** del API — su nginx hace `proxy_pass http://api:8080/` para enrutar las peticiones del navegador al microservicio API a través del proxy Envoy, sin exponer el puerto 8080 al exterior.
+
+El campo `port_name` debe coincidir exactamente con el campo `name` del `portMappings` en el `container_definitions`.
+
+### Deployment Circuit Breaker
+
+El Circuit Breaker de ECS monitoriza el estado de las nuevas tareas durante un despliegue. Si el porcentaje de fallos supera un umbral (tareas que no pasan al estado `RUNNING` o que fallan el health check), ECS considera el despliegue fallido.
+
+Con `rollback = true`, ECS activa automáticamente un nuevo despliegue usando la revisión anterior de la task definition, restaurando el servicio al último estado conocido bueno sin intervención manual.
+
+```hcl
+deployment_circuit_breaker {
+  enable   = true
+  rollback = true
+}
+```
+
+Sin el Circuit Breaker, un despliegue con un contenedor defectuoso (imagen incorrecta, error de configuración, secreto inválido) dejaría el servicio parcialmente degradado hasta que alguien interviniera manualmente.
 
 ---
 
@@ -155,93 +184,162 @@ resource "aws_iam_role_policy" "sqs" {
 
 ```
 lab-30/
+├── diagrama.drawio       # Fuente editable del diagrama de arquitectura
 ├── arch/
-│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg      # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
-│   ├── providers.tf          # Backend S3, Terraform >= 1.10, providers AWS y archive
-│   ├── variables.tf          # region, project, runtime, app_env
-│   ├── main.tf               # archive_file, SQS (x4), IAM, CloudWatch, Lambda,
-│   │                         # Lambda Destinations, Event Source Mapping
-│   ├── outputs.tf            # URLs de colas, function_name, log_group, comandos de ejemplo
-│   └── src/
-│       └── function/
-│           └── handler.py    # Handler: procesa lotes SQS e invocaciones async directas
+│   ├── aws.s3.tfbackend   # Parámetros del backend S3 (sin bucket)
+│   ├── providers.tf       # Backend S3, Terraform >= 1.10, provider AWS
+│   ├── variables.tf       # region, project, vpc_cidr, desired_count, container_image, api_key
+│   ├── main.tf            # VPC, ECR, SSM, IAM, ECS Cluster, 2 Task Definitions, 2 Servicios ECS
+│   ├── outputs.tf         # ECR URL, cluster, web/api service, SSM, namespace, logs
+│   ├── startup.sh         # Script de arranque del servicio Web: genera HTML + proxy_pass nginx
+│   └── startup-api.sh     # Script de arranque del microservicio API: genera JSON + nginx:8080
 └── localstack/
-    ├── providers.tf          # Endpoints apuntando a LocalStack (lambda, sqs, iam, logs)
-    ├── variables.tf          # Mismas variables, project = "lab30-local"
-    ├── main.tf               # Idéntico a aws/main.tf (filter_criteria y Destinations con soporte parcial)
+    ├── providers.tf       # Endpoints apuntando a LocalStack
+    ├── variables.tf       # Mismas variables, valores por defecto para entorno local
+    ├── main.tf            # Idéntico a aws/main.tf
     ├── outputs.tf
-    └── src/
-        └── function/
-            └── handler.py    # Copia idéntica a aws/src/
+    ├── startup.sh         # Copia de aws/startup.sh
+    └── startup-api.sh     # Copia de aws/startup-api.sh
 ```
-
-> **Nota**: `function.zip` es un artefacto generado por `archive_file` durante `terraform plan/apply`. No se versiona en Git — añádelo a `.gitignore`.
 
 ---
 
-## Despliegue en AWS Real.
+## Despliegue en AWS
 
 ### Arquitectura
 
-![SQS orders + Lambda async con filter_criteria + DLQ tras 3 reintentos + Lambda Destinations on_success/on_failure (solo en invocación async)](arch/diagrama.svg)
+![ECS Fargate web + api en subredes públicas, Service Connect HTTP namespace, SSM API_KEY inyectada como secret, ECR IMMUTABLE con lifecycle policy](arch/diagrama.svg)
 
-El productor encola mensajes en `orders`. El **Event Source Mapping** hace polling en batches de 10 con `filter_criteria` que descarta los mensajes que no son `order_type = premium` antes de invocar Lambda — invocación síncrona. Si el handler falla 3 veces sobre el mismo mensaje, la `redrive_policy` lo mueve a la **DLQ** (retención 14 días). El `aws_lambda_function_event_invoke_config` con `on_success → success` y `on_failure → failure` **solo dispara en invocaciones asíncronas** (`InvocationType = Event` desde S3, EventBridge, etc.). En caso de invocaciones mediante **Event Source Mapping** sólo se pueden crear `Destinations` para las invocaciones fallidas.
-
+Patrón sin ALB: las tareas Fargate viven en subredes públicas con `assign_public_ip = true` y exponen IP directamente. La comunicación interna **web → api** usa Service Connect sobre un `aws_service_discovery_http_namespace` — cada tarea lleva un sidecar Envoy que resuelve `api:8080` a las IPs de las tareas activas con load balancing y reintentos. El `aws_security_group.ecs` admite tcp/80 desde Internet y tcp/{80, 8080, 15000-15010} con `self = true` (Envoy interno). La clave compartida se guarda en `aws_ssm_parameter.api_key` (SecureString cifrado con `alias/aws/ssm`) y se inyecta en ambos servicios como `secrets.API_KEY` — el `execution_role` tiene permiso `ssm:GetParameters` + `kms:Decrypt`. El `deployment_circuit_breaker` con `rollback = true` revierte automáticamente despliegues fallidos a la task definition anterior.
 
 ### Código Terraform
 
 **`aws/main.tf`** — Fragmentos clave:
 
-La cola principal define la DLQ a través de `redrive_policy`. El `visibility_timeout_seconds` iguala el timeout de Lambda para evitar reprocesamientos accidentales:
+El laboratorio despliega **dos task definitions** que comparten la misma imagen base (`nginx:alpine`), el mismo secreto SSM y los mismos roles IAM, pero ejecutan scripts de arranque distintos y escuchan en puertos diferentes. El campo `command` pasa el contenido del script de arranque al contenedor mediante `file()`:
 
 ```hcl
-resource "aws_sqs_queue" "orders" {
-  name                       = "${var.project}-orders"
-  visibility_timeout_seconds = 30  # igual que el timeout de Lambda
+# Task definition del servicio Web (startup.sh: HTML + proxy_pass nginx en :80)
+resource "aws_ecs_task_definition" "web" {
+  family = "${var.project}-web"
+  # ...
+  container_definitions = jsonencode([{
+    name    = "web"
+    command = ["/bin/sh", "-c", file("${path.module}/startup.sh")]
 
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.dlq.arn
-    maxReceiveCount     = 3  # 3 intentos fallidos → DLQ
+    portMappings = [{
+      name          = "web-http"   # Referenciado por service_connect_configuration
+      containerPort = 80
+      appProtocol   = "http"
+    }]
+    # ...
+  }])
+}
+
+# Task definition del microservicio API (startup-api.sh: JSON en :8080)
+resource "aws_ecs_task_definition" "api" {
+  family = "${var.project}-api"
+  # ...
+  container_definitions = jsonencode([{
+    name    = "api"
+    command = ["/bin/sh", "-c", file("${path.module}/startup-api.sh")]
+
+    portMappings = [{
+      name          = "api-http"   # Referenciado por service_connect_configuration
+      containerPort = 8080
+      appProtocol   = "http"
+    }]
+    # ...
+  }])
+}
+```
+
+El secreto SSM se inyecta en **ambos** contenedores usando el mismo ARN. Un único parámetro `SecureString` puede ser referenciado por múltiples task definitions; el rol de ejecución compartido tiene el permiso `ssm:GetParameters` necesario:
+
+```hcl
+secrets = [{
+  name      = "API_KEY"
+  valueFrom = aws_ssm_parameter.api_key.arn
+}]
+```
+
+El rol de ejecución necesita un permiso adicional explícito para leer el `SecureString`. La política gestionada `AmazonECSTaskExecutionRolePolicy` no incluye acceso a parámetros SSM arbitrarios:
+
+```hcl
+resource "aws_iam_role_policy" "ssm_read" {
+  name = "${var.project}-ssm-read"
+  role = aws_iam_role.execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameters", "kms:Decrypt"]
+      Resource = [
+        aws_ssm_parameter.api_key.arn,
+        "arn:aws:kms:${var.region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"
+      ]
+    }]
   })
 }
 ```
 
-El `filter_criteria` usa `jsonencode()` para construir el patrón de filtro. El campo `body` es especial: AWS parsea el body del mensaje SQS como JSON para evaluar el filtro:
+**Generación dinámica de configuración nginx con autenticación por header**
 
-```hcl
-resource "aws_lambda_event_source_mapping" "orders" {
-  event_source_arn = aws_sqs_queue.orders.arn
-  function_name    = aws_lambda_function.processor.arn
-  batch_size       = 10
+El microservicio API valida la clave en cada petición usando el bloque `map{}` de nginx, cuyo valor real se incrusta en tiempo de arranque por el shell (`startup-api.sh`):
 
-  filter_criteria {
-    filter {
-      pattern = jsonencode({
-        body = {
-          order_type = ["premium"]
+```sh
+# En startup-api.sh: el shell expande $API_KEY → nginx recibe el valor literal
+cat > /etc/nginx/conf.d/default.conf << CONF
+map \$http_x_api_key \$auth_valid {
+    default    0;
+    "$API_KEY" 1;         # $API_KEY se expande aquí por el shell
+}
+
+server {
+    listen 8080;
+
+    location / {
+        if (\$auth_valid = 0) {
+            return 401 '{"error":"Unauthorized"}';
         }
-      })
+        root /usr/share/nginx/html;
+        try_files /index.json =404;
     }
-  }
+
+    # /health no requiere autenticación → necesario para el Circuit Breaker
+    location /health {
+        return 200 '{"status":"ok","service":"api"}';
+    }
+}
+CONF
+```
+
+El servicio Web incrusta la misma clave en el `proxy_pass` de `startup.sh`:
+
+```sh
+# En startup.sh: nginx adjunta X-API-Key en cada petición al microservicio API
+location /api-data {
+    proxy_pass         http://api:8080/;
+    proxy_set_header   X-API-Key "$API_KEY";   # $API_KEY expande el shell
+    proxy_read_timeout 5s;
 }
 ```
 
-Las Lambda Destinations se configuran en un recurso separado, no como argumento de `aws_lambda_function`. Esto permite modificarlas sin redesplegar la función:
+> **Por qué `map{}` y no `if` directamente en `location`**: `map{}` debe estar en el contexto `http{}`, que es donde nginx:alpine incluye los archivos de `/etc/nginx/conf.d/`. Evalúa la condición una sola vez por petición y es más eficiente que múltiples bloques `if`.
+
+El security group permite puerto 80 desde Internet (para el servicio Web) y puertos 80 y 8080 entre tareas del mismo grupo (`self = true`) para que Service Connect pueda enrutar el tráfico interno:
 
 ```hcl
-resource "aws_lambda_function_event_invoke_config" "processor" {
-  function_name = aws_lambda_function.processor.function_name
-
-  destination_config {
-    on_success {
-      destination = aws_sqs_queue.success.arn
-    }
-    on_failure {
-      destination = aws_sqs_queue.failure.arn
-    }
-  }
+resource "aws_security_group" "ecs" {
+  # Puerto 80 desde Internet → servicio Web accesible por el navegador
+  ingress { from_port = 80,   cidr_blocks = ["0.0.0.0/0"] }
+  # Tráfico interno entre tareas (Service Connect)
+  ingress { from_port = 80,   self = true }
+  ingress { from_port = 8080, self = true }
+  ingress { from_port = 15000, to_port = 15010, self = true }  # Envoy
 }
 ```
 
@@ -263,418 +361,662 @@ terraform apply
 Al finalizar, los outputs mostrarán:
 
 ```
-dlq_url                      = "https://sqs.us-east-1.amazonaws.com/123456789/lab30-dlq"
-failure_queue_url             = "https://sqs.us-east-1.amazonaws.com/123456789/lab30-failure"
-function_arn                  = "arn:aws:lambda:us-east-1:123456789:function:lab30-processor"
-function_name                 = "lab30-processor"
-invoke_async_failure_example  = "aws lambda invoke --function-name lab30-processor ..."
-invoke_async_success_example  = "aws lambda invoke --function-name lab30-processor ..."
-log_group                     = "/aws/lambda/lab30-processor"
-orders_queue_arn              = "arn:aws:sqs:us-east-1:123456789:lab30-orders"
-orders_queue_url              = "https://sqs.us-east-1.amazonaws.com/123456789/lab30-orders"
-send_premium_example          = "aws sqs send-message --queue-url ... --message-body ..."
-send_standard_example         = "aws sqs send-message --queue-url ... --message-body ..."
-success_queue_url             = "https://sqs.us-east-1.amazonaws.com/123456789/lab30-success"
+api_log_group             = "/ecs/lab30/api"
+api_service_name          = "lab30-api"
+api_task_definition_arn   = "arn:aws:ecs:us-east-1:...:task-definition/lab30-api:1"
+docker_login_cmd          = "aws ecr get-login-password --region us-east-1 | docker login ..."
+ecr_repository_url        = "123456789.dkr.ecr.us-east-1.amazonaws.com/lab30/api"
+ecs_cluster_name          = "lab30-cluster"
+service_connect_namespace = "lab30"
+ssm_parameter_name        = "/lab30/api-key"
+web_log_group             = "/ecs/lab30/web"
+web_service_name          = "lab30-web"
+web_task_definition_arn   = "arn:aws:ecs:us-east-1:...:task-definition/lab30-web:1"
 ```
 
-### Verificar el sistema
+### Verificar los servicios y el flujo Web→API
 
-**Paso 1** — Envía una orden premium y observa cómo Lambda la procesa:
+**Paso 1** — Comprueba que ambos servicios están estables:
 
 ```bash
-ORDERS_URL=$(terraform output -raw orders_queue_url)
-
-aws sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_id":"ORD-001","order_type":"premium","amount":299.99,"customer":"cliente-test"}'
+aws ecs describe-services \
+  --cluster lab30-cluster \
+  --services lab30-web lab30-api \
+  --query 'services[].{Nombre:serviceName,Estado:status,Deseadas:desiredCount,Corriendo:runningCount}' \
+  --output table
 ```
 
-Espera unos segundos (Lambda pollea periódicamente) y verifica los logs:
+Espera hasta que `runningCount = desiredCount` en ambos servicios (1-2 minutos la primera vez).
+
+**Paso 2** — Obtén la IP pública de una tarea Web y abre la página en el navegador:
 
 ```bash
-LOG_GROUP=$(terraform output -raw log_group)
-aws logs tail "$LOG_GROUP" --follow --format short
+WEB_TASK=$(aws ecs list-tasks \
+  --cluster lab30-cluster --service-name lab30-web \
+  --query 'taskArns[0]' --output text)
+
+# En Fargate (awsvpc), todos los contenedores comparten la misma ENI e IP
+PRIVATE_IP=$(aws ecs describe-tasks \
+  --cluster lab30-cluster --tasks "$WEB_TASK" \
+  --query 'tasks[0].containers[0].networkInterfaces[0].privateIpv4Address' \
+  --output text)
+
+# La IP pública se obtiene desde EC2 filtrando por IP privada
+WEB_IP=$(aws ec2 describe-network-interfaces \
+  --filters "Name=private-ip-address,Values=$PRIVATE_IP" \
+  --query 'NetworkInterfaces[0].Association.PublicIp' \
+  --output text)
+
+echo "http://$WEB_IP/"
 ```
 
-Deberías ver algo como:
-```
-Procesando orden order_id=ORD-001 order_type=premium amount=299.99
-[SQS] Batch completado: 1 órdenes procesadas — env=production project=lab30
-```
+Abre la URL en el navegador. Verás la página con dos tarjetas:
+- **Tarjeta izquierda (cyan)** — datos de la tarea Web: Task ID, Cluster, Family/Revision, Región, API Key enmascarada
+- **Tarjeta derecha (morado)** — datos del microservicio API cargados vía `fetch('/api-data')`, actualizándose cada 15 segundos
 
-**Paso 2** — Verifica que filter_criteria descarta órdenes estándar:
+> Recarga la página varias veces. El Task ID de la tarjeta API puede cambiar: Service Connect hace round-robin entre las 2 tareas del servicio API, demostrando el balanceo interno sin ALB.
+
+**Paso 3** — Verifica el flujo Service Connect desde el interior del contenedor Web:
 
 ```bash
-# Esta orden NO debería activar Lambda (order_type = "standard")
-aws sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_id":"ORD-002","order_type":"standard","amount":49.99}'
-
-# Espera y comprueba que la cola de órdenes queda vacía (mensaje descartado)
-aws sqs get-queue-attributes \
-  --queue-url "$ORDERS_URL" \
-  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+aws ecs execute-command \
+  --cluster lab30-cluster \
+  --task "$WEB_TASK" \
+  --container web \
+  --interactive \
+  --command "/bin/sh"
 ```
 
-**Paso 3** — Prueba la DLQ con un mensaje que falla sistemáticamente:
+Dentro del contenedor:
+
+```sh
+# Comprueba que API_KEY fue inyectada desde SSM
+echo $API_KEY
+
+# Sin header → el API devuelve 401 Unauthorized
+wget -qO- http://api:8080/ 2>&1
+# wget: server returned error: HTTP/1.1 401 Unauthorized
+
+# Con header correcto → respuesta JSON con metadatos de la tarea API
+wget -qO- --header "X-API-Key: $API_KEY" http://api:8080/
+# {"service":"api","task_id":"...","cluster":"lab30-cluster",...}
+
+# /health siempre responde 200, sin autenticación (necesario para Circuit Breaker)
+wget -qO- http://api:8080/health
+# {"status":"ok","service":"api"}
+
+exit
+```
+
+> Si `execute-command` falla con "The execute command failed", asegúrate de que el servicio tiene `enable_execute_command = true` y que el rol de tarea tiene los permisos `ssmmessages:*`. Puede tardar 1-2 minutos después del `apply`.
+
+**Paso 4** — Verifica los logs de ambos servicios y del proxy Envoy:
 
 ```bash
-# amount > 9999 → handler lanza ValueError → 3 reintentos → DLQ
-aws sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_id":"ORD-FAIL","order_type":"premium","amount":99999.99}'
+# Logs del servicio Web
+aws logs tail /ecs/lab30/web --log-stream-name-prefix web/ --follow
+
+# Logs del microservicio API
+aws logs tail /ecs/lab30/api --log-stream-name-prefix api/ --follow
+
+# Logs del proxy Envoy del servicio Web (registra cada proxy_pass a la API)
+aws logs tail /ecs/lab30/web --log-stream-name-prefix service-connect-web/ --follow
 ```
 
-Tras unos minutos (3 intentos × visibility_timeout), el mensaje aparecerá en la DLQ:
+### Verificar ECR y la política de limpieza
+
+**Paso 1** — Autentica Docker contra ECR:
 
 ```bash
-DLQ_URL=$(terraform output -raw dlq_url)
-aws sqs receive-message \
-  --queue-url "$DLQ_URL" \
-  --max-number-of-messages 10 \
-  --query 'Messages[*].Body'
+ECR_URL=$(terraform output -raw ecr_repository_url)
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin "$ECR_URL"
 ```
 
-**Paso 4** — Inspecciona el Event Source Mapping y su estado:
+**Paso 2** — Intenta hacer push de dos imágenes **distintas** con la misma etiqueta para comprobar IMMUTABLE:
 
 ```bash
-FUNCTION=$(terraform output -raw function_name)
+# Push de nginx:alpine como v1.0.0
+docker pull nginx:alpine
+docker tag nginx:alpine "$ECR_URL:v1.0.0"
+docker push "$ECR_URL:v1.0.0"
 
-aws lambda list-event-source-mappings \
-  --function-name "$FUNCTION" \
-  --query 'EventSourceMappings[*].{UUID:UUID,Estado:State,BatchSize:BatchSize,Filtros:FilterCriteria}'
+# Intenta sobreescribir v1.0.0 con una imagen diferente — debe fallar
+# (usar la misma imagen no genera error porque Docker omite el push al detectar digest idéntico)
+docker pull nginx:stable-alpine
+docker tag nginx:stable-alpine "$ECR_URL:v1.0.0"
+docker push "$ECR_URL:v1.0.0"
+# Error: tag invalid: The image tag 'v1.0.0' already exists in the 'lab30/api' repository
+#        and cannot be overwritten because the repository is immutable.
 ```
 
-**Paso 5** — Demuestra Lambda Destinations con invocación asíncrona:
+**Paso 3** — Confirma la política de limpieza activa:
 
 ```bash
-# Invocación exitosa → debería llegar a success-queue
-terraform output -raw invoke_async_success_example | bash
-
-# Invocación fallida (amount > 9999) → debería llegar a failure-queue
-terraform output -raw invoke_async_failure_example | bash
-
-# Espera unos segundos y verifica las colas de destino
-SUCCESS_URL=$(terraform output -raw success_queue_url)
-FAILURE_URL=$(terraform output -raw failure_queue_url)
-
-aws sqs receive-message \
-  --queue-url "$SUCCESS_URL" \
-  --max-number-of-messages 5 \
-  --query 'Messages[*].Body' | python3 -m json.tool
-
-aws sqs receive-message \
-  --queue-url "$FAILURE_URL" \
-  --max-number-of-messages 5 \
-  --query 'Messages[*].Body' | python3 -m json.tool
+aws ecr get-lifecycle-policy --repository-name lab30/api \
+  --query 'lifecyclePolicyText' --output text | python3 -m json.tool
 ```
 
-El mensaje en `success_queue` tendrá la forma:
-```json
-{
-  "version": "1.0",
-  "timestamp": "2025-01-15T10:30:00.000Z",
-  "requestContext": { "functionArn": "...", "requestId": "..." },
-  "requestPayload": { "order_id": "ASYNC-001", ... },
-  "responseContext": { "statusCode": 200 },
-  "responsePayload": { "order_id": "ASYNC-001", "status": "processed", ... }
-}
-```
+### Demostrar el Deployment Circuit Breaker
 
-### Forzar redeploy con source_code_hash
+Provoca un despliegue fallido cambiando la imagen a una que no existe para observar el rollback automático.
 
-Modifica el handler y verifica que Terraform detecta el cambio:
+**Paso 1** — Despliega una imagen inexistente:
 
 ```bash
-# Añade un campo "version" al resultado del handler
-# Edita src/function/handler.py y añade "lab_version": "1.1" en el return de _process_order
-
-terraform plan
-# ~ source_code_hash = "aBcDe..." -> "XyZwV..."
-
-terraform apply
-
-# Verifica que el nuevo código se ejecuta
-aws sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_id":"ORD-v2","order_type":"premium","amount":99.99}'
-
-aws logs tail "$LOG_GROUP" --format short
+terraform apply -var="container_image=nginx:esta-etiqueta-no-existe-abc123"
 ```
+
+Terraform registrará el cambio en la task definition y ECS intentará lanzar las nuevas tareas.
+
+> **Tiempo hasta activación**: el Circuit Breaker necesita al menos **3 tareas fallidas** (hasta un máximo de 10) con un 50 % de tasa de fallo. Con una imagen inexistente (`ImagePullBackOff`), cada tarea falla en segundos, por lo que el breaker se activa en **3-5 minutos**. Con fallos por health check timeout el proceso puede tardar hasta 15 minutos.
+
+**Paso 2** — Monitoriza ambos servicios en otra terminal (el Circuit Breaker afecta a los dos):
+
+```bash
+watch -n 10 "aws ecs describe-services \
+  --cluster lab30-cluster \
+  --services lab30-web lab30-api \
+  --query 'services[].{Nombre:serviceName,Deployments:length(deployments),Corriendo:runningCount,Fallidas:deployments[0].failedTasks}' \
+  --output table"
+```
+
+**Paso 3** — Comprueba el estado del deployment y los eventos:
+
+```bash
+# Estado del deployment — cuando el Circuit Breaker dispara, rolloutState = FAILED
+aws ecs describe-services \
+  --cluster lab30-cluster \
+  --services lab30-web \
+  --query 'services[0].deployments[*].{ID:id,Estado:rolloutState,Corriendo:runningCount,Fallidas:failedTasks}' \
+  --output table
+
+# Eventos recientes (los más recientes primero)
+aws ecs describe-services \
+  --cluster lab30-cluster \
+  --services lab30-web \
+  --query 'services[0].events[:10].{Tiempo:createdAt,Mensaje:message}' \
+  --output table
+```
+
+> El Circuit Breaker necesita **al menos 3 tareas fallidas** con una tasa de fallo ≥ 50 %. Con `CannotPullContainerError` (imagen inexistente) cada intento falla en segundos, pero ECS introduce esperas entre reintentos — espera **8-12 minutos** hasta que `rolloutState` cambie a `FAILED`.
+
+Cuando el Circuit Breaker dispara verás en los eventos (orden cronológico inverso):
+
+```
+(service lab30-web) has reached a steady state.
+(service lab30-web) (deployment ecs-svc/AAA) deployment completed.
+(service lab30-web) rolling back to deployment ecs-svc/AAA.
+(service lab30-web) (deployment ecs-svc/BBB) deployment failed: tasks failed to start.
+```
+
+`BBB` es el deployment fallido (imagen inexistente) y `AAA` es el deployment anterior bueno al que ECS revierte automáticamente.
+
+> El rollback es automático — no es necesario hacer nada. Sin embargo, el estado de Terraform ha quedado desincronizado (Terraform cree que la imagen es `nginx:esta-etiqueta-no-existe-abc123`). Ejecuta `terraform apply` sin `-var` para reconciliar el estado con la configuración real:
+>
+> ```bash
+> terraform apply
+> ```
 
 ---
 
-> **Antes de comenzar los retos**, asegúrate de que `terraform apply` ha completado sin errores y de que enviando un mensaje premium a la cola de órdenes Lambda lo procesa correctamente (verifica los logs).
+> **Antes de comenzar los retos**, asegúrate de que todos los cambios de `main.tf` están aplicados y el servicio tiene `runningCount = desiredCount`. Si hay un despliegue en curso, espera a que complete.
 
 ## Verificación final
 
 ```bash
-# Verificar las 4 colas SQS creadas (orders, dlq, success, failure)
-aws sqs list-queues \
-  --query 'QueueUrls[?contains(@,`lab30`)]' --output table
+CLUSTER=$(terraform output -raw ecs_cluster_name)
+WEB_SERVICE=$(terraform output -raw web_service_name)
+API_SERVICE=$(terraform output -raw api_service_name)
 
-# Enviar un mensaje de prueba a la cola de órdenes
-ORDERS_URL=$(terraform output -raw orders_queue_url)
-aws sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_type":"premium","order_id":"test-001","amount":99.99}'
+# Verificar que ambos servicios ECS están en RUNNING
+aws ecs describe-services \
+  --cluster "$CLUSTER" \
+  --services "$WEB_SERVICE" "$API_SERVICE" \
+  --query 'services[*].{Name:serviceName,Status:status,Desired:desiredCount,Running:runningCount}' \
+  --output table
 
-# Verificar que Lambda procesó el mensaje (ver logs)
-aws logs tail "$(terraform output -raw log_group)" --since 5m
+# Probar el servicio Web vía la IP pública de una de sus tareas
+WEB_TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$WEB_SERVICE" --query 'taskArns[0]' --output text)
+PRIVATE_IP=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$WEB_TASK" \
+  --query 'tasks[0].containers[0].networkInterfaces[0].privateIpv4Address' --output text)
+WEB_IP=$(aws ec2 describe-network-interfaces \
+  --filters "Name=private-ip-address,Values=$PRIVATE_IP" \
+  --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
 
-# Comprobar que la DLQ está vacía (no hay mensajes fallidos)
-DLQ_URL=$(terraform output -raw dlq_url)
-aws sqs get-queue-attributes \
-  --queue-url "$DLQ_URL" \
-  --attribute-names ApproximateNumberOfMessages \
-  --query 'Attributes.ApproximateNumberOfMessages'
-# Esperado: "0"
+curl -s "http://${WEB_IP}/" | head -20
+# Esperado: HTML con las dos tarjetas (Web + API via Service Connect)
+
+curl -s "http://${WEB_IP}/api-data"
+# Esperado: JSON del microservicio API (proxy_pass + X-API-Key)
+
+# Comprobar que el parámetro SSM está correctamente configurado
+aws ssm get-parameter \
+  --name "$(terraform output -raw ssm_parameter_name)" \
+  --with-decryption \
+  --query 'Parameter.{Name:Name,Type:Type}' \
+  --output table
 ```
 
 ---
 
 ## Retos
 
-### Reto 1 — Alarma en la Dead Letter Queue
+### Reto 1 — Microservicio Worker como Cliente Puro de Service Connect
 
-En producción, los mensajes que llegan a la DLQ indican fallos que requieren atención. Sin una alarma, estos mensajes pueden acumularse días sin ser detectados. El objetivo de este reto es configurar un mecanismo de alerta temprana sobre la DLQ.
+Ya existen dos servicios: `web` (servidor en puerto 80) y `api` (servidor en puerto 8080). Añade un tercer microservicio `worker` que actúe como **cliente puro** de Service Connect: consume el endpoint `http://api:8080` sin necesitar registrar un nombre DNS propio, lo que demuestra la diferencia entre servidor y cliente en la malla de servicios.
 
 **Requisitos**
 
-1. Crea un recurso `aws_cloudwatch_metric_alarm` que se active cuando `ApproximateNumberOfMessagesVisible` en la DLQ sea `>= 1`.
-   - `alarm_name`: `"${var.project}-dlq-not-empty"`
-   - `namespace`: `"AWS/SQS"`
-   - `metric_name`: `"ApproximateNumberOfMessagesVisible"`
-   - `dimensions`: `{ QueueName = aws_sqs_queue.dlq.name }`
-   - `period`: `60` segundos
-   - `evaluation_periods`: `1`
-   - `statistic`: `"Sum"`
-   - `comparison_operator`: `"GreaterThanOrEqualToThreshold"`
-   - `threshold`: `1`
-2. Añade un output `dlq_alarm_name` con el nombre de la alarma.
+1. Crea un archivo `worker.tf` en `aws/` con los siguientes recursos:
+   - `aws_cloudwatch_log_group` para `/ecs/lab30/worker`
+   - `aws_ecs_task_definition` para la tarea worker (misma imagen, cpu=256, memory=512)
+   - `aws_ecs_service` para el servicio worker con `desired_count = 1`
+2. El servicio worker debe tener Service Connect **activado como cliente puro** (`enabled = true` y `namespace`, **sin bloque `service {}`** — no necesita nombre DNS propio).
+3. Añade la variable de entorno `API_URL = "http://api:8080"` en el contenedor para documentar la dependencia.
+4. Usa el mismo Security Group (`aws_security_group.ecs`) y subredes públicas que los demás servicios.
+5. Añade el output `worker_service_name` en `outputs.tf`.
 
 **Criterios de éxito**
 
-- `aws cloudwatch describe-alarms --alarm-names "${var.project}-dlq-not-empty"` muestra la alarma en estado `OK` o `ALARM`.
-- Si envías un mensaje que falla sistemáticamente (amount > 9999) y esperas a que llegue a la DLQ, la alarma pasa al estado `ALARM`.
-- Puedes explicar la diferencia entre `period` (ventana de evaluación) y `evaluation_periods` (cuántas ventanas consecutivas deben cumplir la condición).
+- `terraform plan` no modifica los servicios `web` ni `api` existentes — solo añade los recursos del worker.
+- `aws ecs describe-services --cluster lab30-cluster --services lab30-worker` muestra el servicio activo.
+- Desde el contenedor worker (`execute-command`), `wget -qO- http://api:8080/health` devuelve `{"status":"ok"}`.
+- Puedes explicar por qué el worker no necesita el bloque `service {}` dentro de `service_connect_configuration`.
 
-### Reto 2 — Fallos Parciales de Lote (report_batch_item_failures)
+### Reto 2 — ALB para Acceso Externo con Subredes Privadas
 
-Actualmente, si un lote de 10 mensajes contiene 1 mensaje inválido, Lambda lanza una excepción y los 10 mensajes se reencolan. Esto provoca que 9 mensajes válidos se procesen hasta 3 veces antes de que el inválido llegue a la DLQ. `report_batch_item_failures` permite que Lambda reporte exactamente qué mensajes fallaron, para que solo esos se reencolen.
+Service Connect es excelente para comunicación **este-oeste** (entre microservicios), pero los usuarios externos necesitan acceder al servicio a través de Internet. La arquitectura de producción correcta coloca el ALB en subredes públicas y las tareas ECS en subredes **privadas**: las tareas no tienen IP pública y solo son alcanzables desde el ALB, no desde Internet directamente.
 
-### Requisitos
-
-1. Activa `function_response_types = ["ReportBatchItemFailures"]` en `aws_lambda_event_source_mapping`.
-2. Modifica el handler para que, en lugar de lanzar una excepción al fallar un mensaje, capture el error y construya una respuesta de `batchItemFailures`:
-
-```python
-def lambda_handler(event, context):
-    failures = []
-    for record in event["Records"]:
-        try:
-            body = json.loads(record["body"])
-            _process_order(body)
-        except Exception as e:
-            logger.error("Fallo en mensaje %s: %s", record["messageId"], e)
-            failures.append({"itemIdentifier": record["messageId"]})
-
-    return {"batchItemFailures": failures}
+```
+Internet → ALB (subred pública) → Tareas Web (subred privada) → API (subred privada)
+                                        ↑
+                               NAT Gateway (salida a Internet para pull de imágenes)
 ```
 
-3. Verifica que, con un lote mixto (un mensaje inválido + varios válidos), solo el inválido se reencola y eventualmente llega a la DLQ, mientras los válidos se procesan una sola vez.
+**Requisitos**
+
+1. Crea un archivo `alb.tf` en `aws/` con los siguientes recursos:
+   - Subredes privadas (una por AZ) con su tabla de rutas apuntando al NAT Gateway
+   - `aws_eip` + `aws_nat_gateway` en una de las subredes públicas existentes
+   - `aws_security_group` para el ALB (acepta HTTP en el puerto 80 desde `0.0.0.0/0`)
+   - `aws_lb` de tipo `application` en las subredes **públicas**
+   - `aws_lb_target_group` con `target_type = "ip"` y health check al puerto 80
+   - `aws_lb_listener` en el puerto 80 que reenvíe al target group
+2. Modifica `aws_ecs_service.web` en `main.tf`:
+   - Cambia `subnets` a las nuevas subredes privadas
+   - Cambia `assign_public_ip` a `false`
+   - Añade el bloque `load_balancer`
+3. Actualiza el security group `ecs`: reemplaza la regla de puerto 80 desde `0.0.0.0/0` por una regla que solo admita tráfico desde el security group del ALB (`security_groups = [aws_security_group.alb.id]`).
+4. Añade a `outputs.tf` el output `alb_url` con la URL pública del ALB.
 
 **Criterios de éxito**
 
-- `aws lambda list-event-source-mappings` muestra `FunctionResponseTypes: ["ReportBatchItemFailures"]` en el mapping.
-- Enviando un lote mixto (puedes enviar varios mensajes rapidamente), los mensajes válidos aparecen procesados en los logs exactamente una vez.
-- El mensaje inválido aparece en la DLQ tras `maxReceiveCount` reintentos.
-- Puedes explicar por qué sin `report_batch_item_failures` el procesamiento de duplicados puede disparar costes inesperados en colas de alto volumen.
+- `terraform apply` completa sin errores.
+- `curl $(terraform output -raw alb_url)` devuelve la página HTML con las dos tarjetas.
+- La tarjeta de la API sigue funcionando (el ALB enruta a la tarea Web que internamente llama al API via Service Connect).
+- Las tareas Web **no tienen IP pública** (`assign_public_ip = false`): solo son accesibles a través del ALB.
+- Puedes explicar por qué `target_type = "ip"` es obligatorio para Fargate (y no `instance`) y por qué el NAT Gateway es necesario en subredes privadas.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Alarma en la Dead Letter Queue</strong></summary>
+<summary><strong>Solución al Reto 1 — Microservicio Worker como Cliente Puro de Service Connect</strong></summary>
 
-### Solución al Reto 1 — Alarma en la Dead Letter Queue
+### Solución al Reto 1 — Microservicio Worker como Cliente Puro de Service Connect
 
-Añade el recurso `aws_cloudwatch_metric_alarm` en `main.tf`:
+Crea el archivo `aws/worker.tf`:
 
 ```hcl
-resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
-  alarm_name          = "${var.project}-dlq-not-empty"
-  alarm_description   = "La DLQ tiene mensajes — revisar fallos de procesamiento"
-  namespace           = "AWS/SQS"
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  dimensions          = { QueueName = aws_sqs_queue.dlq.name }
-  period              = 60
-  evaluation_periods  = 1
-  statistic           = "Sum"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
+resource "aws_cloudwatch_log_group" "worker" {
+  name              = "/ecs/${var.project}/worker"
+  retention_in_days = 7
+  tags              = local.tags
+}
 
-  tags = local.tags
+resource "aws_ecs_task_definition" "worker" {
+  family                   = "${var.project}-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+
+  execution_role_arn = aws_iam_role.execution.arn
+  task_role_arn      = aws_iam_role.task.arn
+
+  container_definitions = jsonencode([{
+    name      = "worker"
+    image     = var.container_image
+    essential = true
+    cpu       = 256
+    memory    = 512
+
+    # El worker no expone puertos propios; solo consume el servicio "api".
+    # No se declaran portMappings porque Service Connect no necesita registrarlo.
+    environment = [
+      { name = "APP_ENV",  value = "production" },
+      # URL interna al microservicio API via Service Connect:
+      { name = "API_URL",  value = "http://api:8080" }
+    ]
+
+    secrets = [{
+      name      = "API_KEY"
+      valueFrom = aws_ssm_parameter.api_key.arn
+    }]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.worker.name
+        "awslogs-region"        = var.region
+        "awslogs-stream-prefix" = "worker"
+      }
+    }
+  }])
+
+  tags = merge(local.tags, { Name = "${var.project}-worker-task-def" })
+}
+
+resource "aws_ecs_service" "worker" {
+  name            = "${var.project}-worker"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.worker.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  enable_execute_command = true
+
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.ecs.id]
+    assign_public_ip = true
+  }
+
+  # Cliente Service Connect: solo necesita enabled = true y el namespace.
+  # Sin bloque service {}: este microservicio NO se registra con nombre DNS propio.
+  # ECS aún inyecta el proxy Envoy para que el worker pueda RESOLVER "api:80".
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_http_namespace.main.arn
+  }
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
+
+  depends_on = [
+    aws_iam_role_policy_attachment.execution_basic,
+    aws_iam_role_policy.ssm_read,
+  ]
+
+  tags = merge(local.tags, { Name = "${var.project}-worker-service" })
 }
 ```
 
-Añade el output en `outputs.tf`:
+Añade a `outputs.tf`:
 
 ```hcl
-output "dlq_alarm_name" {
-  description = "Nombre de la alarma CloudWatch sobre la DLQ"
-  value       = aws_cloudwatch_metric_alarm.dlq_not_empty.alarm_name
+output "worker_service_name" {
+  description = "Nombre del servicio ECS worker"
+  value       = aws_ecs_service.worker.name
 }
 ```
 
-Verifica el estado de la alarma:
+El worker no incluye el bloque `service {}` porque no necesita ser **descubierto** por nadie — solo necesita **descubrir** al servicio `api`. El proxy Envoy inyectado por ECS resuelve `api:8080` consultando el namespace Cloud Map sin necesidad de declararlo explícitamente.
+
+**Verificación del microservicio worker**
+
+**Paso 1** — Comprueba que el servicio arrancó correctamente:
 
 ```bash
-aws cloudwatch describe-alarms \
-  --alarm-names "$(terraform output -raw dlq_alarm_name)" \
-  --query 'MetricAlarms[0].{Estado:StateValue,Razon:StateReason}'
+aws ecs describe-services \
+  --cluster lab30-cluster \
+  --services lab30-worker \
+  --query 'services[0].{Estado:status,Deseadas:desiredCount,Corriendo:runningCount,Deployment:deployments[0].rolloutState}' \
+  --output table
 ```
 
-Justo después del `terraform apply`, la alarma muestra `INSUFFICIENT_DATA` con razón `"Unchecked: Initial alarm creation"`. Es el estado inicial normal: CloudWatch aún no tiene datos de la métrica `ApproximateNumberOfMessagesVisible` para ese `period`. Tras el primer ciclo de evaluación (60 segundos), transitará a `OK` si la DLQ está vacía.
+Espera hasta que `runningCount = 1` y `rolloutState = COMPLETED`.
 
-`treat_missing_data = "notBreaching"` es lo que evita que esa ausencia inicial de datos se interprete como un fallo y dispare la alarma prematuramente.
+**Paso 2** — Obtén el ARN de la tarea worker y abre una shell interactiva:
+
+```bash
+WORKER_TASK=$(aws ecs list-tasks \
+  --cluster lab30-cluster --service-name lab30-worker \
+  --query 'taskArns[0]' --output text)
+
+aws ecs execute-command \
+  --cluster lab30-cluster \
+  --task "$WORKER_TASK" \
+  --container worker \
+  --interactive \
+  --command "/bin/sh"
+```
+
+**Paso 3** — Desde dentro del contenedor, prueba la conectividad Service Connect:
+
+```sh
+# /health no requiere autenticación — verifica que Service Connect resuelve "api"
+wget -qO- http://api:8080/health
+# {"status":"ok","service":"api"}
+
+# GET / requiere X-API-Key — sin header devuelve 401
+wget -qO- http://api:8080/ 2>&1
+# wget: server returned error: HTTP/1.1 401 Unauthorized
+
+# Con la clave inyectada desde SSM devuelve los metadatos de la tarea API
+wget -qO- --header "X-API-Key: $API_KEY" http://api:8080/
+# {"service":"api","task_id":"...","cluster":"lab30-cluster",...}
+
+exit
+```
+
+**Paso 4** — Verifica los logs del worker:
+
+```bash
+aws logs tail /ecs/lab30/worker --log-stream-name-prefix worker/ --follow
+```
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Fallos Parciales de Lote</strong></summary>
+<summary><strong>Solución al Reto 2 — ALB para Acceso Externo con Subredes Privadas</strong></summary>
 
-### Solución al Reto 2 — Fallos Parciales de Lote
+### Solución al Reto 2 — ALB para Acceso Externo con Subredes Privadas
 
-**Terraform** — actualiza `aws_lambda_event_source_mapping` en `main.tf`:
+Crea el archivo `aws/alb.tf`:
 
 ```hcl
-resource "aws_lambda_event_source_mapping" "orders" {
-  event_source_arn        = aws_sqs_queue.orders.arn
-  function_name           = aws_lambda_function.processor.arn
-  batch_size              = 10
-  enabled                 = true
-  function_response_types = ["ReportBatchItemFailures"]
+# ── Subredes privadas ─────────────────────────────────────────────────────────
+# Las tareas ECS se mueven aquí: sin IP pública, solo accesibles desde el ALB.
+# Usamos los CIDRs x.x.10.x, x.x.11.x (distintos de los públicos x.x.1.x, x.x.2.x).
 
-  filter_criteria {
-    filter {
-      pattern = jsonencode({
-        body = { order_type = ["premium"] }
-      })
-    }
+locals {
+  private_cidrs = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 10)]
+}
+
+resource "aws_subnet" "private" {
+  count             = length(local.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = local.private_cidrs[count.index]
+  availability_zone = local.azs[count.index]
+
+  tags = merge(local.tags, { Name = "${var.project}-private-${local.azs[count.index]}" })
+}
+
+# ── NAT Gateway ───────────────────────────────────────────────────────────────
+# Las tareas en subredes privadas necesitan salida a Internet para hacer pull
+# de imágenes (Docker Hub / ECR público). El NAT Gateway vive en la subred
+# pública y enruta el tráfico de salida en nombre de las tareas privadas.
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = merge(local.tags, { Name = "${var.project}-nat-eip" })
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id   # NAT Gateway en subred pública
+  tags          = merge(local.tags, { Name = "${var.project}-nat" })
+  depends_on    = [aws_internet_gateway.main]
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-private-rt" })
+}
+
+resource "aws_route_table_association" "private" {
+  count          = length(aws_subnet.private)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+# ── Security Group del ALB ────────────────────────────────────────────────────
+
+resource "aws_security_group" "alb" {
+  name        = "${var.project}-alb-sg"
+  description = "Permite trafico HTTP desde Internet al ALB"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "HTTP desde Internet"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-alb-sg" })
+}
+
+# ── ALB en subredes públicas ──────────────────────────────────────────────────
+
+resource "aws_lb" "main" {
+  name               = "${var.project}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id   # ALB siempre en subred pública
+
+  tags = merge(local.tags, { Name = "${var.project}-alb" })
+}
+
+# target_type = "ip" es OBLIGATORIO para Fargate con network_mode = "awsvpc".
+# En awsvpc, cada tarea tiene su propia ENI con IP propia. El ALB se conecta
+# directamente a esa IP, no a la IP de un servidor EC2 como en el modo "instance".
+resource "aws_lb_target_group" "web" {
+  name        = "${var.project}-web-tg"
+  port        = 80
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.main.id
+
+  health_check {
+    path                = "/"
+    protocol            = "HTTP"
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    interval            = 30
+    timeout             = 5
+    matcher             = "200"
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-web-tg" })
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web.arn
   }
 }
 ```
 
-**Python** — reemplaza `lambda_handler` en `handler.py`:
+Modifica `aws_ecs_service.web` en `main.tf` — mueve las tareas a subredes privadas y añade el ALB:
 
-```python
-def lambda_handler(event, context):
-    env     = os.environ.get("APP_ENV", "unknown")
-    project = os.environ.get("APP_PROJECT", "unknown")
-    failures = []
+```hcl
+resource "aws_ecs_service" "web" {
+  # ...
+  network_configuration {
+    subnets          = aws_subnet.private[*].id   # ← subredes privadas
+    security_groups  = [aws_security_group.ecs.id]
+    assign_public_ip = false                       # ← sin IP pública
+  }
 
-    for record in event["Records"]:
-        try:
-            body = json.loads(record["body"])
-            result = _process_order(body)
-            logger.info("[SQS] Procesado: %s", json.dumps(result))
-        except Exception as exc:
-            logger.error(
-                "[SQS] Fallo en messageId=%s: %s", record["messageId"], exc
-            )
-            failures.append({"itemIdentifier": record["messageId"]})
+  load_balancer {
+    target_group_arn = aws_lb_target_group.web.arn
+    container_name   = "web"
+    container_port   = 80
+  }
 
-    logger.info(
-        "[SQS] Lote finalizado: %d ok, %d fallidos — env=%s project=%s",
-        len(event["Records"]) - len(failures), len(failures), env, project,
-    )
-    return {"batchItemFailures": failures}
-```
-
-Verifica que el mapping refleja la configuración:
-
-```bash
-aws lambda list-event-source-mappings \
-  --function-name "$(terraform output -raw function_name)" \
-  --query 'EventSourceMappings[0].FunctionResponseTypes'
-```
-
-**Paso 1** — Aplica los cambios:
-
-```bash
-terraform apply
-```
-
-**Paso 2** — Invoca Lambda directamente con un evento SQS sintético que contiene un lote mixto. Lambda recoge mensajes de SQS de uno en uno cuando el volumen es bajo, por lo que la forma fiable de probar el comportamiento de lote es construir el evento manualmente:
-
-```bash
-FUNCTION=$(terraform output -raw function_name)
-
-aws lambda invoke \
-  --function-name "$FUNCTION" \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{
-    "Records": [
-      {"messageId":"msg-ok-1","body":"{\"order_id\":\"ORD-OK-1\",\"order_type\":\"premium\",\"amount\":50.00}"},
-      {"messageId":"msg-ok-2","body":"{\"order_id\":\"ORD-OK-2\",\"order_type\":\"premium\",\"amount\":100.00}"},
-      {"messageId":"msg-ok-3","body":"{\"order_id\":\"ORD-OK-3\",\"order_type\":\"premium\",\"amount\":150.00}"},
-      {"messageId":"msg-ok-4","body":"{\"order_id\":\"ORD-OK-4\",\"order_type\":\"premium\",\"amount\":200.00}"},
-      {"messageId":"msg-bad-1","body":"{\"order_id\":\"ORD-BAD-1\",\"order_type\":\"premium\",\"amount\":99999.99}"}
-    ]
-  }' \
-  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
-```
-
-**Paso 3** — Verifica la respuesta. Solo el mensaje inválido debe aparecer en `batchItemFailures`:
-
-```json
-{
-  "batchItemFailures": [
-    { "itemIdentifier": "msg-bad-1" }
+  depends_on = [
+    aws_iam_role_policy_attachment.execution_basic,
+    aws_iam_role_policy.ssm_read,
+    aws_nat_gateway.main,     # las tareas privadas necesitan el NAT antes de arrancar
+    aws_lb_listener.http,     # el listener debe existir antes de que las tareas se registren
   ]
+  # ...
 }
 ```
 
-Si la función devuelve `"batchItemFailures": []` o el campo no aparece, significa que `report_batch_item_failures` no está activo o que el handler no está retornando la estructura correcta.
+Actualiza también la regla de ingreso en el security group `ecs` en `main.tf` para que el puerto 80 solo admita tráfico del ALB (no de toda Internet):
 
-**Paso 4** — Verifica los logs. Los 4 mensajes válidos deben aparecer procesados exactamente una vez; el inválido, con un error:
+```hcl
+# Reemplaza la regla: ingress { from_port = 80, cidr_blocks = ["0.0.0.0/0"] }
+# por esta:
+ingress {
+  description     = "HTTP desde el ALB"
+  from_port       = 80
+  to_port         = 80
+  protocol        = "tcp"
+  security_groups = [aws_security_group.alb.id]
+}
+```
+
+> Las tareas API y Worker permanecen en subredes públicas con `assign_public_ip = true` (necesitan internet para pull de imágenes y no tienen ALB delante). Solo el servicio Web se mueve a subredes privadas porque es el único con un ALB como punto de entrada.
+
+Añade a `outputs.tf`:
+
+```hcl
+output "alb_url" {
+  description = "URL pública del Application Load Balancer"
+  value       = "http://${aws_lb.main.dns_name}"
+}
+```
+
+Verificación:
 
 ```bash
-LOG_GROUP=$(terraform output -raw log_group)
-aws logs tail "$LOG_GROUP" --format short
-```
+terraform apply
 
-Salida esperada:
+# Espera ~2 minutos a que las tareas pasen los health checks del ALB
+curl $(terraform output -raw alb_url)
+# Debe devolver la página HTML con las dos tarjetas (Web + API via Service Connect)
 ```
-[SQS] Procesado: {"order_id": "ORD-OK-1", "status": "processed", ...}
-[SQS] Procesado: {"order_id": "ORD-OK-2", "status": "processed", ...}
-[SQS] Procesado: {"order_id": "ORD-OK-3", "status": "processed", ...}
-[SQS] Procesado: {"order_id": "ORD-OK-4", "status": "processed", ...}
-[SQS] Fallo en messageId=msg-bad-1: order_id=ORD-BAD-1: amount 99999.99 supera el límite 9999.99
-[SQS] Lote finalizado: 4 ok, 1 fallidos — env=production project=lab30
-```
-
-**Paso 5** — Para contrastar, prueba cómo se comportaría el handler **sin** `report_batch_item_failures` — es decir, el handler original que lanza la excepción directamente en lugar de acumular fallos:
-
-```bash
-# Simula el handler original: lanza excepción en el primer mensaje inválido
-aws lambda invoke \
-  --function-name "$FUNCTION" \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{
-    "Records": [
-      {"messageId":"msg-ok-1","body":"{\"order_id\":\"ORD-OK-1\",\"order_type\":\"premium\",\"amount\":50.00}"},
-      {"messageId":"msg-bad-1","body":"{\"order_id\":\"ORD-BAD-1\",\"order_type\":\"premium\",\"amount\":99999.99}"},
-      {"messageId":"msg-ok-2","body":"{\"order_id\":\"ORD-OK-2\",\"order_type\":\"premium\",\"amount\":100.00}"}
-    ]
-  }' \
-  /tmp/response_old.json && cat /tmp/response_old.json | python3 -m json.tool
-```
-
-Con el handler del Reto 2, la respuesta es `{"batchItemFailures":[{"itemIdentifier":"msg-bad-1"}]}` — el `try/except` dentro del bucle hace que `msg-ok-1` y `msg-ok-2` se procesen correctamente (se ven en los logs como "[SQS] Procesado: …") y solo `msg-bad-1` queda registrado como fallo. SQS eliminará los dos mensajes válidos y reencolará únicamente el inválido.
 
 </details>
 
@@ -685,20 +1027,28 @@ Con el handler del Reto 2, la respuesta es `{"batchItemFailures":[{"itemIdentifi
 ```bash
 # Desde lab30/aws/
 terraform destroy
-
-# Eliminar el ZIP generado localmente
-rm -f function.zip
 ```
 
-`terraform destroy` elimina las 4 colas SQS, la función Lambda, el Event Source Mapping, las Lambda Destinations, IAM y CloudWatch Logs. No hay recursos de API Gateway ni Layers en este laboratorio.
+El `destroy` elimina el cluster ECS, el servicio, las tareas en ejecución, el repositorio ECR (si está vacío), el parámetro SSM y todos los recursos de red. Si el repositorio ECR tiene imágenes, el destroy fallará — borra las imágenes primero:
+
+```bash
+aws ecr batch-delete-image \
+  --repository-name lab30/api \
+  --image-ids "$(aws ecr list-images \
+    --repository-name lab30/api \
+    --query 'imageIds' \
+    --output json)"
+```
+
+> El bucket S3 de estado (`terraform-state-labs-<ACCOUNT_ID>`) no se destruye: se reutiliza en otros laboratorios.
 
 ---
 
 ## LocalStack
 
-Las colas SQS, Lambda y el Event Source Mapping funcionan correctamente en LocalStack Community. `filter_criteria` y Lambda Destinations tienen soporte parcial — los recursos se crean sin errores pero su comportamiento puede diferir del real.
+Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-Consulta [localstack/README.md](localstack/README.md) para instrucciones detalladas de despliegue y verificación con `awslocal`.
+LocalStack Community soporta ECR, SSM e IAM completamente. ECS tiene soporte parcial: los recursos (cluster, task definition, service) se crean correctamente en el estado de Terraform, pero las tareas Fargate no se lanzan realmente. Service Connect y el Circuit Breaker se registran sin efecto observable.
 
 ---
 
@@ -706,34 +1056,41 @@ Consulta [localstack/README.md](localstack/README.md) para instrucciones detalla
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| SQS colas y DLQ | Colas reales con latencia de red | Emulado localmente — comportamiento idéntico |
-| `redrive_policy` (maxReceiveCount=3) | Mueve mensajes a DLQ tras 3 fallos reales | Funciona correctamente |
-| `aws_lambda_event_source_mapping` | Lambda pollea SQS continuamente | Funciona; latencia de polling puede ser mayor |
-| `filter_criteria` (order_type=premium) | Solo activa Lambda para mensajes premium | Soporte parcial — puede ignorar el filtro |
-| Lambda Destinations (on_success/on_failure) | Enruta resultado de invocaciones async | Soporte parcial — puede no enrutar |
-| `source_code_hash` | Detecta cambios y fuerza redeploy | Detecta cambios y fuerza redeploy |
-| CloudWatch Metric Alarm (Reto 1) | Alarma real visible en consola | Soporte básico; estado puede no actualizarse |
-| `report_batch_item_failures` (Reto 2) | Solo los mensajes fallidos se reencolan | Soporte en versiones recientes de LocalStack |
-| Coste | ~$0 con volumen de laboratorio | Sin coste |
+| ECR con IMMUTABLE | Rechaza push duplicado realmente | El repositorio se crea; el push no rechaza en Community |
+| Lifecycle policy | Se ejecuta automáticamente | Se almacena pero no se evalúa |
+| SSM SecureString | Cifrado con KMS real | Almacenado, `--with-decryption` devuelve el valor |
+| ECS Task Definition | Registrada en la API de ECS | Registrada correctamente |
+| Tareas Fargate | Se lanzan y ejecutan los contenedores | No se lanzan contenedores reales |
+| Service Connect | Proxy Envoy funcional entre tareas | Configuración registrada, sin proxy real |
+| Circuit Breaker | Detecta fallos y revierte | Se configura, no hay despliegue real que fallar |
+| Execute Command | Funcional con el SSM Agent | No disponible (sin contenedores reales) |
+| startup.sh / startup-api.sh | Generan HTML y JSON en el arranque usando metadatos ECS v4 | Los scripts se ejecutan pero el endpoint de metadatos devuelve vacío |
+| Coste aproximado | ~$0.03/hora × 4 tareas Fargate (2 web + 2 api, 256 CPU / 512 MB c/u) | Sin coste |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **`visibility_timeout_seconds` ≥ `timeout` de Lambda**: si el timeout de Lambda es 30 s, el visibility_timeout de la cola debe ser al menos 30 s. De lo contrario, el mensaje puede volver a ser visible mientras Lambda lo procesa y ser recibido por otro consumidor.
-- **DLQ siempre presente**: una cola SQS sin DLQ pierde mensajes silenciosamente cuando se supera el tiempo de retención. La DLQ es el último recurso de diagnóstico.
-- **Alarma sobre la DLQ**: sin alerta, los mensajes en la DLQ pueden acumularse días sin ser detectados. Un umbral de 1 mensaje es suficiente para producción.
-- **`filter_criteria` reduce costes**: los mensajes filtrados no invocán Lambda, eliminando procesamiento innecesario. Úsalo siempre que el volumen de mensajes descartados sea significativo.
-- **Lambda Destinations vs DLQ**: usa Destinations para capturar éxitos (imposible con DLQ) y para tener más contexto sobre el fallo (input + output completos). Usa DLQ cuando el procesamiento es síncrono desde SQS o cuando quieres volver a procesar los mensajes fallidos manualmente.
-- **`report_batch_item_failures` en producción**: sin esta opción, un único mensaje inválido en un lote de 100 fuerza el reprocesamiento de los 99 mensajes válidos. Con cargas altas esto puede multiplicar el coste por 3 (maxReceiveCount).
+- **Usa `IMMUTABLE` en producción siempre.** Los tags mutables permiten sobreescribir accidentalmente una imagen en producción con otra versión. IMMUTABLE hace que el tag sea un identificador permanente, equivalente a un commit hash en Git.
+- **Referencia parámetros SSM por ARN, no por nombre.** En el bloque `secrets` de la task definition, usar el ARN (`aws_ssm_parameter.api_key.arn`) en lugar del nombre (`:ssm:/lab30/api-key`) evita ambigüedades de región y cuenta, y garantiza que el permiso IAM apunta exactamente al mismo recurso.
+- **Separa el rol de ejecución del rol de tarea.** El `execution_role_arn` solo lo usa el agente ECS para arrancar el contenedor (pull de imagen, inyección de secretos). El `task_role_arn` lo usa el código dentro del contenedor en tiempo de ejecución. Mezclarlos en un solo rol otorga al código de la aplicación permisos que solo debería tener la infraestructura.
+- **`port_name` es el contrato entre Task Definition y Service Connect.** El campo `name` en `portMappings` y el campo `port_name` en `service_connect_configuration.service` deben coincidir exactamente. Un cambio en uno sin actualizar el otro causa un error en el despliegue.
+- **Activa Container Insights en el cluster.** El bloque `setting { name = "containerInsights" value = "enabled" }` publica métricas de uso de CPU y memoria de cada tarea en CloudWatch, permitiendo configurar alarmas y políticas de auto-escalado basadas en consumo real.
+- **Usa `deployment_minimum_healthy_percent = 100` con cuidado.** Con `desired_count = 1`, este valor impide cualquier despliegue porque ECS no puede lanzar una tarea nueva sin terminar la única existente. En ese caso, usa `50` para permitir un despliegue stop-start o aumenta `desired_count` a 2.
+- **Limpia el repositorio ECR antes de `destroy`.** Terraform no puede eliminar un repositorio ECR que contiene imágenes. Añade `force_delete = true` en el recurso si quieres que el `destroy` lo elimine aunque contenga imágenes (útil en entornos de desarrollo, no recomendado en producción).
 
 ---
 
 ## Recursos
 
-- [AWS — Lambda Event Source Mapping con SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html)
-- [AWS — Lambda Destinations](https://docs.aws.amazon.com/lambda/latest/dg/invocation-async.html#invocation-async-destinations)
-- [AWS — Filter criteria para Event Source Mapping](https://docs.aws.amazon.com/lambda/latest/dg/invocation-eventfiltering.html)
-- [AWS — Dead Letter Queues en SQS](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
-- [Terraform — aws_lambda_event_source_mapping](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_event_source_mapping)
-- [Terraform — aws_lambda_function_event_invoke_config](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function_event_invoke_config)
+- [aws_ecr_repository — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecr_repository)
+- [aws_ecr_lifecycle_policy — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecr_lifecycle_policy)
+- [aws_ecs_task_definition — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecs_task_definition)
+- [aws_ecs_service — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecs_service)
+- [aws_ssm_parameter — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ssm_parameter)
+- [aws_service_discovery_http_namespace — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/service_discovery_http_namespace)
+- [Combinaciones válidas de CPU/Memoria en Fargate — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html)
+- [Service Connect — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect.html)
+- [Deployment Circuit Breaker — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
+- [Pasar datos sensibles a contenedores ECS — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-ssm-paramstore.html)
+- [ECR Lifecycle Policies — AWS Docs](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html)

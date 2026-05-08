@@ -1,74 +1,44 @@
+output "api_endpoint" {
+  description = "URL base de la HTTP API. Añade /items, /items/{id}, etc."
+  value       = aws_apigatewayv2_stage.default.invoke_url
+}
+
 output "function_name" {
   description = "Nombre de la función Lambda"
-  value       = aws_lambda_function.main.function_name
+  value       = aws_lambda_function.api.function_name
 }
 
-output "function_version" {
-  description = "Última versión publicada de la función Lambda"
-  value       = aws_lambda_function.main.version
+output "function_arn" {
+  description = "ARN de la función Lambda"
+  value       = aws_lambda_function.api.arn
 }
 
-output "alias_arn" {
-  description = "ARN del alias 'live' (con Provisioned Concurrency)"
-  value       = aws_lambda_alias.live.arn
+output "layer_arn" {
+  description = "ARN versionado de la Lambda Layer 'utils'"
+  value       = aws_lambda_layer_version.utils.arn
 }
 
-output "alias_invoke_arn" {
-  description = "ARN de invocación del alias 'live'"
-  value       = aws_lambda_alias.live.invoke_arn
+output "layer_version" {
+  description = "Número de versión de la Lambda Layer"
+  value       = aws_lambda_layer_version.utils.version
 }
 
-output "vpc_id" {
-  description = "ID de la VPC del laboratorio"
-  value       = aws_vpc.main.id
-}
-
-output "private_subnet_ids" {
-  description = "IDs de las subredes privadas (Lambda)"
-  value       = aws_subnet.private[*].id
-}
-
-output "lambda_sg_id" {
-  description = "ID del Security Group dedicado a Lambda"
-  value       = aws_security_group.lambda.id
-}
-
-output "cluster_name" {
-  description = "Nombre del cluster ECS"
-  value       = aws_ecs_cluster.main.name
-}
-
-output "service_name" {
-  description = "Nombre del servicio ECS"
-  value       = aws_ecs_service.app.name
-}
-
-output "sns_topic_arn" {
-  description = "ARN del topic SNS para alertas de CloudWatch"
-  value       = aws_sns_topic.alerts.arn
-}
-
-output "alarm_name" {
-  description = "Nombre de la alarma CloudWatch sobre CPU del servicio ECS"
-  value       = aws_cloudwatch_metric_alarm.ecs_cpu.alarm_name
-}
-
-output "log_group_lambda" {
-  description = "Nombre del log group de CloudWatch para Lambda"
+output "log_group" {
+  description = "Nombre del log group de CloudWatch para la función Lambda"
   value       = aws_cloudwatch_log_group.lambda.name
 }
 
-output "log_group_ecs" {
-  description = "Nombre del log group de CloudWatch para ECS"
-  value       = aws_cloudwatch_log_group.ecs.name
+output "api_id" {
+  description = "ID de la HTTP API en API Gateway v2"
+  value       = aws_apigatewayv2_api.main.id
 }
 
-output "invoke_alias_example" {
-  description = "Comando para invocar la función a través del alias 'live' (con Provisioned Concurrency)"
-  value       = "aws lambda invoke --function-name ${aws_lambda_function.main.function_name} --qualifier live --payload '{}' --cli-binary-format raw-in-base64-out /tmp/response.json && cat /tmp/response.json | python3 -m json.tool"
+output "curl_get_items" {
+  description = "Comando curl de ejemplo para GET /items"
+  value       = "curl -s '${aws_apigatewayv2_stage.default.invoke_url}/items' | python3 -m json.tool"
 }
 
-output "invoke_latest_example" {
-  description = "Comando para invocar $LATEST (sin Provisioned Concurrency, cold start posible)"
-  value       = "aws lambda invoke --function-name ${aws_lambda_function.main.function_name} --payload '{}' --cli-binary-format raw-in-base64-out /tmp/response.json && cat /tmp/response.json | python3 -m json.tool"
+output "curl_post_item" {
+  description = "Comando curl de ejemplo para POST /items"
+  value       = "curl -s -X POST '${aws_apigatewayv2_stage.default.invoke_url}/items' -H 'Content-Type: application/json' -d '{\"nombre\":\"Nuevo Item\",\"precio\":49.99}' | python3 -m json.tool"
 }

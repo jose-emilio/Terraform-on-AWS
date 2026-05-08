@@ -43,9 +43,9 @@ resource "aws_iam_role_policy" "remediation_s3" {
         # AWSConfigRemediation-ConfigureS3BucketPublicAccessBlock:
         #   - PutBucketPublicAccessBlock: habilita los 4 ajustes de bloqueo
         #   - GetBucketPublicAccessBlock: lee el estado actual antes de modificar
-        Sid      = "AllowS3PublicAccessBlockManagement"
-        Effect   = "Allow"
-        Action   = [
+        Sid    = "AllowS3PublicAccessBlockManagement"
+        Effect = "Allow"
+        Action = [
           "s3:PutBucketPublicAccessBlock",
           "s3:GetBucketPublicAccessBlock"
         ]

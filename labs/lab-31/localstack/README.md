@@ -1,9 +1,9 @@
-# Laboratorio 31 — LocalStack: API Serverless: Lambda, API Gateway v2 y Layers
+# Laboratorio 31 — LocalStack: Procesamiento Asíncrono y Resiliencia de Eventos
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Este documento describe cómo ejecutar el laboratorio 31 contra LocalStack. El código Terraform de `localstack/` es una versión reducida respecto a `aws/`: **API Gateway v2 no está disponible en LocalStack Community** (requiere licencia Pro) y se ha eliminado del `main.tf`. Los recursos disponibles — Lambda Layer, Lambda Function, IAM y CloudWatch Logs — funcionan completamente y permiten verificar los mecanismos clave del laboratorio (`archive_file`, `source_code_hash`, Layer).
+Este documento describe cómo ejecutar el laboratorio 30 contra LocalStack. El código Terraform de `localstack/` es equivalente al de `aws/` con las adaptaciones necesarias para los servicios disponibles en LocalStack Community.
 
 ## Requisitos previos
 
@@ -20,12 +20,13 @@ Este documento describe cómo ejecutar el laboratorio 31 contra LocalStack. El c
 |---|---|
 | `archive_file` (provider archive) | Completo — operación local, sin llamadas a AWS |
 | `source_code_hash` | Completo — detecta cambios y redespliega |
-| Lambda Layer (`aws_lambda_layer_version`) | Parcial — el recurso se crea y versiona, pero LocalStack Community no monta la Layer en `/opt/python`; el handler fallaría con `No module named 'utils'`. Solución aplicada en `main.tf`: `utils.py` se empaqueta también dentro del ZIP de la función. |
+| SQS (`aws_sqs_queue`, `redrive_policy`) | Completo — colas, DLQ y política de redrive funcionan correctamente |
 | Lambda Function (Python 3.12) | Completo — el código Python se ejecuta realmente |
+| `aws_lambda_event_source_mapping` (SQS) | Completo — Lambda recibe mensajes de la cola automáticamente |
 | IAM roles y políticas | Completo |
 | CloudWatch Log Groups | Completo |
-| **API Gateway v2** (`aws_apigatewayv2_*`) | **No disponible** — requiere LocalStack Pro |
-| **`aws_lambda_permission`** | Eliminado (dependía de APIGW) |
+| `filter_criteria` | Parcial — los filtros pueden no aplicarse en Community; todos los mensajes podrían activar Lambda independientemente del `order_type` |
+| `aws_lambda_function_event_invoke_config` (Lambda Destinations) | Parcial — el recurso se crea sin errores, pero LocalStack Community puede no enrutar el resultado a las colas de destino |
 
 ### Inicialización y despliegue
 
@@ -44,92 +45,122 @@ terraform plan
 terraform apply
 ```
 
-El `apply` despliega Lambda Layer + Lambda Function + IAM + CloudWatch. No fallará porque los recursos de API Gateway v2 se han eliminado de `localstack/main.tf`.
+El `apply` despliega todas las colas SQS, Lambda, IAM y CloudWatch. No fallará por las limitaciones de `filter_criteria` o Lambda Destinations — los recursos se crean correctamente.
 
-### Verificación
+### Verificación de recursos
 
 ```bash
-# Lambda Function
+# Función Lambda
 awslocal lambda get-function \
   --function-name "$(terraform output -raw function_name)" \
   --query 'Configuration.{Estado:State,Runtime:Runtime,Handler:Handler}'
 
-# Lambda Layer adjunta
-awslocal lambda get-function-configuration \
+# Event Source Mapping
+awslocal lambda list-event-source-mappings \
   --function-name "$(terraform output -raw function_name)" \
-  --query 'Layers[*].Arn'
+  --query 'EventSourceMappings[*].{UUID:UUID,Estado:State,BatchSize:BatchSize,Source:EventSourceArn}'
 
-# Versiones de la Layer
-awslocal lambda list-layer-versions \
-  --layer-name lab31-local-utils \
-  --query 'LayerVersions[*].{Version:Version,ARN:LayerVersionArn}'
+# Colas SQS creadas
+awslocal sqs list-queues
+
+# Atributos de la cola de órdenes (redrive policy)
+awslocal sqs get-queue-attributes \
+  --queue-url "$(terraform output -raw orders_queue_url)" \
+  --attribute-names All \
+  --query 'Attributes.{RetentionSeconds:MessageRetentionPeriod,VisibilityTimeout:VisibilityTimeout,RedrivePolicy:RedrivePolicy}'
 
 # Log group
 awslocal logs describe-log-groups \
   --log-group-name-prefix /aws/lambda/lab31-local
 ```
 
-### Invocar Lambda directamente
+### Flujo SQS → Lambda (Event Source Mapping)
 
-Sin API Gateway, la función se invoca con `awslocal lambda invoke`. El output `invoke_example` ya contiene el comando listo para ejecutar:
+El Event Source Mapping está activo y Lambda pollea la cola automáticamente. Envía mensajes y observa cómo Lambda los procesa:
 
 ```bash
-terraform output -raw invoke_example | bash
+ORDERS_URL=$(terraform output -raw orders_queue_url)
+
+# Orden premium (debería activar Lambda según filter_criteria)
+awslocal sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_id":"ORD-001","order_type":"premium","amount":299.99}'
+
+# Orden estándar (debería ser filtrada en AWS real; en Community puede activar Lambda)
+awslocal sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_id":"ORD-002","order_type":"standard","amount":49.99}'
+
+# Orden con amount > 9999 (procesamiento fallará → 3 reintentos → DLQ)
+awslocal sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_id":"ORD-003","order_type":"premium","amount":99999.99}'
+
+# Espera unos segundos y verifica los logs de Lambda
+awslocal logs describe-log-streams \
+  --log-group-name "$(terraform output -raw log_group)" \
+  --order-by LastEventTime --descending --max-items 3
+
+# Verifica mensajes en la DLQ (tras varios segundos para que los reintentos completen)
+awslocal sqs get-queue-attributes \
+  --queue-url "$(terraform output -raw dlq_url)" \
+  --attribute-names ApproximateNumberOfMessages
 ```
 
-O manualmente, construyendo el evento en payload format 2.0:
+### Lambda Destinations (invocación async directa)
+
+Para demostrar Lambda Destinations con invocación asíncrona:
 
 ```bash
 FUNCTION=$(terraform output -raw function_name)
 
-# GET /items — lista todos los items
+# Invocación async exitosa (amount ≤ 9999) → debería llegar a success-queue
 awslocal lambda invoke \
   --function-name "$FUNCTION" \
-  --payload '{"requestContext":{"http":{"method":"GET"}},"rawPath":"/items"}' \
+  --invocation-type Event \
+  --payload '{"order_id":"ASYNC-001","order_type":"premium","amount":500.00}' \
   --cli-binary-format raw-in-base64-out \
-  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
+  /dev/null
 
-# GET /items/2 — item por ID
+# Invocación async fallida (amount > 9999) → debería llegar a failure-queue
 awslocal lambda invoke \
   --function-name "$FUNCTION" \
-  --payload '{"requestContext":{"http":{"method":"GET"}},"rawPath":"/items/2","pathParameters":{"id":"2"}}' \
+  --invocation-type Event \
+  --payload '{"order_id":"ASYNC-002","order_type":"premium","amount":99999.99}' \
   --cli-binary-format raw-in-base64-out \
-  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
+  /dev/null
 
-# POST /items — crear item
-awslocal lambda invoke \
-  --function-name "$FUNCTION" \
-  --payload '{"requestContext":{"http":{"method":"POST"}},"rawPath":"/items","body":"{\"nombre\":\"Nuevo Item\",\"precio\":29.99}"}' \
-  --cli-binary-format raw-in-base64-out \
-  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
+# Verifica mensajes en success-queue (soporte parcial en Community)
+awslocal sqs receive-message \
+  --queue-url "$(terraform output -raw success_queue_url)" \
+  --max-number-of-messages 5
 
-# Ruta inexistente (404)
-awslocal lambda invoke \
-  --function-name "$FUNCTION" \
-  --payload '{"requestContext":{"http":{"method":"DELETE"}},"rawPath":"/items/1"}' \
-  --cli-binary-format raw-in-base64-out \
-  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
+# Verifica mensajes en failure-queue (soporte parcial en Community)
+awslocal sqs receive-message \
+  --queue-url "$(terraform output -raw failure_queue_url)" \
+  --max-number-of-messages 5
 ```
 
-### Demostración de source_code_hash
+### Invocación sync directa (para verificar el handler)
 
-El mecanismo de detección de cambios funciona exactamente igual que en AWS real, ya que es una operación puramente local de Terraform:
+Para verificar que el handler Python funciona correctamente sin esperar al Event Source Mapping, invoca Lambda de forma síncrona:
 
 ```bash
-# Modifica una línea del handler y observa el cambio de hash en el plan
-echo "# cambio de prueba" >> src/function/handler.py
-terraform plan
-# ~ source_code_hash = "aBcDe..." -> "XyZwV..."
-
-terraform apply
-
-# Verifica que LocalStack ejecuta el nuevo código
 FUNCTION=$(terraform output -raw function_name)
+
+# Orden premium válida
 awslocal lambda invoke \
   --function-name "$FUNCTION" \
-  --payload '{"requestContext":{"http":{"method":"GET"}},"rawPath":"/items"}' \
+  --payload '{"Records":[{"body":"{\"order_id\":\"ORD-TEST\",\"order_type\":\"premium\",\"amount\":150.00}"}]}' \
   --cli-binary-format raw-in-base64-out \
   /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
+
+# Orden que falla (amount > 9999) — verifica el mensaje de error
+awslocal lambda invoke \
+  --function-name "$FUNCTION" \
+  --payload '{"Records":[{"body":"{\"order_id\":\"ORD-FAIL\",\"order_type\":\"premium\",\"amount\":99999.99}"}]}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/response_fail.json && cat /tmp/response_fail.json | python3 -m json.tool
 ```
 
 ---
@@ -140,8 +171,8 @@ awslocal lambda invoke \
 # Desde lab31/localstack/
 terraform destroy
 
-# Eliminar los ZIPs generados localmente
-rm -f layer.zip function.zip
+# Eliminar el ZIP generado localmente
+rm -f function.zip
 ```
 
 ---
@@ -150,29 +181,28 @@ rm -f layer.zip function.zip
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| `archive_file` | Genera ZIP localmente (sin llamadas AWS) | Idéntico — operación local |
+| SQS colas y DLQ | Colas reales con latencia de red | Emulado localmente — comportamiento idéntico |
+| `redrive_policy` (maxReceiveCount=3) | Mueve mensajes a DLQ tras 3 fallos reales | Funciona correctamente |
+| `aws_lambda_event_source_mapping` | Lambda pollea SQS continuamente | Funciona; puede haber mayor latencia de polling |
+| `filter_criteria` (order_type=premium) | Solo activa Lambda para mensajes premium | Soporte parcial — puede ignorar el filtro |
+| Lambda Destinations (on_success/on_failure) | Enruta resultado a colas según éxito/fallo | Soporte parcial — puede no enrutar |
 | `source_code_hash` | Detecta cambios y fuerza redeploy | Detecta cambios y fuerza redeploy |
-| Lambda Layer | Versión numerada inmutable en el servicio real | Se crea y numera correctamente |
-| Lambda Function | Ejecuta Python 3.12 real en infraestructura AWS | Ejecuta Python 3.12 real en contenedor local |
-| Cold start | Latencia real (100–500 ms) | Latencia mínima (entorno local) |
-| API Gateway v2 | URL HTTPS pública, rutas, integración AWS_PROXY | **No disponible** en Community |
-| `aws_lambda_permission` | Control de acceso real; sin permiso → 403 | No desplegado (depende de APIGW) |
 | CloudWatch Logs | Logs reales con `aws logs tail` | Registrados; `awslocal logs` limitado |
-| Coste | ~$0 (capa gratuita generosa) | Sin coste |
+| Coste | ~$0 con volumen de laboratorio | Sin coste |
 
 ---
 
 ## Buenas Prácticas
 
-- Usa LocalStack para validar que el código Python (`handler.py` + `utils.py`) se ejecuta correctamente antes de desplegar en AWS real, invocando la función directamente con `awslocal lambda invoke`.
-- El mecanismo de `source_code_hash` funciona igual en LocalStack: practica el ciclo completo de editar código → `terraform apply` → verificar cambio aquí antes de afectar AWS real.
-- Para verificar el flujo completo HTTP → API Gateway v2 → Lambda (rutas, permisos, CORS, throttling), usa AWS real o LocalStack Pro.
-- El flag `terraform validate` y `terraform plan` son suficientes para detectar errores de configuración sin necesidad de LocalStack.
+- Usa LocalStack para verificar que el handler Python (`handler.py`) procesa correctamente tanto lotes SQS como invocaciones directas, antes de desplegar en AWS real.
+- El mecanismo de `source_code_hash` funciona igual en LocalStack: practica el ciclo editar → `terraform apply` → verificar aquí antes de afectar AWS real.
+- Para verificar el comportamiento preciso de `filter_criteria` (solo mensajes premium activan Lambda) y Lambda Destinations (enrutamiento correcto a success/failure queues), usa AWS real.
+- Verifica siempre que `visibility_timeout_seconds` de la cola es >= `timeout` de la función Lambda para evitar que mensajes se reencolen mientras Lambda los procesa.
 
 ---
 
 ## Recursos Adicionales
 
+- [LocalStack — SQS](https://docs.localstack.cloud/aws/services/sqs/)
 - [LocalStack — Lambda](https://docs.localstack.cloud/aws/services/lambda/)
-- [LocalStack coverage — API Gateway v2](https://docs.localstack.cloud/aws/services/apigateway/)
-- [LocalStack Pro — soporte ampliado](https://docs.localstack.cloud/aws/getting-started/)
+- [LocalStack coverage — Lambda Event Source Mappings](https://docs.localstack.cloud/aws/services/lambda/)

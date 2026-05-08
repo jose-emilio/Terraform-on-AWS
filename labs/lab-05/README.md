@@ -10,7 +10,7 @@
 
 En este laboratorio automatizarás la generación de scripts de inicio (User Data) usando plantillas `.tftpl`, transformarás listas en maps con expresiones `for`, leerás claves SSH desde el disco con `file()` y generarás archivos de configuración locales con directivas `%{if}` y `%{for}`. El objetivo es dominar las funciones de transformación y el sistema de plantillas de Terraform.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -25,7 +25,7 @@ Al finalizar este laboratorio serás capaz de:
 - Laboratorio 01 completado (entorno configurado)
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### Función `templatefile()`
 
@@ -132,7 +132,7 @@ La plantilla `user_data.tftpl` vive en la raíz de `lab04/` y es compartida por 
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Código Terraform
 

@@ -1,4 +1,4 @@
-# Laboratorio 15 — Blindaje del Pipeline DevSecOps
+# Laboratorio 15 — Automatización de Secretos "Zero-Touch"
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,31 +8,25 @@
 
 ## Visión general
 
-Las llaves de acceso permanentes (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`)
-almacenadas en secretos de CI/CD son credenciales de larga vida: si se filtran,
-el atacante dispone de acceso indefinido. Este laboratorio elimina ese riesgo
-sustituyendo las llaves estáticas por **identidades efímeras OIDC**: GitHub
-Actions obtiene un token firmado en cada ejecución, lo intercambia por credenciales
-temporales de STS y estas expiran automáticamente al finalizar el job.
+Las credenciales estáticas en variables de entorno, ficheros de configuración o
+parámetros de CI/CD son el vector de filtración más frecuente en sistemas cloud.
+Este laboratorio implementa un flujo **Zero-Touch** donde la contraseña de la
+base de datos se genera, se almacena cifrada y se inyecta directamente en RDS —
+todo en una única ejecución de Terraform, sin que el operador la vea ni la
+introduzca en ningún momento.
 
-Además, el pipeline incorpora dos capas de análisis de seguridad estático:
-**Checkov/Trivy** para detectar configuraciones IaC inseguras y **OPA/Rego** para
-aplicar políticas de compliance personalizable (ej. "todos los buckets S3 deben
-usar SSE-KMS").
+## Objetivos de aprendizaje
 
-## Objetivos
-
-- Crear un proveedor OIDC en IAM para `token.actions.githubusercontent.com`.
-- Definir un rol IAM con Trust Policy restringida a un repositorio y ref específicos.
-- Integrar Checkov y Trivy en el pipeline como gates de seguridad bloqueantes.
-- Escribir y ejecutar una política OPA/Rego que verifique cifrado en buckets S3.
-- Comprender el flujo completo: token OIDC → `AssumeRoleWithWebIdentity` → credenciales STS temporales.
+- Generar contraseñas de alta entropía con `random_password` sin exponerlas en variables de entrada.
+- Almacenar credenciales en Secrets Manager en formato JSON con cifrado de una CMK KMS propia.
+- Inyectar la contraseña directamente en `aws_db_instance` mediante referencia a `random_password.result`.
+- Aplicar la misma CMK como raíz de confianza en tres capas: Secrets Manager, RDS y el backend S3.
+- Comprender por qué el estado de Terraform requiere hardening específico.
 
 ## Requisitos previos
 
-- Terraform ≥ 1.10 instalado (requerido para lock nativo de S3).
+- **Terraform >= 1.10** instalado.
 - AWS CLI configurado con perfil `default`.
-- Repositorio GitHub propio donde puedas crear workflows.
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 
 ```bash
@@ -42,987 +36,471 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 
 ## Arquitectura
 
-![Arquitectura del pipeline DevSecOps con federación OIDC GitHub Actions ↔ AWS](arch/diagrama.svg)
+![Zero-Touch secrets: random_password → inyección directa en RDS y JSON en Secrets Manager + KMS cifra Secrets, RDS y backend S3](arch/diagrama.svg)
 
-**Flujo en cinco pasos:**
-
-1. El job `terraform-apply` envía a STS la acción `AssumeRoleWithWebIdentity` con el JWT firmado por GitHub.
-2. STS verifica la firma del JWT contra el JWKS público del OIDC Identity Provider.
-3. STS valida los claims (`aud`, `sub`, `iss`) contra la Trust Policy del rol IAM.
-4. STS devuelve credenciales temporales (`ASIA…` + `SessionToken`, TTL 1h).
-5. Terraform ejecuta `plan`/`apply` contra el backend S3 (`tfstate` + `.tflock` nativo) con esas credenciales efímeras.
-
-Antes del paso 1, el job `security-scan` ejecuta Checkov + Trivy + Conftest/OPA **sin credenciales AWS**: si alguno falla, el pipeline aborta sin llegar a STS.
+Patrón Zero-Touch — ningún humano ve la contraseña. Terraform la genera con `random_password` (32 chars, entropía CSPRNG del SO), la inyecta directamente como `password` en `aws_db_instance` y como JSON estructurado (`jsonencode({user, pass, host, port, dbname})`) en `aws_secretsmanager_secret_version`. Una CMK (`alias/lab15-secrets`) con rotación anual cifra tres capas distintas: el `secret_string` de Secrets Manager, el almacenamiento on-disk de RDS y el `.tfstate` del backend S3 (hardening crítico — el password se almacena en texto plano en el state). Las aplicaciones consumen el JSON con una sola llamada a `aws secretsmanager get-secret-value`.
 
 ## Conceptos clave
 
-### OIDC (OpenID Connect) para CI/CD
+| Concepto | Descripción |
+|----------|-------------|
+| `random_password` | Genera contraseñas con entropía del CSPRNG del SO; el valor nunca aparece en `terraform plan` ni en logs |
+| AWS Secrets Manager | Almacena y rota secretos cifrados con KMS; registra cada acceso en CloudTrail |
+| `aws_secretsmanager_secret_version` | Almacena el valor del secreto; `secret_string` acepta JSON para empaquetar múltiples campos |
+| Inyección directa | `random_password.db.result` como `password` en `aws_db_instance` — sin variables intermedias |
+| CMK (Customer Managed Key) | A diferencia de `aws/service`, permite policy granular, rotación anual y auditoría independiente |
+| Hardening del backend | Configurar `kms_key_id` en el backend S3 protege el `.tfstate`, que contiene la contraseña en texto plano |
+| `recovery_window_in_days = 0` | Elimina el secreto inmediatamente al destruir; evita colisiones de nombre entre despliegues |
 
-OIDC es una capa de identidad sobre OAuth 2.0. GitHub actúa como **Identity
-Provider (IdP)**: firma un JSON Web Token (JWT) por cada job con claims que
-identifican el repositorio, la rama y el workflow. AWS actúa como **Service
-Provider**: verifica la firma contra el JWKS publicado en
-`https://token.actions.githubusercontent.com/.well-known/openid-configuration`
-y emite credenciales STS temporales si la Trust Policy lo permite.
+### Por qué no `var.db_password`
 
-**Ventaja clave**: las credenciales tienen TTL de 1 hora y nunca se almacenan.
-No hay secreto que filtrar en GitHub.
+Si la contraseña fuera una variable de entrada, aparecería en texto plano en los
+logs de CI/CD, en el historial de shell y potencialmente en pull requests. El
+modelo Zero-Touch elimina ese vector: la contraseña se genera internamente en
+Terraform y solo vive en el estado cifrado y en Secrets Manager.
 
-### Trust Policy y el claim `sub`
+### El estado de Terraform y el riesgo oculto
 
-El claim `sub` en el JWT de GitHub sigue el formato:
-```
-repo:<org>/<repositorio>:<ref>
-```
+`random_password.db.result` se almacena en texto plano en el `.tfstate`. Esto
+hace que el hardening del backend con KMS sea imprescindible: sin él, cualquier
+persona con acceso de lectura al bucket S3 puede leer la contraseña directamente
+del fichero de estado.
 
-Ejemplos:
-- `repo:mi-org/mi-repo:ref:refs/heads/main` — sólo la rama `main`
-- `repo:mi-org/mi-repo:*` — cualquier rama o tag
-- `repo:mi-org/mi-repo:environment:production` — sólo el entorno `production`
+### Secreto en formato JSON
 
-La condición `StringLike` en la Trust Policy permite usar `*` como comodín.
+Almacenar el secreto como JSON es la práctica estándar de AWS por tres razones:
 
-### Checkov vs Trivy
-
-| Herramienta | Enfoque | Checks destacados |
-|-------------|---------|-------------------|
-| Checkov | Compliance (CIS, NIST, PCI-DSS...) | MFA en root, rotación de llaves, cifrado |
-| Trivy | Seguridad IaC (sucesor de tfsec) | SGs permisivos, S3 público, IMDSv1 |
-
-Ambas se ejecutan **sin credenciales AWS** — analizan el código estático.
-
-### OPA/Rego para IaC
-
-Open Policy Agent (OPA) permite expresar políticas de compliance como código
-Rego. `conftest` es la CLI que aplica políticas Rego a ficheros de configuración
-(HCL, JSON, YAML). En este laboratorio la política `s3_encryption.rego` deniega
-cualquier bucket S3 sin SSE-KMS.
-
-#### Política `policies/s3_encryption.rego`
-
-El fichero define tres reglas bajo el paquete `terraform.s3`:
-
-| Regla | Tipo | Condición que activa |
-|-------|------|----------------------|
-| `s3-encryption` | `deny` | Existe un `aws_s3_bucket` sin ningún `aws_s3_bucket_server_side_encryption_configuration` asociado |
-| `s3-kms-only` | `deny` | Existe una config de cifrado cuyo `sse_algorithm` no es `aws:kms` (p.ej. `AES256`) |
-| `s3-bucket-key` | `warn` | El cifrado es `aws:kms` pero `bucket_key_enabled` está ausente, lo que incrementa el coste de llamadas a KMS |
-
-El helper `bucket_has_encryption` vincula cada bucket con su config de cifrado
-buscando que el campo `bucket` de la config contenga el nombre del recurso Terraform
-(`contains(entry.bucket, bucket_name)`). Esto es necesario porque el parser HCL2
-de conftest no resuelve referencias — representa `aws_s3_bucket.X.id` como el
-string literal `"${aws_s3_bucket.X.id}"`.
-
-Las reglas usan `some config_name` para declarar explícitamente la variable de
-iteración antes de usarla como clave de objeto, requisito de OPA en modo v1-compatible.
-
-#### Fixture `policies/fixtures/bad_s3.tf`
-
-Contiene tres buckets que cubren los tres escenarios de fallo posibles:
-
-```
-aws_s3_bucket "no_encryption"          ← sin ninguna config de cifrado
-                                            → FAIL [s3-encryption]
-
-aws_s3_bucket "aes_encryption"         ← tiene config, pero con AES256
-aws_s3_bucket_server_side_encryption_configuration "aes"
-  sse_algorithm = "AES256"                 → FAIL [s3-kms-only]
-
-aws_s3_bucket "kms_no_key"             ← tiene config con aws:kms
-aws_s3_bucket_server_side_encryption_configuration "kms_no_key"
-  sse_algorithm = "aws:kms"
-  # bucket_key_enabled ausente              → WARN [s3-bucket-key]
-```
-
-El fixture no se despliega — su único propósito es verificar que la política
-detecta cada tipo de incumplimiento de forma aislada.
+1. Las aplicaciones consumen una sola llamada a `GetSecretValue` y obtienen todos los datos de conexión.
+2. Los SDKs de AWS incluyen utilidades para parsear este formato directamente.
+3. Los blueprints de rotación de Secrets Manager esperan el formato `{"username": "...", "password": "..."}`.
 
 ## Estructura del proyecto
 
 ```
 lab-15/
+├── README.md
 ├── arch/
-│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg           # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf          # Terraform + provider AWS
-│   ├── variables.tf          # region, project, github_org, github_repo, allowed_ref
-│   ├── main.tf               # OIDC provider + IAM role + PowerUserAccess attachment
-│   ├── outputs.tf            # ARN del rol y del OIDC provider
-│   └── aws.s3.tfbackend      # Configuración parcial del backend S3
-├── pipeline/
-│   ├── terraform-ci.yml      # Workflow GitHub Actions (security-scan → plan → apply)
-│   └── terraform/            # Ejemplo Terraform de partida que el alumno copia a su repo
-│       ├── main.tf           # KMS key mínimo - pasa todos los gates de seguridad
-│       └── aws.s3.tfbackend  # Backend del demo
-├── policies/
-│   ├── s3_encryption.rego    # Política OPA/Rego: S3 debe usar SSE-KMS
-│   └── fixtures/
-│       ├── bad_s3.tf         # Buckets con cifrado ausente/incorrecto para probar s3_encryption.rego
-│       └── bad_sg.tf         # Security groups permisivos para probar sg_no_public_ingress.rego
-└── README.md
+│   ├── providers.tf           # Provider AWS ~> 6.0 + random + backend S3
+│   ├── variables.tf           # region, project_name, environment, vpc_cidr, db_name, db_username
+│   ├── main.tf                # KMS, random_password, Secrets Manager, VPC, RDS
+│   ├── outputs.tf             # ARNs, endpoint RDS, alias KMS, secret name
+│   └── aws.s3.tfbackend       # key = "lab15/terraform.tfstate"
+└── localstack/
+    ├── README.md              # Guía de despliegue en LocalStack
+    ├── providers.tf
+    ├── variables.tf
+    ├── main.tf
+    ├── outputs.tf
+    └── localstack.s3.tfbackend
 ```
 
-## Despliegue en AWS real
+## Despliegue en AWS
+
+### Paso 1 — Despliegue inicial (backend sin KMS)
+
+En el primer despliegue la CMK aún no existe, por lo que el backend usa SSE-S3:
 
 ```bash
 cd labs/lab-15/aws
 
+# Si no tienes la variable inicializada de la sección de requisitos previos:
+export BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
+
 terraform init \
   -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=${BUCKET}"
+  -backend-config="bucket=$BUCKET"
 
-terraform plan \
-  -var="github_org=<tu-org-o-usuario>" \
-  -var="github_repo=<nombre-del-repo>"
-
-terraform apply \
-  -var="github_org=<tu-org-o-usuario>" \
-  -var="github_repo=<nombre-del-repo>"
+terraform apply
 ```
 
-Para restringir a la rama `main` únicamente:
+> La instancia RDS puede tardar 5-10 minutos en estar disponible.
+
+### Paso 2 — Hardening del backend con KMS
+
+Una vez desplegada la infraestructura, protege el estado de Terraform con la CMK:
+
 ```bash
-terraform apply \
-  -var="github_org=<tu-org>" \
-  -var="github_repo=<tu-repo>" \
-  -var="allowed_ref=ref:refs/heads/main"
+KMS_ARN=$(terraform output -raw kms_key_arn)
 ```
+
+Edita `aws.s3.tfbackend` y añade/descomenta:
+
+```hcl
+kms_key_id = "<pega aquí el valor de KMS_ARN>"
+```
+
+Migra el estado al nuevo cifrado:
+
+```bash
+terraform init \
+  -reconfigure \
+  -backend-config=aws.s3.tfbackend \
+  -backend-config="bucket=$BUCKET"
+```
+
+A partir de este momento el `.tfstate` solo puede leerse con permisos `kms:Decrypt` sobre la CMK.
+
+## Despliegue en LocalStack
+
+Consulta [localstack/README.md](localstack/README.md) para instrucciones de
+despliegue local con LocalStack y sus limitaciones respecto a AWS real.
 
 ## Verificación final
 
-### OIDC Provider creado
+### 1. Comprobar la CMK y su rotación
 
 ```bash
-# Listar proveedores OIDC de la cuenta
-aws iam list-open-id-connect-providers
+aws kms describe-key --key-id alias/lab15-secrets \
+  --query 'KeyMetadata.{KeyId:KeyId,KeyState:KeyState,Description:Description}'
 
-# Inspeccionar el proveedor de GitHub
-OIDC_ARN=$(terraform output -raw oidc_provider_arn)
-aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$OIDC_ARN"
-# Esperado: url=token.actions.githubusercontent.com, ClientIDList=[sts.amazonaws.com]
+aws kms get-key-rotation-status \
+  --key-id $(terraform output -raw kms_key_arn)
+# Esperado: { "KeyRotationEnabled": true }
+# Nota: get-key-rotation-status no acepta alias, requiere Key ID (UUID) o ARN
 ```
 
-### Rol IAM
+### 2. Recuperar el secreto generado
 
 ```bash
-ROLE_ARN=$(terraform output -raw github_actions_role_arn)
-ROLE_NAME=$(terraform output -raw github_actions_role_name)
-
-aws iam get-role --role-name "$ROLE_NAME" \
-  --query 'Role.{Arn:Arn,AssumeRolePolicyDocument:AssumeRolePolicyDocument}'
-
-# Verificar que la Trust Policy contiene la condición StringLike sobre sub
-aws iam get-role --role-name "$ROLE_NAME" \
-  --query 'Role.AssumeRolePolicyDocument.Statement[0].Condition'
+aws secretsmanager get-secret-value \
+  --secret-id $(terraform output -raw secret_name) \
+  --query SecretString --output text | python3 -m json.tool
 ```
 
-### Verificar la Trust Policy del rol
-
-`sts:AssumeRoleWithWebIdentity` lo controla la **Trust Policy** del rol (política
-de recurso), no políticas de identidad. La forma correcta de verificarlo es
-inspeccionarla directamente:
-
-```bash
-# Ver la Trust Policy completa
-aws iam get-role \
-  --role-name "$ROLE_NAME" \
-  --query 'Role.AssumeRolePolicyDocument'
-
-# Confirmar las condiciones OIDC (aud + sub)
-aws iam get-role \
-  --role-name "$ROLE_NAME" \
-  --query 'Role.AssumeRolePolicyDocument.Statement[0].Condition'
-# Esperado:
-# {
-#   "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-#   "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<org>/<repo>:*" }
-# }
-```
-
-### Escaneo estático local (sin pipeline)
-
-```bash
-# Checkov
-pip install checkov
-checkov --directory . --framework terraform
-
-# Trivy
-brew install trivy   # macOS; en Linux: descarga el binario de GitHub Releases
-trivy config .
-
-# Conftest + política Rego (instalar una sola vez)
-brew install conftest
-
-# Probar la política s3_encryption con los fixtures incluidos
-conftest test ../policies/fixtures/bad_s3.tf \
-  --policy ../policies/ \
-  --parser hcl2 \
-  --all-namespaces
-
-# Validar código propio (p.ej. lab-13 que sí tiene S3)
-conftest test *.tf \
-  --policy ../policies/ \
-  --parser hcl2 \
-  --all-namespaces
-```
-
-## Prueba de la federación OIDC con GitHub Actions
-
-Una vez desplegada la infraestructura, la forma más directa de verificar que
-la federación OIDC funciona de extremo a extremo es ejecutar un workflow real
-en el repositorio GitHub que configuraste como entrada. Este apartado te guía
-paso a paso.
-
-### Cómo funciona el intercambio
-
-Antes de crear el workflow, conviene entender qué ocurre internamente:
-
-```
-Runner de GitHub                GitHub OIDC IdP             AWS STS
-      │                               │                        │
-      │ 1. Solicitar token OIDC       │                        │
-      │──────────────────────────────►│                        │
-      │                               │                        │
-      │ 2. JWT firmado (sub, aud...)  │                        │
-      │◄──────────────────────────────│                        │
-      │                               │                        │
-      │ 3. AssumeRoleWithWebIdentity (JWT + RoleArn)           │
-      │───────────────────────────────────────────────────────►│
-      │                               │                        │
-      │                               │  4. Verificar firma JWT│
-      │                               │◄───────────────────────│
-      │                               │  contra JWKS público   │
-      │                               │                        │
-      │                               │  5. Validar claims:    │
-      │                               │  aud == sts.amazonaws  │
-      │                               │  sub == repo:org/repo:*│
-      │                               │                        │
-      │ 6. Credenciales temporales (AccessKeyId, TTL 1h)       │
-      │◄───────────────────────────────────────────────────────│
-      │                               │                        │
-      │ 7. aws sts get-caller-identity (con creds temporales)  │
-      │───────────────────────────────────────────────────────►│
-```
-
-El JWT que emite GitHub contiene un claim `sub` con el formato:
-- `repo:<org>/<repo>:ref:refs/heads/<rama>` — desde una rama
-- `repo:<org>/<repo>:environment:<nombre>` — desde un entorno de GitHub
-
-La Trust Policy del rol IAM valida ese `sub` con `StringLike`. Si no coincide,
-STS devuelve `Not authorized to perform sts:AssumeRoleWithWebIdentity`.
-
-### Paso 1 — Crear el entorno `production` en GitHub
-
-Si has restringido el rol con `allowed_ref = "environment:production"` (en
-lugar del default `"*"`), antes de poder asumirlo necesitas que exista el
-entorno en GitHub.
-
-1. Ve a tu repositorio → **Settings** → **Environments** → **New environment**
-2. Nombre: `production`
-3. Opcional: activa **Required reviewers** para añadir aprobación manual
-
-> Si tu Trust Policy usa `allowed_ref = "*"` en lugar de `environment:production`,
-> omite este paso — el workflow funcionará desde cualquier rama.
-
-### Paso 2 — Añadir el secreto `AWS_ROLE_ARN`
-
-El ARN del rol creado por Terraform debe estar disponible en el workflow como secreto.
-
-Obtén el valor:
-
-```bash
-terraform output -raw github_actions_role_arn
-# Ejemplo: arn:aws:iam::510547572113:role/lab15-github-actions
-```
-
-En GitHub: **Settings** → **Secrets and variables** → **Actions** →
-**New repository secret**:
-
-| Campo | Valor |
-|---|---|
-| Name | `AWS_ROLE_ARN` |
-| Secret | el ARN del output anterior |
-
-### Paso 3 — Crear el workflow de prueba
-
-Desde la consola de GitHub, crea el fichero `.github/workflows/test-oidc.yml` en tu repositorio con el
-siguiente contenido:
-
-```yaml
-name: Test OIDC Federation
-
-on:
-  workflow_dispatch:
-
-permissions:
-  id-token: write   # Imprescindible: sin esto GitHub no emite el token OIDC
-  contents: read
-
-jobs:
-  test-oidc:
-    runs-on: ubuntu-latest
-    environment: production   # Hace que sub = repo:<org>/<repo>:environment:production
-
-    steps:
-      # ── Paso A: decodificar el JWT antes de enviarlo a AWS ────────────────
-      # Permite ver los claims exactos (sub, aud, iss) que recibirá la Trust Policy.
-      # Útil para diagnosticar si configure-aws-credentials falla.
-      - name: Decodificar claims del token OIDC
-        run: |
-          TOKEN=$(curl -s \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
-          echo "$TOKEN" | python3 -c "
-          import sys, json, base64
-          t = json.load(sys.stdin)['value'].split('.')[1]
-          t += '=' * (4 - len(t) % 4)
-          claims = json.loads(base64.b64decode(t))
-          print(json.dumps(claims, indent=2))
-          "
-
-      # ── Paso B: intercambiar el JWT por credenciales temporales de AWS ────
-      # La action envía el JWT a STS. AWS verifica la firma contra el JWKS
-      # público de GitHub y valida los claims contra la Trust Policy del rol.
-      - name: Obtener credenciales temporales via OIDC
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
-          role-session-name: GitHubActions-OIDC-Test
-
-      # ── Paso C: inspeccionar las credenciales temporales ─────────────────
-      # configure-aws-credentials inyecta tres variables de entorno:
-      #   AWS_ACCESS_KEY_ID     → visible (ASIA = temporal, AKIA = permanente)
-      #   AWS_SECRET_ACCESS_KEY → enmascarado automáticamente por la action (---)
-      #   AWS_SESSION_TOKEN     → enmascarado automáticamente por la action (---)
-      - name: Inspeccionar credenciales temporales
-        run: |
-          echo "=== Fuente de credenciales ==="
-          aws configure list
-
-          echo ""
-          echo "=== Access Key ID (ASIA = temporal, AKIA = permanente) ==="
-          echo "AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID"
-
-          echo ""
-          echo "=== Secret y Token (enmascarados por configure-aws-credentials) ==="
-          echo "AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY"
-          echo "AWS_SESSION_TOKEN: $AWS_SESSION_TOKEN"
-
-          echo ""
-          echo "=== Identidad y nombre de sesión ==="
-          aws sts get-caller-identity
-```
-
-**Por qué `permissions: id-token: write` es imprescindible**: por defecto los
-workflows de GitHub no tienen acceso al endpoint de tokens OIDC. Sin este
-permiso, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` está vacío y `configure-aws-credentials`
-se queda esperando indefinidamente hasta hacer timeout.
-
-**Por qué `environment: production`**: cuando un job declara `environment`,
-GitHub incluye el nombre del entorno en el claim `sub` del JWT:
-`repo:<org>/<repo>:environment:production`. Sin esta declaración, el `sub` sería
-`repo:<org>/<repo>:ref:refs/heads/main`, que no coincidiría con la Trust Policy
-si fue desplegada con `allowed_ref = environment:production`.
-
-### Paso 4 — Ejecutar el workflow y leer el output
-
-Haz push del fichero y ve a **Actions** → **Test OIDC Federation** →
-**Run workflow** → **Run workflow**.
-
-**Output esperado del Paso A** (claims del JWT):
+Resultado esperado:
 
 ```json
 {
-  "aud": "sts.amazonaws.com",
-  "iss": "https://token.actions.githubusercontent.com",
-  "sub": "repo:<org>/<repo>:environment:production",
-  "repository": "<org>/<repo>",
-  "ref": "refs/heads/main",
-  "event_name": "workflow_dispatch",
-  ...
+    "username": "dbadmin",
+    "password": "K#3mP!...(32 chars)...",
+    "engine": "mysql",
+    "host": "lab15-db.xxxx.us-east-1.rds.amazonaws.com",
+    "port": 3306,
+    "dbname": "appdb"
 }
 ```
 
-Los tres claims que AWS valida contra la Trust Policy son:
-- `iss` — debe coincidir con la URL del OIDC provider registrado en IAM
-- `aud` — debe ser `sts.amazonaws.com` (condición `StringEquals`)
-- `sub` — debe coincidir con el patrón de la condición `StringLike`
+La contraseña es visible al recuperar el secreto con permisos adecuados, pero
+nunca apareció en ninguna variable de entrada ni en la salida de Terraform.
 
-**Output esperado del Paso C**:
-
-```
-=== Fuente de credenciales ===
-      Name                    Value             Type    Location
-      ----                    -----             ----    --------
-   profile                <not set>             None    None
-access_key     ****************XXXX              env
-secret_key     ****************XXXX              env
-    region                us-east-1              env    AWS_REGION
-
-=== Access Key ID (ASIA = temporal, AKIA = permanente) ===
-AWS_ACCESS_KEY_ID: ASIAIOSFODNN7EXAMPLE
-
-=== Secret y Token (enmascarados por configure-aws-credentials) ===
-AWS_SECRET_ACCESS_KEY: ***
-AWS_SESSION_TOKEN: ***
-
-=== Identidad y nombre de sesión ===
-{
-    "UserId": "AROAXXXXXXXXXXXXXXXXX:GitHubActions-OIDC-Test",
-    "Account": "510547572113",
-    "Arn": "arn:aws:sts::510547572113:assumed-role/lab15-github-actions/GitHubActions-OIDC-Test"
-}
-```
-
-Tres indicadores que confirman que la federación OIDC funciona correctamente:
-
-| Indicador | Qué demuestra |
-|---|---|
-| `ASIA...` en el Key ID | Credencial temporal de STS — no es una llave permanente de IAM (`AKIA`) |
-| `***` en secret y token | `configure-aws-credentials` los registra como valores enmascarados con `core.setSecret()` — no filtrables en logs aunque el workflow los imprima explícitamente |
-| `assumed-role/lab15-github-actions/GitHubActions-OIDC-Test` en el ARN | El rol correcto fue asumido y la sesión lleva el nombre definido en `role-session-name` — útil para auditar en CloudTrail |
-
-Las credenciales tienen un TTL de 1 hora desde la asunción. Pasado ese tiempo,
-cualquier llamada a la API devuelve `ExpiredTokenException` y el workflow debe
-ejecutarse de nuevo para obtener credenciales frescas.
-
-### Diagnóstico de errores comunes
-
-| Error | Causa más probable | Solución |
-|---|---|---|
-| Step bloqueado / timeout | Falta `permissions: id-token: write` | Añadir el bloque `permissions` al workflow |
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | El `sub` del token no coincide con la Trust Policy | Verificar `github_org`, `github_repo` y `allowed_ref` con `terraform output` y redesplegar |
-| `ExpiredTokenException` | Las credenciales caducaron (TTL 1h) | Ejecutar el workflow de nuevo |
-
-Para comparar el `sub` real con la Trust Policy en cualquier momento:
+### 3. Verificar el cifrado del secreto con la CMK
 
 ```bash
-# Ver qué sub espera la Trust Policy
-aws iam get-role \
-  --role-name lab15-github-actions \
-  --query 'Role.AssumeRolePolicyDocument.Statement[0].Condition.StringLike'
-
-# El sub real lo muestra el Paso A del workflow en el log de Actions
+aws secretsmanager describe-secret \
+  --secret-id $(terraform output -raw secret_name) \
+  --query '{Name:Name,KmsKeyId:KmsKeyId,RotationEnabled:RotationEnabled}'
+# KmsKeyId debe apuntar a alias/lab15-secrets, no a aws/secretsmanager
 ```
 
----
-
-## Despliegue del pipeline DevSecOps
-
-Una vez verificada la federación OIDC, el siguiente paso del lab es activar el
-pipeline completo de [`pipeline/terraform-ci.yml`](pipeline/terraform-ci.yml).
-Combina los tres jobs del flujo DevSecOps:
-
-1. **`security-scan`** — Checkov + Trivy + Conftest (sin credenciales AWS).
-2. **`terraform-plan`** — en pull requests **y** en push a `main`, con OIDC y entorno `aws-readonly`. En el push a main genera el `tfplan` que reutiliza el job de apply.
-3. **`terraform-apply`** — solo en push a `main`, descarga el `tfplan` del job anterior y lo aplica con OIDC y aprobación manual en `aws-production`.
-
-### Paso 1 — Crear los entornos `aws-readonly` y `aws-production`
-
-En GitHub: **Settings** → **Environments** → **New environment**. Crea dos:
-
-| Entorno | Uso | Recomendación |
-|---|---|---|
-| `aws-readonly` | `terraform plan` en pull requests | Sin reviewers — automático |
-| `aws-production` | `terraform apply` tras merge a `main` | **Required reviewers** activado |
-
-> El workflow de test OIDC del apartado anterior usaba el entorno `production`
-> (más simple). Este pipeline usa dos entornos distintos para separar lectura
-> y escritura: alinea el `allowed_ref` del rol con los `sub` que GitHub emitirá
-> (`repo:<org>/<repo>:environment:aws-readonly` y `:environment:aws-production`).
-
-### Paso 2 — Ajustar el `allowed_ref` del rol IAM
-
-La Trust Policy debe aceptar los dos entornos. La forma más simple es usar `*`
-y dejar que GitHub Environments haga el control de aprobación, pero si quieres
-restricción estricta:
+### 4. Verificar el cifrado del volumen RDS
 
 ```bash
-terraform apply \
-  -var="github_org=<tu-org>" \
-  -var="github_repo=<tu-repo>" \
-  -var='allowed_ref=environment:aws-*'
+aws rds describe-db-instances \
+  --db-instance-identifier lab15-db \
+  --query 'DBInstances[0].{Status:DBInstanceStatus,Encrypted:StorageEncrypted,KmsKeyId:KmsKeyId}'
+# Esperado: Encrypted = true, KmsKeyId = ARN de la CMK
 ```
 
-### Paso 3 — Preparar el repo de pruebas y activar el pipeline
-
-GitHub Actions solo ejecuta workflows ubicados en `.github/workflows/` **del
-repo configurado en `github_org`/`github_repo`** (el que la Trust Policy del
-rol autoriza a asumir credenciales). No copies nada a este repo del curso —
-todo va al tuyo.
-
-El pipeline está escrito para trabajar sobre una estructura genérica:
-
-```
-<tu-repo>/
-├── .github/workflows/
-│   └── terraform-ci.yml      ← el pipeline (de lab-15/pipeline/)
-├── terraform/                ← código Terraform a desplegar (TF_DIR)
-│   ├── main.tf
-│   └── aws.s3.tfbackend
-└── policies/                 ← políticas OPA/Rego (--policy)
-    └── *.rego
-```
-
-Como punto de partida, dentro de [`pipeline/terraform/`](pipeline/terraform/)
-del lab tienes un **ejemplo mínimo y seguro** (clave KMS + rotación automática)
-diseñado para pasar todos los gates del pipeline sin intervención. Puedes
-sustituirlo después por tu propia infraestructura.
-
-Si aún no tienes un repo de pruebas, clónalo en `/tmp/` y trabaja desde ahí:
+### 5. Verificar el hardening del backend S3
 
 ```bash
-# Sustituye <tu-org>/<tu-repo> por los valores que pasaste a Terraform
-cd /tmp
-git clone git@github.com:<tu-org>/<tu-repo>.git
-cd <tu-repo>
-
-# Ajusta esto a la ruta absoluta de tu clon local del curso
-export LAB_REPO="$HOME/path/al/curso/terraform-on-aws"
-
-# 1. Copiar el workflow
-mkdir -p .github/workflows
-cp $LAB_REPO/labs/lab-15/pipeline/terraform-ci.yml .github/workflows/terraform-ci.yml
-
-# 2. Copiar las políticas OPA (puedes empezar con las del lab y añadir más)
-mkdir -p policies
-cp $LAB_REPO/labs/lab-15/policies/*.rego policies/
-
-# 3. Copiar el ejemplo Terraform mínimo de partida
-mkdir -p terraform
-cp $LAB_REPO/labs/lab-15/pipeline/terraform/* terraform/
-
-git add .github/workflows/terraform-ci.yml policies/ terraform/
-git commit -m "Activar pipeline DevSecOps de lab-15"
-git push
+aws s3api head-object \
+  --bucket "$BUCKET" \
+  --key "lab15/terraform.tfstate" \
+  --query '{SSE:ServerSideEncryption,KMSKeyId:SSEKMSKeyId}'
+# Esperado: SSE = "aws:kms", KMSKeyId = ARN de la CMK (no "aws/s3")
 ```
 
-A partir de aquí, cualquier cambio en `terraform/**` o `policies/**` dispara
-el pipeline. Cuando quieras desplegar tu propia infraestructura, sustituye
-los `*.tf` de `terraform/` por tu código (manteniendo la coherencia con el
-backend declarado en `aws.s3.tfbackend`).
-
-#### Probar los dos flujos del pipeline
-
-Para ver con tus propios ojos el comportamiento condicional de los jobs (que
-ya viste documentado en la sección anterior), prueba los dos escenarios:
-
-**A. Push directo a `main`** — dispara el flujo completo (security-scan →
-plan → apply con aprobación):
+### 6. Confirmar que la contraseña no es visible en el plan
 
 ```bash
-# Edita un fichero dentro de terraform/ para forzar el trigger del pipeline
-echo "# trigger inicial" >> terraform/main.tf
-git add terraform/main.tf
-git commit -m "Trigger inicial del pipeline"
-git push origin main
+terraform plan
 ```
 
-En la pestaña **Actions** del repo verás:
-- ✅ `security-scan`
-- ✅ `terraform-plan` (corre en push a main para generar el `tfplan`)
-- ⏸ `terraform-apply` — pausa esperando aprobación en `aws-production`. Apruébalo manualmente y observa el `terraform apply tfplan`.
+Busca `password = (sensitive value)` en la sección de `aws_db_instance.main`.
+El operador nunca ve la contraseña en texto plano, ni en el plan ni en los logs.
 
-**B. Crear una rama, push y abrir PR contra `main`** — dispara solo
-security-scan + plan (apply queda esperando al merge):
+### 7. Consumo del secreto desde una aplicación
 
-```bash
-git checkout -b feature/probar-pr
-echo "# cambio en una rama feature" >> terraform/main.tf
-git add terraform/main.tf
-git commit -m "Probar el flujo de PR"
-git push origin feature/probar-pr
-# Abre la PR desde la UI de GitHub o con: gh pr create --base main
+Las aplicaciones deben recuperar el secreto en tiempo de ejecución, no en tiempo
+de despliegue. Ejemplo con Python:
+
+```python
+import boto3, json
+
+def get_db_credentials(secret_name: str) -> dict:
+    client = boto3.client("secretsmanager", region_name="us-east-1")
+    response = client.get_secret_value(SecretId=secret_name)
+    return json.loads(response["SecretString"])
+
+creds = get_db_credentials("lab15/rds/master-credentials")
+connection_string = (
+    f"mysql+pymysql://{creds['username']}:{creds['password']}"
+    f"@{creds['host']}:{creds['port']}/{creds['dbname']}"
+)
 ```
 
-En el run del PR:
-- ✅ `security-scan`
-- ✅ `terraform-plan` (el reviewer puede inspeccionar el log antes de aprobar)
-- ⏭ `terraform-apply` — *skipped* (no es un push a main, todavía no toca aplicar)
+La aplicación obtiene las credenciales directamente de Secrets Manager en cada
+arranque. La contraseña nunca se persiste en variables de entorno ni en archivos
+de configuración.
 
-Cuando mergees la PR, GitHub dispara un nuevo run sobre `main` que sí
-ejecutará apply (con su pausa de aprobación).
+## Retos
 
-> **¿Pipeline no se dispara?** Suele ser por el filtro `paths:` del workflow:
-> si tu commit no toca `terraform/**` ni `policies/**`, GitHub no lanza el
-> workflow. Verifica con `git diff --name-only origin/main...HEAD`.
+### Reto 1 — Rol de aplicación con acceso exclusivo al secreto
 
-### Paso 4 — Permisos del rol
+El flujo Zero-Touch garantiza que la contraseña no pasa por variables del
+operador, pero actualmente cualquier principal IAM con permisos
+`secretsmanager:GetSecretValue` puede leer el secreto.
 
-El rol IAM tiene adjunta la política gestionada `PowerUserAccess`
-([aws/main.tf:65-93](aws/main.tf)), que concede acceso a casi todos los
-servicios AWS (S3, KMS, EC2, Lambda, etc.) salvo IAM, Organizations y
-Account settings. Permite que el pipeline despliegue casi cualquier
-infraestructura sin tener que ampliar la policy cada vez que cambias el demo.
+Cierra ese acceso implementando dos recursos:
 
-> ⚠️ **PowerUserAccess no es producción.** Es una decisión didáctica para
-> simplificar el lab. En producción se aplica el **principio de mínimo
-> privilegio**: una policy inline restringida a los ARNs y acciones concretas
-> que el rol necesita para gestionar sus recursos. Ver el [Reto](#reto--sustituir-poweruseraccess-por-una-policy-de-mínimo-privilegio)
-> para hacer ese ejercicio de fortificación.
+1. Un **rol IAM** (`aws_iam_role`) que represente a la aplicación que necesita
+   las credenciales de la base de datos, con una política inline que le permita
+   llamar a `GetSecretValue` sobre el secreto.
 
-> El **workflow de prueba OIDC** del apartado anterior es independiente: sigue
-> sirviendo para depurar la federación de forma aislada sin ejecutar Terraform
-> ni los gates de seguridad.
-
----
-
-## Ejercicio guiado — Tu primera política Rego
-
-La política `s3_encryption.rego` ya existe y funciona. Ahora vas a escribir tú
-una segunda política desde cero para aprender la estructura de Rego.
-
-### Objetivo
-
-Crear `policies/sg_no_public_ingress.rego` que deniegue cualquier Security Group
-que permita tráfico de entrada desde `0.0.0.0/0` (todo Internet IPv4) o `::/0`
-(todo Internet IPv6).
-
-### Anatomía de una política Rego
-
-Un fichero Rego tiene tres partes:
-
-```
-package <nombre>          ← namespace que agrupa las reglas
-
-<regla> contains msg if { ← cabecera: tipo + variable de salida
-    <condición 1>         ← cuerpo: todas deben ser verdaderas
-    <condición 2>         ← (AND implícito entre líneas)
-    msg := "texto"        ← construir el mensaje de error
-}
-```
-
-- **`deny contains msg if`**: regla que acumula mensajes de error en un conjunto.
-  Si el cuerpo es verdadero para alguna combinación de variables, añade `msg` al conjunto.
-- **`warn contains msg if`**: igual pero produce advertencias, no fallos.
-- **`[_]`**: iterador anónimo — recorre todos los elementos de un array u objeto.
-- **`some x`**: declara `x` como variable de iteración sobre las claves de un objeto.
-
-### Cómo conftest ve el HCL
-
-Antes de escribir la política, necesitas saber cómo conftest transforma el HCL.
-El parser HCL2 convierte cada bloque `resource` en un mapa de arrays:
+2. Una **política de recurso** (`aws_secretsmanager_secret_policy`) sobre el
+   secreto que deniegue `GetSecretValue` a cualquier principal que no sea ese
+   rol de aplicación.
 
 ```hcl
-# Código Terraform original
-resource "aws_security_group" "mi_sg" {
-  ingress {
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+# Rol de la aplicación — completar la Trust Policy y la política inline
+resource "aws_iam_role" "app" {
+  name = "${var.project_name}-app-role"
+  # ...
+}
+
+resource "aws_iam_role_policy" "app_read_secret" {
+  name = "${var.project_name}-read-secret"
+  role = aws_iam_role.app.id
+  # ...
+}
+
+# Política de recurso — completar el Statement de denegación
+resource "aws_secretsmanager_secret_policy" "db" {
+  secret_arn = aws_secretsmanager_secret.db.arn
+  policy = jsonencode({
+    # ...
+  })
 }
 ```
 
-Se convierte en este JSON (que Rego ve como `input`):
-
-```json
-{
-  "resource": {
-    "aws_security_group": {
-      "mi_sg": [
-        {
-          "ingress": [
-            { "cidr_blocks": ["0.0.0.0/0"] }
-          ]
-        }
-      ]
-    }
-  }
-}
-```
-
-El nivel extra de array (los `[...]` alrededor del objeto) es específico del
-parser HCL2 — requiere dos iteraciones: una para la clave del mapa y otra para
-desenvolver el array.
-
-### Paso 1 — Estructura básica del fichero
-
-Crea `labs/lab-15/policies/sg_no_public_ingress.rego` con el paquete, el
-import del syntax v1 (compatibilidad con versiones de OPA anteriores a la 1.0)
-y el conjunto de CIDRs prohibidos:
-
-```rego
-package terraform.security_groups
-
-import rego.v1
-
-public_cidrs := {"0.0.0.0/0", "::/0"}
-```
-
-`public_cidrs` es un **conjunto** Rego (llaves `{}`). El operador `in` comprueba
-pertenencia, lo que evita duplicar la regla para IPv4 e IPv6.
-
-### Paso 2 — Primera regla: SGs con ingress inline IPv4
-
-```rego
-deny contains msg if {
-    some sg_name                                              # (1)
-    sg_entries := input.resource.aws_security_group[sg_name] # (2)
-    sg         := sg_entries[_]                              # (3)
-    ingress    := sg.ingress[_]                              # (4)
-    cidr       := ingress.cidr_blocks[_]                     # (5)
-    cidr in public_cidrs                                     # (6)
-    msg := sprintf(
-        "FAIL [sg-no-public-ingress]: Security group '%s' permite ingreso desde '%s'.",
-        [sg_name, cidr],
-    )
-}
-```
-
-Línea por línea:
-
-1. `some sg_name` — declara la variable que iterará sobre los nombres de recurso.
-2. `sg_entries` — obtiene el array asociado al nombre (p.ej. `[{ingress: [...]}]`).
-3. `sg` — desenvuelve el array con `[_]`, dando el objeto con los atributos del SG.
-4. `ingress` — itera sobre los bloques `ingress` del SG (también es array).
-5. `cidr` — itera sobre cada CIDR del bloque ingress.
-6. `cidr in public_cidrs` — condición de fallo: el CIDR está en el conjunto prohibido.
-
-### Paso 3 — Segunda regla: SGs con ingress inline IPv6
-
-Añade una regla idéntica pero para `ipv6_cidr_blocks`:
-
-```rego
-deny contains msg if {
-    some sg_name
-    sg_entries := input.resource.aws_security_group[sg_name]
-    sg         := sg_entries[_]
-    ingress    := sg.ingress[_]
-    cidr       := ingress.ipv6_cidr_blocks[_]
-    cidr in public_cidrs
-    msg := sprintf(
-        "FAIL [sg-no-public-ingress-ipv6]: Security group '%s' permite ingreso IPv6 desde '%s'.",
-        [sg_name, cidr],
-    )
-}
-```
-
-### Paso 4 — Tercera regla: `aws_security_group_rule` independiente
-
-Terraform permite definir reglas de SG como recursos separados. Hay que cubrirlos:
-
-```rego
-deny contains msg if {
-    some rule_name
-    rule_entries := input.resource.aws_security_group_rule[rule_name]
-    rule         := rule_entries[_]
-    rule.type    == "ingress"
-    cidr         := rule.cidr_blocks[_]
-    cidr in public_cidrs
-    msg := sprintf(
-        "FAIL [sg-rule-no-public-ingress]: Regla de SG '%s' permite ingreso desde '%s'.",
-        [rule_name, cidr],
-    )
-}
-```
-
-La condición `rule.type == "ingress"` filtra solo las reglas de entrada — las
-de salida (`egress`) no son un problema de exposición pública.
-
-### Paso 5 — Verificar con el fixture
-
-El fichero `policies/fixtures/bad_sg.tf` contiene cuatro recursos diseñados para
-cubrir cada escenario:
-
-```
-aws_security_group "open_ipv4"   cidr_blocks      = ["0.0.0.0/0"]  → FAIL [sg-no-public-ingress]
-aws_security_group "open_ipv6"   ipv6_cidr_blocks = ["::/0"]        → FAIL [sg-no-public-ingress-ipv6]
-aws_security_group_rule "open_rule" cidr_blocks   = ["0.0.0.0/0"]  → FAIL [sg-rule-no-public-ingress]
-aws_security_group "restricted"  cidr_blocks      = ["10.0.0.0/8"] → sin fallos (1 passed)
-```
-
-Ejecuta:
-
-```bash
-conftest test labs/lab-15/policies/fixtures/bad_sg.tf \
-  --policy labs/lab-15/policies/ \
-  --parser hcl2 \
-  --all-namespaces
-```
-
-Salida esperada:
-
-```
-FAIL - bad_sg.tf - terraform.security_groups - FAIL [sg-no-public-ingress]: Security group 'open_ipv4' permite ingreso desde '0.0.0.0/0'.
-FAIL - bad_sg.tf - terraform.security_groups - FAIL [sg-no-public-ingress-ipv6]: Security group 'open_ipv6' permite ingreso IPv6 desde '::/0'.
-FAIL - bad_sg.tf - terraform.security_groups - FAIL [sg-rule-no-public-ingress]: Regla de SG 'open_rule' permite ingreso desde '0.0.0.0/0'.
-
-3 tests, 1 passed, 0 warnings, 3 failures, 0 exceptions
-```
-
-El `restricted` produce el "1 passed" — su CIDR `10.0.0.0/8` no está en `public_cidrs`.
-
----
-
-## Reto — Sustituir PowerUserAccess por una policy de mínimo privilegio
-
-El rol del lab tiene `PowerUserAccess`, lo que es cómodo para el demo pero
-sería inaceptable en producción: si las credenciales temporales se filtraran,
-el atacante podría tocar prácticamente cualquier servicio de la cuenta.
-
-Tu tarea es sustituir el `aws_iam_role_policy_attachment` actual por una
-**policy inline de mínimo privilegio** que conceda exactamente lo que el demo
-del pipeline (`pipeline/terraform/main.tf`) necesita y nada más:
-
-- `s3:Get*/Put*/List*/Delete*` solo sobre el bucket de estado (con condition
-  de prefijo si quieres ser aún más estricto).
-- Permisos KMS para gestionar la CMK del demo (CreateKey, CreateAlias,
-  Describe/Get/Put policy, EnableKeyRotation, TagResource, ScheduleKeyDeletion...).
-- `iam:GetRole`, `iam:GetOpenIDConnectProvider` y similares para el refresh
-  del estado del propio lab-15.
-
-**Requisito**: nada de políticas gestionadas AWS (`ReadOnlyAccess`,
-`PowerUserAccess`, etc.). Todo en `data.aws_iam_policy_document` declarando
-acciones y recursos concretos.
+**Pistas:**
+- La Trust Policy del rol debe permitir que alguien lo asuma. Usa
+  `ec2.amazonaws.com` como principal (simula que es el rol de una instancia).
+- La política inline necesita `secretsmanager:GetSecretValue` y
+  `secretsmanager:DescribeSecret` sobre el ARN exacto del secreto.
+- La política de recurso debe tener un `Deny` con `StringNotLike` sobre
+  `aws:PrincipalArn` apuntando al ARN del rol de aplicación.
 
 #### Prueba
 
 ```bash
-ROLE_NAME=$(terraform output -raw github_actions_role_name)
+SECRET=$(terraform output -raw secret_name)
 
-# 1. Confirmar que PowerUserAccess ya no está adjunto
-aws iam list-attached-role-policies --role-name "$ROLE_NAME"
-# Esperado: lista vacía o sin "PowerUserAccess"
+# 1. Confirmar que el rol de aplicación existe
+aws iam get-role --role-name lab15-app-role \
+  --query 'Role.{RoleName:RoleName,Arn:Arn}'
 
-# 2. Confirmar que la policy inline existe con los statements esperados
-aws iam list-role-policies --role-name "$ROLE_NAME"
-# Esperado: ["lab15-terraform-permissions"] (o el nombre que le hayas dado)
-
+# 2. Confirmar que el rol tiene la política inline que permite leer el secreto
 aws iam get-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name lab15-terraform-permissions \
-  --query 'PolicyDocument.Statement[].Sid'
-# Esperado: nombres de tus statements (TerraformStateS3, KMSManagement, IAMReadOnly, etc.)
+  --role-name lab15-app-role \
+  --policy-name lab15-read-secret \
+  --query 'PolicyDocument.Statement[0].{Effect:Effect,Action:Action,Resource:Resource}'
+# Esperado: Effect "Allow", Action incluye secretsmanager:GetSecretValue,
+#           Resource = ARN exacto del secreto
 
-# 3. Re-ejecutar el pipeline en tu repo de pruebas. El plan y el apply del
-#    demo (KMS) deben seguir funcionando. Si añades un recurso fuera del
-#    alcance de la policy (ej. un aws_s3_bucket), el apply debe fallar con
-#    AccessDenied — eso prueba que el principio funciona.
+# 3. Verificar el contenido de la resource policy del secreto
+aws secretsmanager get-resource-policy \
+  --secret-id "$SECRET" \
+  --query ResourcePolicy --output text | python3 -m json.tool
+# Esperado: Statement con Deny y condición StringNotLike sobre el rol de app
+
+# 4. Verificación end-to-end: tu usuario actual NO es el rol de app, así que
+#    la resource policy debe denegarte el acceso al secreto. Es la prueba
+#    definitiva de que el control funciona.
+aws secretsmanager get-secret-value --secret-id "$SECRET" 2>&1 | head -3
+# Esperado: AccessDeniedException ... explicit deny in a resource-based policy
 ```
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto — Sustituir PowerUserAccess por una policy de mínimo privilegio</strong></summary>
+<summary><strong>Solución al Reto 1 — Rol de aplicación con acceso exclusivo al secreto</strong></summary>
 
-### Solución al Reto — Sustituir PowerUserAccess por una policy de mínimo privilegio
+### Solución al Reto 1 — Rol de aplicación con acceso exclusivo al secreto
 
-**Paso 1 — Eliminar el attachment de PowerUserAccess en `aws/main.tf`**:
+**Por qué dos capas: política inline + política de recurso**
 
-Borra el recurso `aws_iam_role_policy_attachment.github_actions_poweruser`.
+La política inline en el rol concede el permiso desde el lado del principal
+("el rol puede hacer X"). La política de recurso en el secreto deniega desde
+el lado del recurso ("solo este rol puede acceder aquí"). Usadas juntas crean
+una lista blanca bidireccional: para leer el secreto hay que ser el rol correcto
+Y el secreto tiene que permitirlo explícitamente.
 
-**Paso 2 — Declarar la policy inline con los statements mínimos**:
+**Por qué `StringNotLike` y no `StringNotEquals` en la política de recurso**
+
+Cuando un rol es asumido, el ARN de sesión tiene la forma
+`arn:aws:sts::123456789012:assumed-role/lab15-app-role/session-name`, que es
+distinto al ARN del rol `arn:aws:iam::123456789012:role/lab15-app-role`.
+`StringNotEquals` rechazaría las sesiones asumidas aunque vengan del rol
+correcto. Con `StringNotLike` y el wildcard `*` al final se cubren todas las
+sesiones del rol sin importar el nombre de sesión.
+
+**Código completo a añadir en `main.tf`**
 
 ```hcl
-data "aws_iam_policy_document" "terraform_permissions" {
-  # Estado de Terraform en S3
-  statement {
-    sid    = "TerraformStateS3"
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject",
-      "s3:ListBucket",
-    ]
-    resources = [
-      "arn:aws:s3:::terraform-state-labs-${data.aws_caller_identity.current.account_id}",
-      "arn:aws:s3:::terraform-state-labs-${data.aws_caller_identity.current.account_id}/*",
-    ]
-  }
+# Rol IAM que representa a la aplicación consumidora del secreto.
+# Trust Policy: ec2.amazonaws.com puede asumir el rol (simula una instancia EC2).
+resource "aws_iam_role" "app" {
+  name        = "${var.project_name}-app-role"
+  description = "Rol de la aplicacion - unico principal autorizado a leer el secreto de RDS"
 
-  # Gestión de la CMK del demo del pipeline.
-  # KMS no soporta ARNs específicos en CreateKey/CreateAlias - hay que usar "*".
-  statement {
-    sid    = "KMSManagement"
-    effect = "Allow"
-    actions = [
-      "kms:CreateKey", "kms:CreateAlias", "kms:DeleteAlias", "kms:UpdateAlias",
-      "kms:DescribeKey", "kms:GetKeyPolicy", "kms:PutKeyPolicy",
-      "kms:GetKeyRotationStatus", "kms:EnableKeyRotation", "kms:DisableKeyRotation",
-      "kms:UpdateKeyDescription",
-      "kms:TagResource", "kms:UntagResource", "kms:ListResourceTags",
-      "kms:ListAliases", "kms:ListKeys",
-      "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion",
-    ]
-    resources = ["*"]
-  }
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowEC2Assume"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
 
-  # IAM read-only para el refresh del estado del propio lab-15
-  statement {
-    sid    = "IAMReadOnly"
-    effect = "Allow"
-    actions = [
-      "iam:GetRole",
-      "iam:GetPolicy", "iam:GetPolicyVersion",
-      "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
-      "iam:GetOpenIDConnectProvider",
-    ]
-    resources = ["*"]
-  }
-
-  # STS para que aws_caller_identity funcione
-  statement {
-    sid       = "STSCallerIdentity"
-    effect    = "Allow"
-    actions   = ["sts:GetCallerIdentity"]
-    resources = ["*"]
-  }
+  tags = merge(local.common_tags, { Name = "${var.project_name}-app-role" })
 }
 
-resource "aws_iam_role_policy" "github_actions_terraform" {
-  name   = "${var.project}-terraform-permissions"
-  role   = aws_iam_role.github_actions.id
-  policy = data.aws_iam_policy_document.terraform_permissions.json
+# Política inline: el rol puede leer y describir el secreto de RDS.
+# Se limita al ARN exacto del secreto — principio de mínimo privilegio.
+resource "aws_iam_role_policy" "app_read_secret" {
+  name = "${var.project_name}-read-secret"
+  role = aws_iam_role.app.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ReadRDSSecret"
+      Effect = "Allow"
+      Action = [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+      ]
+      Resource = aws_secretsmanager_secret.db.arn
+    }]
+  })
+}
+
+# Política de recurso: deniega GetSecretValue a cualquier principal
+# que no sea el rol de aplicación. El Deny explícito tiene precedencia
+# sobre cualquier Allow en las políticas de identidad de otros principals.
+resource "aws_secretsmanager_secret_policy" "db" {
+  secret_arn = aws_secretsmanager_secret.db.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyAllExceptAppRole"
+      Effect    = "Deny"
+      Principal = { AWS = "*" }
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.db.arn
+      Condition = {
+        StringNotLike = {
+          # El wildcard cubre tanto el ARN del rol como el ARN de las sesiones
+          # asumidas: arn:aws:sts::...:assumed-role/lab15-app-role/*
+          "aws:PrincipalArn" = "${aws_iam_role.app.arn}"
+        }
+      }
+    }]
+  })
 }
 ```
 
-**Paso 3 — Aplicar y verificar**:
+**Output necesario para la prueba**
 
-```bash
-terraform apply -var="github_org=<tu-org>" -var="github_repo=<tu-repo>"
+Añade en `outputs.tf`:
+
+```hcl
+output "app_role_arn" {
+  description = "ARN del rol IAM de la aplicacion"
+  value       = aws_iam_role.app.arn
+}
+
 ```
 
-**Por qué algunos statements usan `resources = ["*"]`**: muchas acciones
-KMS de creación (`CreateKey`, `CreateAlias`) no admiten ARNs específicos
-porque el recurso aún no existe en el momento de la llamada. IAM requiere
-`"*"` para esos casos. Donde sí se puede (S3 buckets concretos), se usa el
-ARN específico.
+**Efecto neto tras aplicar**
 
-**Si añades nuevos recursos al demo**: cuando sustituyes `pipeline/terraform/`
-por código que use otros servicios (RDS, EC2, Lambda...), el apply fallará
-con `AccessDenied` hasta que añadas los statements correspondientes a esta
-policy. Esto es el principio funcionando — vas concediendo permisos
-deliberadamente, no por defecto.
+```
+┌─────────────────────────────────────────────────────────┐
+│  aws_secretsmanager_secret "db"                         │
+│                                                         │
+│  Política de recurso:                                   │
+│    Deny GetSecretValue → todos EXCEPTO lab15-app-role   │
+│                                                         │
+│  ✓ lab15-app-role          → Allow (política inline)    │
+│  ✗ cualquier otro usuario  → Deny  (política recurso)   │
+│  ✗ cualquier otro rol      → Deny  (política recurso)   │
+└─────────────────────────────────────────────────────────┘
+```
+
+> **Nota:** después de aplicar, tu usuario de operador también quedará bloqueado
+> para `GetSecretValue` (a menos que lo añadas a la condición `StringNotLike`).
+> Esto es intencional — demuestra que el Deny de la política de recurso tiene
+> precedencia sobre cualquier Allow en las políticas de identidad.
+
+> **Implicación al destruir:** Terraform invoca `GetSecretValue` durante el
+> refresh para leer el estado de `aws_secretsmanager_secret_version`. Con la
+> resource policy aplicada tu operador queda bloqueado y `terraform destroy`
+> falla con `AccessDeniedException`. La sección [Limpieza](#limpieza) documenta
+> el workaround.
 
 </details>
 
 ## Limpieza
 
+> Si migraste el backend a KMS, revierte `kms_key_id` en `aws.s3.tfbackend`
+> y ejecuta `terraform init -backend-config=aws.s3.tfbackend -backend-config="bucket=$BUCKET" -reconfigure` antes de destruir — de lo contrario
+> la CMK se destruirá primero y el estado quedará ilegible.
+>
+> La CMK tiene `deletion_window_in_days = 7`: durante esos 7 días está
+> deshabilitada pero no eliminada. Puedes cancelar el borrado con
+> `aws kms cancel-key-deletion --key-id <key-id>`.
+
+> **Si aplicaste el Reto 1**, la resource policy del secreto deniega
+> `GetSecretValue` a tu operador. Terraform necesita esa acción durante el
+> refresh previo al destroy (para leer el estado de `aws_secretsmanager_secret_version`),
+> así que el destroy fallará con `AccessDeniedException`. Solución:
+>
+> ```bash
+> # Eliminar la resource policy con la CLI
+> aws secretsmanager delete-resource-policy \
+>   --secret-id $(terraform output -raw secret_name)
+>
+> # Refrescar el estado para que Terraform vea que la policy ya no está
+> terraform refresh
+
 ```bash
-cd labs/lab-15/aws
-terraform destroy \
-  -var="github_org=<tu-org>" \
-  -var="github_repo=<tu-repo>"
+terraform destroy
 ```
 
 ## Buenas prácticas aplicadas
 
-- **Sin credenciales estáticas**: el rol IAM sólo es asumible via OIDC, nunca con `AWS_ACCESS_KEY_ID`.
-- **Lock nativo de S3**: Terraform ≥ 1.10 gestiona el lock con un fichero `.tflock` en el propio bucket — sin dependencia de DynamoDB.
-- **Restricción por repositorio y ref**: la condición `StringLike` en `sub` evita que otros repositorios asuman el rol.
-- **Separación de entornos GitHub**: `aws-readonly` para `plan` (automático) y `aws-production` para `apply` (con aprobación manual). El claim `sub` del JWT incluye el entorno, lo que permitiría incluso usar dos roles distintos en AWS.
-- **Plan reutilizado en apply**: el `terraform apply` consume el `tfplan` generado por el job de plan en el mismo run — sin re-plan ni "plan drift" entre validación y ejecución.
-- **Seguridad desplazada a la izquierda**: Checkov y Trivy ejecutan antes del `plan` — un fallo de seguridad bloquea el pipeline sin consumir llamadas a AWS.
-- **Política como código**: OPA/Rego permite versionar, revisar y reutilizar reglas de compliance igual que el código de infraestructura.
-- **PowerUserAccess solo para el lab**: el rol del pipeline tiene una política gestionada amplia para simplificar el aprendizaje, pero el [Reto](#reto--sustituir-poweruseraccess-por-una-policy-de-mínimo-privilegio) muestra cómo sustituirla por una policy inline de mínimo privilegio — patrón obligatorio en producción.
+| Práctica | Implementación |
+|----------|----------------|
+| Zero-Touch — sin credenciales en variables de entrada | `random_password.result` inyectado directamente, sin `var.db_password` |
+| Sensitive value | `random_password` oculta el valor en `terraform plan` y logs |
+| Formato JSON en Secrets Manager | Una sola llamada a `GetSecretValue` devuelve todos los datos de conexión |
+| CMK compartida entre servicios | Una sola llave KMS cifra Secrets Manager, RDS y el backend S3 |
+| Hardening del backend | `kms_key_id` en el backend S3 protege el `.tfstate` que contiene la contraseña |
+| `recovery_window_in_days = 0` | Evita conflictos de nombre al destruir y re-crear el lab |
+| Rotación automática de la CMK | `enable_key_rotation = true` — anual, sin cambio de ARN |
 
 ## Recursos
 
-- [Configurar OIDC de GitHub en AWS — Documentación oficial](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws)
-- [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)
-- [Checkov — Reglas para Terraform](https://www.checkov.io/5.Policy%20Index/terraform.html)
-- [Trivy — Documentación](https://trivy.dev/)
-- [OPA/Rego — Documentación](https://www.openpolicyagent.org/docs/policy-language)
-- [Conftest — Testing con OPA](https://www.conftest.dev/)
+- [random_password — Terraform Registry](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/password)
+- [Secrets Manager — Buenas prácticas](https://docs.aws.amazon.com/secretsmanager/latest/userguide/best-practices.html)
+- [Rotación de secretos para RDS](https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html)
+- [KMS Key Rotation — AWS Docs](https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html)
+- [Backend S3 — kms_key_id](https://developer.hashicorp.com/terraform/language/backend/s3#kms_key_id)
+- [Sensitive data in Terraform state](https://developer.hashicorp.com/terraform/language/manage-sensitive-data)
+- [aws_secretsmanager_secret_version — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/secretsmanager_secret_version)

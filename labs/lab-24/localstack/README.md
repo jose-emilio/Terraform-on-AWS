@@ -1,28 +1,96 @@
-# Laboratorio 24 — LocalStack: El "Wrapper" Corporativo: RDS + VPC
+# Laboratorio 24 — LocalStack: Diseño de Interfaz Robusta y "Fail-Safe"
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-## No disponible en LocalStack Community
+Esta guía adapta el lab24 para ejecutarse íntegramente en LocalStack. Los tres módulos (`safe-network`, `validated-bucket`, `db-config`) funcionan igual que en AWS real. Las validaciones, precondiciones y postcondiciones son evaluadas por el motor de Terraform, no por el proveedor, por lo que funcionan idénticamente. La diferencia principal es que `db-config` usa SSM SecureString en lugar de Secrets Manager.
 
-Este laboratorio **no tiene versión LocalStack** porque depende de servicios que no están disponibles en la edición Community:
+## Requisitos previos
 
-| Servicio | LocalStack Community | Requerido por |
+- LocalStack corriendo: `localstack start -d`
+- lab02/localstack desplegado (crea el bucket `terraform-state-labs` usado como backend de tfstate)
+- AWS CLI configurado para LocalStack:
+
+```bash
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+alias awslocal='aws --endpoint-url=http://localhost.localstack.cloud:4566'
+```
+
+## Despliegue
+
+```bash
+cd labs/lab-24/localstack
+
+terraform init -backend-config=localstack.s3.tfbackend
+
+terraform apply \
+  -var="bucket_name=empresa-lab24-data-000000000000" \
+  -var='db_password=MiPassword123Seguro'
+```
+
+Revisa los outputs:
+
+```bash
+terraform output
+# vpc_id            = "vpc-..."
+# vpc_cidr          = "10.19.0.0/16"
+# bucket_id         = "empresa-lab24-data-000000000000"
+# db_config_summary = { engine = "mysql", ... }
+# ssm_prefix        = "/lab24/db/"
+```
+
+## Verificación
+
+### Probar validaciones (funcionan igual que en AWS)
+
+```bash
+# Nombre sin prefijo → debe fallar
+terraform plan -var="bucket_name=mi-bucket" -var='db_password=MiPassword123Seguro'
+# Error: El nombre del bucket debe comenzar con 'empresa-'...
+
+# Contraseña débil → debe fallar
+terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=corta'
+# Error: La contraseña debe tener al menos 12 caracteres.
+
+# Motor inválido → debe fallar
+terraform plan \
+  -var="bucket_name=empresa-test-bucket" \
+  -var='db_password=MiPassword123Seguro' \
+  -var='db_config={"engine":"oracle","engine_version":"19c","instance_class":"db.m5.large","allocated_storage":50}'
+# Error: El motor de base de datos debe ser uno de: mysql, postgres, mariadb.
+```
+
+### Verificar recursos creados
+
+```bash
+# Bucket
+awslocal s3 ls | grep empresa
+
+# Parámetros SSM
+awslocal ssm get-parameters-by-path \
+  --path "/lab24/db/" \
+  --query 'Parameters[].{Name: Name, Value: Value}' \
+  --output table
+```
+
+## Limitaciones en LocalStack
+
+| Característica | AWS Real | LocalStack Community |
 |---|---|---|
-| **RDS** | No disponible | Módulo `terraform-aws-modules/rds/aws` |
-| **Secrets Manager (RDS managed)** | Parcial | `manage_master_user_password = true` |
-| **VPC completa** | Emulación parcial | Módulo `terraform-aws-modules/vpc/aws` (NAT GW, route tables) |
+| `validation` en variables | Funciona | Funciona (evaluado por Terraform) |
+| `postcondition` en recursos | Funciona | Funciona (evaluado por Terraform) |
+| `precondition` en recursos | Funciona | Funciona (evaluado por Terraform) |
+| `sensitive = true` | Oculta en plan/apply | Oculta en plan/apply |
+| Secrets Manager | Completo | Emulación parcial |
+| SSM SecureString | Cifrado con KMS | Sin cifrado real |
+| VPC | Completa | Emulada |
 
-## Alternativa
+## Limpieza
 
-Para practicar los conceptos de este laboratorio sin coste de AWS:
-
-1. **Composición de módulos y encadenamiento de outputs**: revisa el lab22 (módulos S3) y lab23 (módulos con validación) en sus versiones localstack
-2. **Parámetros hardcoded**: el concepto se puede practicar con cualquier módulo que use S3 o VPC básica
-3. **`moved {}` blocks**: funciona con cualquier recurso de Terraform, incluso con recursos locales (`local_file`, `null_resource`)
-
-## Ejecución en AWS
-
-Este laboratorio requiere una cuenta de AWS real. Consulta la guía principal en [../README.md](../README.md).
-
-> **Aviso de coste:** La instancia RDS `db.t4g.micro` tiene coste por hora. Destruye los recursos al finalizar.
+```bash
+terraform destroy \
+  -var="bucket_name=empresa-lab24-data-000000000000" \
+  -var='db_password=MiPassword123Seguro'
+```

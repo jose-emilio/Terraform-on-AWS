@@ -10,10 +10,6 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.0"
     }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.0"
-    }
   }
 
   # Configuracion parcial del backend. Todos los parametros estan en
@@ -27,4 +23,3 @@ provider "aws" {
 }
 
 provider "random" {}
-provider "archive" {}

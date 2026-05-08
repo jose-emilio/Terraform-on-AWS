@@ -1,6 +1,6 @@
-# Backend config completo para Lab18 en LocalStack.
+# Backend config completo para Lab17 en LocalStack.
 # El bucket terraform-state-labs es creado por Lab02/localstack/ al desplegar en LocalStack.
-# Usalo asi:
+# Úsalo así:
 #   terraform init -backend-config=localstack.s3.tfbackend
 bucket                      = "terraform-state-labs"
 key                         = "lab18/terraform.tfstate"

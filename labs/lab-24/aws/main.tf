@@ -1,16 +1,21 @@
 # ===========================================================================
-# Lab24 — El "Wrapper" Corporativo: RDS + VPC
+# Lab23 — Diseño de Interfaz Robusta y "Fail-Safe"
 # ===========================================================================
-# Invoca el módulo corporate-rds que internamente orquesta:
-#   - Módulo público VPC (terraform-aws-modules/vpc/aws)
-#   - Módulo público RDS (terraform-aws-modules/rds/aws)
-#   - Security group restrictivo
-# Con parámetros de seguridad hardcoded que el equipo no puede desactivar.
+# Tres módulos que demuestran técnicas de validación defensiva:
+#   - safe-network:     VPC con postcondition RFC 1918
+#   - validated-bucket: S3 con regex de prefijo corporativo
+#   - db-config:        Tipo object + sensitive + Secrets Manager + SSM
 # ===========================================================================
+
+# --- Data Sources ---
+
+data "aws_caller_identity" "current" {}
 
 # --- Locals ---
 
 locals {
+  account_id = data.aws_caller_identity.current.account_id
+
   common_tags = {
     Environment = var.environment
     ManagedBy   = "terraform"
@@ -19,24 +24,42 @@ locals {
 }
 
 # ===========================================================================
-# Módulo Wrapper — corporate-rds
+# Módulo safe-network — VPC con postcondición RFC 1918
 # ===========================================================================
 
-module "corporate_rds" {
-  source = "./modules/corporate-rds"
+module "network" {
+  source = "./modules/safe-network"
 
+  vpc_cidr     = var.vpc_cidr
   project_name = var.project_name
   environment  = var.environment
+  tags         = local.common_tags
+}
 
-  # Red
-  vpc_cidr = "10.20.0.0/16"
+# ===========================================================================
+# Módulo validated-bucket — S3 con nombre validado por regex
+# ===========================================================================
 
-  # Base de datos (solo parámetros que el equipo puede elegir)
-  db_engine         = "mysql"
-  db_engine_version = "8.0"
-  db_instance_class = "db.t4g.micro"
-  db_name           = "appdb"
-  db_username       = "admin"
+module "corporate_bucket" {
+  source = "./modules/validated-bucket"
 
-  tags = local.common_tags
+  bucket_name   = var.bucket_name
+  force_destroy = true
+
+  tags = merge(local.common_tags, {
+    Purpose = "corporate-data"
+  })
+}
+
+# ===========================================================================
+# Módulo db-config — Configuración de DB con tipos complejos y secretos
+# ===========================================================================
+
+module "database" {
+  source = "./modules/db-config"
+
+  project_name = var.project_name
+  db_config    = var.db_config
+  db_password  = var.db_password
+  tags         = local.common_tags
 }

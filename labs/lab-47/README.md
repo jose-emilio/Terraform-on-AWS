@@ -26,7 +26,7 @@ La arquitectura tiene cuatro capas:
    Glacier Deep Archive tras 90 días, aprovechando que los datos de auditoría se
    consultan raramente pero deben conservarse durante años.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Habilitar VPC Flow Logs sobre la VPC por defecto, capturando solo el tráfico REJECT
 - Entender el formato estándar de los registros de flujo y cómo consultarlos
@@ -221,7 +221,7 @@ Para 1 TB de logs de auditoría retenidos 2 años:
 - 3 meses Standard + 21 meses GDA: (3 × $23) + (21 × $0.99) = $69 + $20.79 = **$89.79**
 - Ahorro total: **~$462 por TB** (83% menos en el escenario completo)
 
-## Estructura
+## Estructura del proyecto
 
 ```
 lab-47/
@@ -1307,7 +1307,7 @@ Un escáner de puertos típico (nmap, masscan) envía decenas de paquetes por se
 el ruido de fondo de internet (bots, crawlers ocasionales) pero captura patrones
 activos de escaneo. En producción ajustarías este valor según el baseline observado.
 
-**SNS Topic y suscripción** → [aws/monitoring.tf](aws/monitoring.tf):
+**SNS Topic y suscripción** → `aws/monitoring.tf`:
 
 ```hcl
 resource "aws_sns_topic" "security_alerts" {

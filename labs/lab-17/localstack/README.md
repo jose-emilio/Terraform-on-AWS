@@ -1,9 +1,9 @@
-# Laboratorio 17 — LocalStack: Optimización de Salida a Internet y "NAT Tax"
+# Laboratorio 17 — LocalStack: Red Multi-AZ Robusta y Dinámica
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guía adapta el lab17 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia principal es que **la Instancia NAT no está disponible** (requiere AMIs reales de EC2), por lo que solo se despliega la variante con NAT Gateway.
+Esta guía adapta el lab17 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia reside en la configuración del provider y el backend.
 
 ## Requisitos previos
 
@@ -32,86 +32,52 @@ Revisa los outputs:
 
 ```bash
 terraform output
-# vpc_id                  = "vpc-xxxxxxxxx"
-# internet_gateway_id     = "igw-xxxxxxxxx"
-# nat_gateway_ids         = { "public-1" = "nat-xxxxxxxxx", ... }
-# nat_public_ips          = { "public-1" = "x.x.x.x", ... }
-# s3_endpoint_id          = "vpce-xxxxxxxxx"
-# private_subnet_ids      = { "private-1" = "subnet-xxx", ... }
-# private_route_table_ids = { "private-1" = "rtb-xxx", ... }
+# vpc_id             = "vpc-xxxxxxxxx"
+# vpc_cidr           = "10.12.0.0/16"
+# availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+# subnet_cidrs       = { "private-1" = "10.12.10.0/24", ... }
 ```
 
 ## Verificación
 
-### Internet Gateway
+### VPC
 
 ```bash
-awslocal ec2 describe-internet-gateways \
+awslocal ec2 describe-vpcs \
   --filters Name=tag:Project,Values=lab17 \
-  --query 'InternetGateways[].{ID: InternetGatewayId, VPC: Attachments[0].VpcId}' \
+  --query 'Vpcs[*].[VpcId,CidrBlock]' \
   --output table
 ```
 
-### NAT Gateway
+### Subredes
 
 ```bash
-awslocal ec2 describe-nat-gateways \
-  --filter Name=tag:Project,Values=lab17 \
-  --query 'NatGateways[].{ID: NatGatewayId, State: State, SubnetId: SubnetId}' \
-  --output table
-```
-
-### Tablas de rutas
-
-```bash
-# Tabla pública: 0.0.0.0/0 → IGW
-awslocal ec2 describe-route-tables \
-  --filters Name=tag:Name,Values=lab17-public-rt \
-  --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, GatewayId: GatewayId, NatGatewayId: NatGatewayId}' \
-  --output table
-
-# Tablas privadas (una por AZ): 0.0.0.0/0 → NAT GW + prefijo S3 → VPC Endpoint
-awslocal ec2 describe-route-tables \
-  --filters "Name=tag:Name,Values=lab17-private-rt-*" \
-  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, GatewayId: GatewayId, NatGatewayId: NatGatewayId}}' \
-  --output json
-```
-
-### VPC Endpoint para S3
-
-```bash
-awslocal ec2 describe-vpc-endpoints \
+awslocal ec2 describe-subnets \
   --filters Name=tag:Project,Values=lab17 \
-  --query 'VpcEndpoints[].{ID: VpcEndpointId, Service: ServiceName, State: State, RouteTables: RouteTableIds}' \
+  --query 'Subnets[*].[SubnetId,AvailabilityZone,CidrBlock,Tags[?Key==`Name`].Value|[0]]' \
   --output table
 ```
 
-## Instancia de test
-
-Igual que en la versión aws/, este lab despliega una `aws_instance.test` en
-`private-1` con un Security Group que solo permite tráfico saliente (`ingress = []`
-explícito). En LocalStack esta instancia no ejecuta tráfico real — su único
-propósito es validar la estructura Terraform: que el SG, las dependencias del
-NAT Gateway y la asociación de subred privada se declaren correctamente.
+### Tags EKS
 
 ```bash
-awslocal ec2 describe-instances \
+awslocal ec2 describe-subnets \
   --filters Name=tag:Project,Values=lab17 \
-  --query 'Reservations[].Instances[].{ID: InstanceId, AZ: Placement.AvailabilityZone, SubnetId: SubnetId}' \
+  --query 'Subnets[].{Name: Tags[?Key==`Name`].Value|[0], ELB: Tags[?Key==`kubernetes.io/role/elb`].Value|[0], InternalELB: Tags[?Key==`kubernetes.io/role/internal-elb`].Value|[0], Cluster: Tags[?Key==`kubernetes.io/cluster/lab17`].Value|[0]}' \
   --output table
 ```
 
-## Limitaciones en LocalStack
+## Probar la postcondición
 
-| Característica | AWS Real | LocalStack |
-|---|---|---|
-| NAT Gateway | Funcional, procesa tráfico | Emulado, sin tráfico real |
-| NAT Instance | AL2023 ARM + iptables user_data | No disponible (requiere AMI real) |
-| Instancia de test | Conectividad real verificable por SSM | Emulada, sin SSM ni tráfico |
-| VPC Endpoint S3 | Ruta real al servicio S3 | Emulado |
-| Cargos NAT | $0.045/GB procesado | Sin cargos |
+Intenta desplegar con un CIDR no RFC 1918:
 
-Para probar la Instancia NAT, usa la versión `aws/` con `-var="use_nat_instance=true"`.
+```bash
+terraform apply -var="vpc_cidr=203.0.113.0/24"
+```
+
+Terraform rechazará el plan con el error de la postcondición.
+
+> **Nota:** En LocalStack la postcondición se evalúa igual que en AWS real, ya que es una validación del lado de Terraform, no del proveedor.
 
 ## Limpieza
 

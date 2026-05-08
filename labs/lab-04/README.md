@@ -10,7 +10,7 @@
 
 En este laboratorio crearás usuarios IAM de forma masiva usando `for_each`, buscarás la AMI de Ubuntu más reciente con un data source dinámico y configurarás un launch template con una estrategia de actualización blue-green mediante el meta-argumento `lifecycle`. El objetivo es dominar los mecanismos de iteración y control de ciclo de vida de Terraform.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -26,7 +26,7 @@ Al finalizar este laboratorio serás capaz de:
 - Laboratorio 02 completado (flujo básico de Terraform)
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### Meta-argumento `for_each`
 
@@ -141,7 +141,7 @@ Cuatro mecanismos clave combinados: (1) `for_each` sobre `map(object)` para crea
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Código Terraform
 

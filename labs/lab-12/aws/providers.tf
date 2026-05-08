@@ -7,8 +7,8 @@ terraform {
     }
   }
 
-  # Configuracion parcial del backend. Todos los parametros estan en
-  # aws.s3.tfbackend. Usalo asi:
+  # Configuración parcial del backend. Todos los parámetros están en
+  # aws.s3.tfbackend. Úsalo así:
   #   terraform init -backend-config=aws.s3.tfbackend -backend-config="bucket=terraform-state-labs-<ACCOUNT_ID>"
   backend "s3" {}
 }

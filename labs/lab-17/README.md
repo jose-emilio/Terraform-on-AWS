@@ -1,4 +1,4 @@
-# Laboratorio 17 — Optimización de Salida a Internet y "NAT Tax"
+# Laboratorio 17 — Construcción de una Red Multi-AZ Robusta y Dinámica
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,35 +8,25 @@
 
 ## Visión general
 
-Configurar la conectividad de salida a Internet priorizando la **alta disponibilidad** y la **eficiencia de costes** (FinOps), comparando el modelo NAT Gateway regional con una Instancia NAT EC2 para entornos de desarrollo.
+Implementar el plano maestro de una VPC profesional utilizando **funciones de cálculo dinámico** e **iteración**, creando una red lista para cargas de trabajo como EKS.
 
 ## Arquitectura
 
-![Salida a Internet por AZ con NAT Gateway o NAT Instance + VPC Endpoint S3](arch/diagrama.svg)
+![VPC multi-AZ con 6 subredes generadas dinámicamente con for_each y cidrsubnet()](arch/diagrama.svg)
 
-Una VPC `10.13.0.0/16` con 3 AZs. Cada AZ tiene su propio NAT (Gateway en producción, Instance ARM `t4g.small` en desarrollo, controlado por `var.use_nat_instance`) y su propia tabla de rutas privada — así el tráfico de salida nunca cruza AZs. El **VPC Gateway Endpoint S3** se asocia a las cuatro tablas de rutas (1 pública + 3 privadas) y desvía el tráfico hacia S3 por la red interna de AWS, evitando el cargo de $0.045/GB del NAT ("NAT Tax"). Una instancia de test en `private-1` permite verificar la conectividad por SSM Session Manager.
+Una única VPC `10.12.0.0/16` con 6 subredes distribuidas en 3 AZs (3 públicas + 3 privadas), todas generadas con un único recurso `aws_subnet.this` iterando sobre `local.subnets` con `for_each`. Los CIDRs se calculan con `cidrsubnet()` para evitar errores manuales y los tags incluyen los marcadores `kubernetes.io/role/{elb,internal-elb}` que EKS usa para descubrir subredes. Una `postcondition` rechaza el apply si el CIDR no es RFC 1918. **Aún no hay IGW ni NAT Gateway** — el routing real a Internet llega en el [lab-18](../lab-18/README.md).
 
 ## Conceptos clave
 
 | Concepto | Descripción |
 |---|---|
-| **Internet Gateway (IGW)** | Componente de VPC que permite comunicación bidireccional entre subredes públicas e Internet; sin coste base, sin límite de ancho de banda |
-| **NAT Gateway** | Servicio gestionado que permite a las subredes privadas iniciar conexiones salientes a Internet sin exponerse; coste: ~$32/mes + $0.045/GB procesado |
-| **NAT Gateway × 3 AZs** | Buena práctica: 1 NAT Gateway por AZ elimina tráfico cross-AZ y mantiene la salida si cae una AZ |
-| **Instancia NAT** | EC2 ARM configurada como router NAT con iptables; coste: ~$12.26/mes (t4g.small), ahorro ~62% vs NAT Gateway, mejor relación precio/rendimiento en Graviton |
-| **`source_dest_check`** | Atributo de EC2 que por defecto descarta tráfico cuyo origen/destino no sea la propia instancia; **debe deshabilitarse** en instancias NAT |
-| **VPC Gateway Endpoint** | Ruta directa desde la VPC al servicio de AWS (S3, DynamoDB) por la red interna; **completamente gratuito**, evita el cargo por GB del NAT |
-| **"NAT Tax"** | Término coloquial para el coste acumulado de $0.045/GB que cobra el NAT Gateway por cada GB procesado; puede ser significativo en cargas con alto volumen de datos |
-
-## Comparativa de costes
-
-| Modelo | Coste base (mes) | Coste por GB | Alta disponibilidad | Mantenimiento |
-|---|---|---|---|---|
-| NAT Gateway × 3 AZs (este lab) | ~$96 | $0.045 | Sí (por AZ) | Ninguno |
-| Instancia NAT × 3 AZs (este lab) | ~$36.78 | Tráfico EC2 estándar | Sí (por AZ) | Parches, iptables, monitoreo |
-| VPC Endpoint S3 | $0 | $0 | Sí | Ninguno |
-
-> **Regla FinOps:** Usa NAT Gateway × 3 en producción (alta disponibilidad sin mantenimiento), Instancia NAT × 3 en dev/sandbox (ahorro ~62%), y **siempre** VPC Endpoints para servicios de AWS de alto volumen (S3, DynamoDB).
+| **`for_each`** | Meta-argumento que crea múltiples instancias de un recurso a partir de un mapa o conjunto, permitiendo referenciar cada instancia por su clave |
+| **`cidrsubnet()`** | Función que calcula rangos de subred a partir de un CIDR base, eliminando errores de cálculo manual |
+| **`merge()`** | Función que combina múltiples mapas en uno solo; las claves del último mapa prevalecen sobre las anteriores |
+| **`lifecycle` / `postcondition`** | Bloque que valida propiedades del recurso **después** de crearlo o actualizarlo; falla el apply si la condición no se cumple |
+| **Tags EKS** | Etiquetas `kubernetes.io/role/elb` y `kubernetes.io/role/internal-elb` que permiten a EKS descubrir automáticamente qué subredes usar para balanceadores públicos e internos |
+| **Multi-AZ** | Distribución de recursos en múltiples zonas de disponibilidad para alta disponibilidad |
+| **RFC 1918** | Rangos de IP privados: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
 
 ## Requisitos previos
 
@@ -45,6 +35,7 @@ Una VPC `10.13.0.0/16` con 3 AZs. Cada AZ tiene su propio NAT (Gateway en produc
 - Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
 ```bash
+# Exportar el Account ID y nombre del bucket para usar en los comandos
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 echo "Bucket: $BUCKET"
@@ -59,201 +50,128 @@ lab-17/
 │   └── diagrama.svg             ← Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf             ← Backend S3 parcial
-│   ├── variables.tf             ← Variables: región, CIDR, proyecto, use_nat_instance
-│   ├── main.tf                  ← VPC + subredes + IGW + NAT GW/Instance + VPC Endpoint S3
-│   ├── outputs.tf               ← IDs, IPs, modo NAT activo
-│   ├── aws.s3.tfbackend         ← Parámetros del backend (sin bucket)
-│   └── scripts/
-│       ├── nat_init.sh          ← user_data de la NAT Instance (iptables + SSM)
-│       └── test_init.sh         ← user_data de la instancia de test (SSM)
+│   ├── variables.tf             ← Variables: región, CIDR, proyecto, entorno
+│   ├── main.tf                  ← VPC + 6 subredes con for_each y cidrsubnet()
+│   ├── outputs.tf               ← IDs, CIDRs y AZs
+│   └── aws.s3.tfbackend         ← Parámetros del backend (sin bucket)
 └── localstack/
     ├── README.md                ← Guía específica para LocalStack
     ├── providers.tf
     ├── variables.tf
-    ├── main.tf                  ← Solo NAT Gateway (NAT Instance no disponible en LocalStack)
+    ├── main.tf
     ├── outputs.tf
     └── localstack.s3.tfbackend  ← Backend completo para LocalStack
 ```
 
-## Análisis del código
+## Análisis del código antes de desplegar
 
-### Internet Gateway — La puerta de entrada
+Antes de ejecutar nada, revisemos las técnicas clave del código en `main.tf`.
 
-```hcl
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-}
-```
-
-El IGW es el componente más simple de la red: se adjunta a la VPC y permite que las subredes públicas (con una ruta `0.0.0.0/0 → igw`) se comuniquen bidireccionalmente con Internet. No tiene coste base ni límite de ancho de banda.
-
-Las subredes públicas se asocian a una tabla de rutas con esta ruta:
+### La VPC y la resolución DNS
 
 ```hcl
-resource "aws_route" "public_internet" {
-  route_table_id         = aws_route_table.public.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.main.id
-}
-```
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
-### NAT Gateway × 3 — Uno por AZ (buena práctica)
-
-```hcl
-resource "aws_nat_gateway" "this" {
-  for_each = var.use_nat_instance ? {} : {
-    for idx, az in local.azs : az => "public-${idx + 1}"
-  }
-
-  allocation_id = aws_eip.nat[each.key].id
-  subnet_id     = aws_subnet.this[each.value].id
-
-  depends_on = [aws_internet_gateway.main]
-}
-```
-
-Puntos clave:
-- Se despliega **un NAT Gateway por AZ**, cada uno en la subred pública correspondiente
-- `for_each` itera sobre las AZs: la clave es el nombre de la AZ, el valor es la subred pública
-- Cada NAT Gateway tiene su propia **Elastic IP** (3 EIPs en total)
-- `depends_on` asegura que el IGW exista antes de crear los NAT Gateways
-
-**¿Por qué 1 por AZ en vez de 1 compartido?**
-
-| Aspecto | 1 NAT GW compartido | 1 NAT GW por AZ (este lab) |
-|---|---|---|
-| Coste base | ~$32/mes | ~$96/mes |
-| Tráfico cross-AZ | Sí ($0.01/GB extra) | No |
-| Resiliencia | Si cae la AZ, **todas** las privadas pierden salida | Solo la AZ afectada pierde salida |
-| Buena práctica AWS | No | **Sí** |
-
-A escala, el coste de tráfico cross-AZ puede superar la diferencia de $64/mes. La resiliencia adicional suele justificar el coste en producción.
-
-### Tablas de rutas privadas — Una por AZ
-
-```hcl
-resource "aws_route_table" "private" {
-  for_each = toset(local.azs)
-  vpc_id   = aws_vpc.main.id
-}
-
-resource "aws_route_table_association" "private" {
-  for_each       = local.private_subnets
-  subnet_id      = aws_subnet.this[each.key].id
-  route_table_id = aws_route_table.private[local.azs[each.value.az_index]].id
-}
-```
-
-Cada subred privada se asocia a la tabla de rutas de **su propia AZ**, que apunta al NAT local. Esto garantiza que el tráfico nunca cruza AZs para salir a Internet.
-
-### Instancia NAT × 3 — La alternativa económica para desarrollo
-
-```hcl
-resource "aws_instance" "nat" {
-  for_each = var.use_nat_instance ? {
-    for idx, az in local.azs : az => "public-${idx + 1}"
-  } : {}
-
-  ami                    = data.aws_ami.nat.id   # AL2023 ARM minimal
-  instance_type          = "t4g.small"            # Graviton (ARM)
-  subnet_id              = aws_subnet.this[each.value].id
-  vpc_security_group_ids = [aws_security_group.nat[0].id]
-
-  source_dest_check = false  # ← CLAVE para NAT
-
-  user_data = templatefile("${path.module}/scripts/nat_init.sh", {
-    vpc_cidr = var.vpc_cidr
+  tags = merge(local.common_tags, {
+    Name = "vpc-${var.project_name}"
   })
+
+  lifecycle {
+    postcondition { ... }   # Ver sección 1.5
+  }
 }
 ```
 
-> En el código real, el `user_data` se mantiene en
-> [`scripts/nat_init.sh`](aws/scripts/nat_init.sh) (cargado con
-> `templatefile()`). Lo importante son las tres operaciones que ese script
-> realiza al arrancar la instancia:
->
-> ```bash
-> # 1. Habilitar IP forwarding
-> echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-nat.conf
-> sysctl -p /etc/sysctl.d/90-nat.conf
->
-> # 2. Instalar iptables-nft (AL2023 minimal usa nftables como backend)
-> dnf install -y iptables-nft
->
-> # 3. Reescribir IP origen de los paquetes reenviados (MASQUERADE)
-> iptables -t nat -A POSTROUTING -o ens5 -s ${var.vpc_cidr} -j MASQUERADE
-> iptables -A FORWARD -i ens5 -o ens5 -m state --state RELATED,ESTABLISHED -j ACCEPT
-> iptables -A FORWARD -i ens5 -o ens5 -j ACCEPT
-> ```
+Tres atributos clave de la VPC:
 
-Mismo patrón `for_each` que los NAT Gateways: una instancia por AZ en su subred pública correspondiente.
+- **`cidr_block`** — el rango privado a partir del cual `cidrsubnet()` (sección 1.2) deriva las subredes. Por defecto `10.12.0.0/16`. AWS permite cualquier CIDR IPv4 (también públicos), pero la postcondición de la sección 1.5 obliga a usar uno RFC 1918.
+- **`enable_dns_support = true`** — habilita el servidor DNS interno de la VPC (`AmazonProvidedDNS`, accesible en `10.12.0.2` en este caso). Sin él, las instancias no resuelven nombres dentro de la VPC.
+- **`enable_dns_hostnames = true`** — hace que las instancias EC2 con IP pública reciban además un *hostname* DNS público (`ec2-X-X-X-X.compute.amazonaws.com`).
 
-**¿Por qué `t4g.small` ARM en vez de `t3.nano` x86?**
+Ambos flags son **requisitos previos para EKS**: el plano de control de Kubernetes resuelve los nodos por hostname y los servicios por DNS; sin estas dos opciones a `true`, el cluster no funciona. De ahí que las dejemos activadas desde el lab base de red.
 
-Las instancias Graviton (t4g) ofrecen hasta un 20% mejor relación precio/rendimiento que las equivalentes x86. Para una instancia NAT, el cuello de botella es el ancho de banda de red, no la CPU, y `t4g.small` proporciona suficiente capacidad de red para un entorno de desarrollo.
-
-**¿Por qué `user_data` con iptables?**
-
-Las antiguas AMIs `amzn-ami-vpc-nat` venían preconfiguradas con NAT, pero están basadas en Amazon Linux 1 (EOL). Usamos Amazon Linux 2023 (ARM) y configuramos NAT manualmente:
-
-1. **`ip_forward = 1`**: Habilita el reenvío de paquetes en el kernel (por defecto Linux descarta paquetes que no son para él)
-2. **`iptables -t nat ... MASQUERADE`**: Reescribe la IP origen de los paquetes reenviados con la IP pública de la instancia, permitiendo que las respuestas vuelvan correctamente
-3. **`FORWARD ... RELATED,ESTABLISHED`**: Permite el tráfico de retorno de conexiones ya establecidas
-
-**¿Por qué `source_dest_check = false`?**
-
-Por defecto, EC2 descarta cualquier paquete de red cuyo origen o destino no sea la IP de la propia instancia. Esto es una protección contra suplantación de IP. Pero una instancia NAT **reenvía** tráfico de otros orígenes (las subredes privadas), por lo que esta verificación debe deshabilitarse.
-
-Sin `source_dest_check = false`, el tráfico de las subredes privadas llega a la instancia NAT pero es descartado silenciosamente — uno de los errores más difíciles de diagnosticar en redes AWS.
-
-### VPC Gateway Endpoint para S3 — Eliminar el "NAT Tax"
+### Cálculo dinámico de CIDRs con `cidrsubnet()`
 
 ```hcl
-resource "aws_vpc_endpoint" "s3" {
-  vpc_id            = aws_vpc.main.id
-  service_name      = "com.amazonaws.${var.region}.s3"
-  vpc_endpoint_type = "Gateway"
-
-  route_table_ids = concat(
-    [aws_route_table.public.id],
-    [for rt in aws_route_table.private : rt.id],   # private es un mapa (for_each por AZ)
-  )
-}
+cidr_block = cidrsubnet(aws_vpc.main.cidr_block, 8, each.value.subnet_index)
 ```
 
-El Gateway Endpoint añade automáticamente una ruta en las tablas especificadas con el **prefix list** de S3 (las IPs del servicio S3 en la región). El tráfico hacia S3 viaja por la red interna de AWS en lugar de salir por el NAT Gateway.
+La función `cidrsubnet(prefix, newbits, netnum)` calcula subredes automáticamente:
 
-**Impacto en costes:** Si una aplicación transfiere 100 GB/mes a S3:
-- Sin endpoint: 100 GB × $0.045 = **$4.50/mes** en cargos NAT
-- Con endpoint: **$0** — el tráfico no pasa por el NAT
+- **`prefix`**: el CIDR base de la VPC (`10.12.0.0/16`)
+- **`newbits`**: bits adicionales para la subred (`8` → de `/16` a `/24` = 256 IPs por subred)
+- **`netnum`**: número de la subred dentro del espacio disponible
 
-A escala (TB de datos, backups, logs), este ahorro puede ser de cientos de dólares mensuales.
+Con el CIDR `10.12.0.0/16` y `newbits = 8`, el cálculo produce:
 
-### Rutas privadas mutuamente excluyentes — Una por AZ
+| Subred | `netnum` | CIDR resultante | IPs disponibles |
+|---|---|---|---|
+| public-1 | 0 | `10.12.0.0/24` | 251 |
+| public-2 | 1 | `10.12.1.0/24` | 251 |
+| public-3 | 2 | `10.12.2.0/24` | 251 |
+| private-1 | 10 | `10.12.10.0/24` | 251 |
+| private-2 | 11 | `10.12.11.0/24` | 251 |
+| private-3 | 12 | `10.12.12.0/24` | 251 |
+
+> **Nota:** AWS reserva 5 IPs por subred (red, router, DNS, reservada, broadcast), por eso 256 - 5 = 251 disponibles.
+
+Los `netnum` de las subredes privadas (10, 11, 12) están separados intencionalmente de las públicas (0, 1, 2), dejando espacio para futuras subredes intermedias.
+
+### Iteración con `for_each`
 
 ```hcl
-resource "aws_route" "private_nat_gateway" {
-  for_each = var.use_nat_instance ? {} : toset(local.azs)
-
-  route_table_id         = aws_route_table.private[each.key].id
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.this[each.key].id
-}
-
-resource "aws_route" "private_nat_instance" {
-  for_each = var.use_nat_instance ? toset(local.azs) : toset([])
-
-  route_table_id         = aws_route_table.private[each.key].id
-  destination_cidr_block = "0.0.0.0/0"
-  network_interface_id   = aws_instance.nat[each.key].primary_network_interface_id
+resource "aws_subnet" "this" {
+  for_each = local.subnets
+  # ...
 }
 ```
 
-Solo uno de los dos conjuntos existe en cada despliegue. En ambos casos se crean 3 rutas `0.0.0.0/0` (una por tabla de rutas privada), cada una apuntando al NAT Gateway o la instancia NAT de **su misma AZ**.
+En lugar de repetir 6 bloques `resource`, definimos un único recurso con `for_each` que itera sobre un mapa. Cada entrada del mapa tiene:
+
+- **`az_index`**: índice de la AZ en la lista `local.azs`
+- **`subnet_index`**: número para `cidrsubnet()`
+- **`public`**: booleano que determina si la subred es pública
+
+Terraform crea instancias identificadas por clave: `aws_subnet.this["public-1"]`, `aws_subnet.this["private-2"]`, etc. Esto es más robusto que `count` porque renombrar o reordenar subredes no fuerza la destrucción y recreación.
+
+### Tags dinámicos con `merge()`
+
+```hcl
+tags = merge(
+  local.common_tags,                    # Tags base (Environment, ManagedBy, Project)
+  { Name = "...", Tier = "..." },       # Tags específicos de la subred
+  each.value.public ? {                 # Tags condicionales para EKS
+    "kubernetes.io/role/elb" = "1"
+  } : {
+    "kubernetes.io/role/internal-elb" = "1"
+  }
+)
+```
+
+`merge()` combina tres mapas en uno:
+1. **Tags comunes** definidos en `local.common_tags` — se aplican a todos los recursos
+2. **Tags específicos** de cada subred (nombre y tier)
+3. **Tags EKS** condicionales — las subredes públicas reciben `kubernetes.io/role/elb` y las privadas `kubernetes.io/role/internal-elb`
+
+### Postcondición para validar RFC 1918
+
+```hcl
+lifecycle {
+  postcondition {
+    condition = can(regex("^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)", self.cidr_block))
+    error_message = "El CIDR de la VPC debe pertenecer a un rango privado RFC 1918 (10.0.0.0/8, 172.16.0.0/12 o 192.168.0.0/16)."
+  }
+}
+```
+
+La `postcondition` se evalúa **después** de que el recurso se crea o actualiza. Usa `self` para referenciar los atributos del propio recurso. Si alguien intenta desplegar con un CIDR público (por ejemplo `203.0.113.0/24`), Terraform abortará el apply con un mensaje descriptivo.
 
 ---
 
-## Despliegue — Modo producción (NAT Gateway)
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-17/aws
@@ -265,174 +183,204 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará ~35 recursos: VPC, 6 subredes, IGW, 3 EIPs, 3 NAT Gateways, 1 tabla de rutas pública + 3 privadas (una por AZ), rutas y asociaciones, VPC Endpoint S3, IAM role + policy attachments + instance profile (SSM), security group e instancia de test.
+Revisa el plan antes de confirmar. Terraform creará **7 recursos**: 1 VPC + 6 subredes.
+
+Verifica los outputs:
 
 ```bash
 terraform output
-# nat_mode       = "nat_gateway"
-# nat_public_ips = { "us-east-1a" = "3.xx.xx.xx", "us-east-1b" = "18.xx.xx.xx", "us-east-1c" = "54.xx.xx.xx" }
-# s3_endpoint_id = "vpce-0abc..."
+# vpc_id             = "vpc-0abc123..."
+# vpc_cidr           = "10.12.0.0/16"
+# availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+# subnet_cidrs       = {
+#   "private-1" = "10.12.10.0/24"
+#   "private-2" = "10.12.11.0/24"
+#   "private-3" = "10.12.12.0/24"
+#   "public-1"  = "10.12.0.0/24"
+#   "public-2"  = "10.12.1.0/24"
+#   "public-3"  = "10.12.2.0/24"
+# }
 ```
 
 ---
 
 ## Verificación final
 
-### Tabla de rutas pública
+### Verificar la VPC
 
 ```bash
-aws ec2 describe-route-tables \
-  --filters Name=tag:Name,Values=lab17-public-rt \
-  --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, GatewayId: GatewayId}' \
-  --output table
-```
-
-Deberías ver tres rutas:
-- `10.13.0.0/16 → local` (ruta interna de la VPC, automática)
-- `0.0.0.0/0 → igw-xxx` (ruta al IGW)
-- `Dest=None, Prefix=pl-xxx → vpce-xxx` (ruta al VPC Endpoint S3 — usa `DestinationPrefixListId` en lugar de CIDR, por eso `Dest` aparece vacío)
-
-### Tablas de rutas privadas (una por AZ)
-
-```bash
-aws ec2 describe-route-tables \
-  --filters "Name=tag:Name,Values=lab17-private-rt-*" \
-  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, NatGW: NatGatewayId, GatewayId: GatewayId}}' \
-  --output table
-```
-
-Cada tabla debe tener:
-- `10.13.0.0/16 → local`
-- `0.0.0.0/0 → nat-xxx` (ruta al NAT Gateway **de su propia AZ**)
-- `pl-xxx → vpce-xxx` (prefix list de S3 → VPC Endpoint)
-
-Verifica que cada tabla privada apunta a un NAT Gateway **diferente** (uno por AZ).
-
-### VPC Endpoint
-
-```bash
-aws ec2 describe-vpc-endpoints \
+aws ec2 describe-vpcs \
   --filters Name=tag:Project,Values=lab17 \
-  --query 'VpcEndpoints[].{ID: VpcEndpointId, Service: ServiceName, State: State}' \
+  --query 'Vpcs[*].[VpcId,CidrBlock,Tags[?Key==`Name`].Value|[0]]' \
   --output table
 ```
 
-### Verificar el prefix list de S3
+### Verificar las subredes y su distribución por AZ
 
 ```bash
-REGION=$(aws configure get region || echo us-east-1)
-
-PLID=$(aws ec2 describe-prefix-lists \
-  --filters "Name=prefix-list-name,Values=com.amazonaws.${REGION}.s3" \
-  --query 'PrefixLists[0].PrefixListId' --output text)
-
-aws ec2 describe-prefix-lists \
-  --prefix-list-ids $PLID \
-  --query 'PrefixLists[].Cidrs[]' \
+aws ec2 describe-subnets \
+  --filters Name=tag:Project,Values=lab17 \
+  --query 'Subnets[*].[Tags[?Key==`Name`].Value|[0],AvailabilityZone,CidrBlock,MapPublicIpOnLaunch]' \
   --output table
 ```
 
-Estos son los rangos de IPs públicas de S3 que el Gateway Endpoint intercepta antes de que lleguen al NAT.
+Deberías ver 6 subredes distribuidas en 3 AZs, con las públicas marcadas con `MapPublicIpOnLaunch = True`.
+
+### Verificar tags EKS
+
+```bash
+aws ec2 describe-subnets \
+  --filters Name=tag:Project,Values=lab17 \
+  --query 'Subnets[].{Name: Tags[?Key==`Name`].Value|[0], ELB: Tags[?Key==`kubernetes.io/role/elb`].Value|[0], InternalELB: Tags[?Key==`kubernetes.io/role/internal-elb`].Value|[0], Cluster: Tags[?Key==`kubernetes.io/cluster/lab17`].Value|[0]}' \
+  --output table
+```
+
+Las subredes públicas deben tener `ELB = 1` y las privadas `InternalELB = 1`. Todas deben tener `Cluster = shared`.
+
+### Probar la postcondición RFC 1918
+
+Intenta desplegar con un CIDR público para verificar que la postcondición funciona:
+
+```bash
+terraform apply -var="vpc_cidr=203.0.113.0/24"
+```
+
+Terraform rechazará el apply con este error:
+
+```
+│ Error: Resource postcondition failed
+│
+│   on main.tf line XX, in resource "aws_vpc" "main":
+│
+│ El CIDR de la VPC debe pertenecer a un rango privado RFC 1918 (10.0.0.0/8, 172.16.0.0/12 o 192.168.0.0/16).
+```
+
+> **Nota:** AWS acepta cualquier CIDR IPv4 (incluidos rangos públicos como `203.0.113.0/24`) al crear una VPC, así que la VPC se llega a crear realmente; es Terraform —no el provider— quien marca el `apply` como fallido al evaluar la postcondición sobre `self.cidr_block`. Para corregirlo, vuelve a ejecutar `terraform apply` con un CIDR RFC 1918 válido: como el atributo `cidr_block` **no es modificable in-place**, Terraform planificará la recreación de la VPC (no una actualización) y, una vez aplicada, la postcondición pasará.
 
 ---
 
-## Despliegue — Modo desarrollo (Instancia NAT)
+## Reto — Ampliar la red con subredes de base de datos
 
-Modifica el despliegue anterior y vuelve a aplicar con la variable activada — Terraform destruirá los NAT Gateways y creará las instancias NAT en su lugar:
+**Situación**: El equipo de base de datos necesita 3 subredes privadas adicionales dedicadas exclusivamente a RDS, aisladas de las subredes de aplicación existentes.
 
-```bash
-terraform apply -var="use_nat_instance=true"
-```
+**Tu objetivo**:
 
-Compara los outputs:
+1. Añadir 3 subredes `database-1`, `database-2` y `database-3` al mapa `local.subnets`
+2. Usar `subnet_index` 20, 21 y 22 para separarlas de las subredes de aplicación
+3. Asignar el tag `Tier = "database"` (en vez de `"private"`)
+4. **No** incluir tags de EKS en estas subredes (las bases de datos no necesitan descubrimiento de Kubernetes)
+5. Añadir un nuevo output `database_subnet_ids` con los IDs de las subredes de base de datos
+6. Al finalizar, `terraform apply` debe crear las 3 subredes adicionales sin modificar las 6 existentes
 
-```bash
-terraform output
-# nat_mode       = "nat_instance"
-# nat_public_ips = { "us-east-1a" = "54.xx.xx.xx", "us-east-1b" = "3.xx.xx.xx", "us-east-1c" = "18.xx.xx.xx" }
-```
-
-### Verificar source_dest_check en las 3 instancias
-
-```bash
-aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=nat-instance-lab17-*" Name=instance-state-name,Values=running \
-  --query 'Reservations[].Instances[].{ID: InstanceId, AZ: Placement.AvailabilityZone, SourceDestCheck: SourceDestCheck}' \
-  --output table
-```
-
-Las 3 instancias deben mostrar `SourceDestCheck = false`.
-
-### Verificar las tablas de rutas privadas
-
-```bash
-aws ec2 describe-route-tables \
-  --filters "Name=tag:Name,Values=lab17-private-rt-*" \
-  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, NetworkInterface: NetworkInterfaceId, GatewayId: GatewayId}}' \
-  --output json
-```
-
-Ahora cada ruta `0.0.0.0/0` apunta a `eni-xxx` (la interfaz de red de la instancia NAT de esa AZ) en lugar de `nat-xxx`.
+**Pistas**:
+- Necesitarás modificar `local.subnets` (para añadir las 3 nuevas entradas) y la lógica de tags en `main.tf`. La solución propuesta más adelante refactoriza el bloque de tags para basarse en un campo `tier` y un mapa `local.eks_tags`; ese refactor **toca también las subredes existentes** (todas pasan a leer `each.value.tier` y a obtener los tags EKS desde `lookup(...)`), por lo que conviene comprobar el `plan` con cuidado para asegurarte de que los tags resultantes son idénticos a los actuales y Terraform no marca cambios "fantasma" en las 6 subredes ya desplegadas.
+- Como alternativa menos invasiva, puedes añadir una tercera rama al operador ternario (anidando otro condicional `each.value.tier == "database" ? {} : (each.value.public ? {…} : {…})`) y dejar las subredes existentes sin tocar la forma de leer los tags.
+- ¿Cómo verificas que las nuevas subredes no afectaron a las existentes? Mira el resumen de `terraform plan`: el objetivo es ver únicamente recursos en `+ create` para `database-*` y ningún `~ update` sobre `public-*` / `private-*`.
 
 ---
 
-## Verificación end-to-end con instancia de test
+## Solución
 
-La instancia de test se despliega automáticamente en la subred `private-1` con cada `terraform apply`. Es una `t4g.micro` con SSM Agent, que permite verificar la conectividad NAT sin SSH.
+<details>
+<summary><strong>Ampliar la red con subredes de base de datos</strong></summary>
 
-```bash
-terraform output test_instance_id
-# "i-0abc123..."
+
+#### Paso 1: Ampliar el mapa de subredes
+
+Añade las 3 subredes de base de datos a `local.subnets` en `main.tf`:
+
+```hcl
+locals {
+  subnets = {
+    "public-1"    = { az_index = 0, subnet_index = 0,  public = true,  tier = "public" }
+    "public-2"    = { az_index = 1, subnet_index = 1,  public = true,  tier = "public" }
+    "public-3"    = { az_index = 2, subnet_index = 2,  public = true,  tier = "public" }
+    "private-1"   = { az_index = 0, subnet_index = 10, public = false, tier = "private" }
+    "private-2"   = { az_index = 1, subnet_index = 11, public = false, tier = "private" }
+    "private-3"   = { az_index = 2, subnet_index = 12, public = false, tier = "private" }
+    "database-1"  = { az_index = 0, subnet_index = 20, public = false, tier = "database" }
+    "database-2"  = { az_index = 1, subnet_index = 21, public = false, tier = "database" }
+    "database-3"  = { az_index = 2, subnet_index = 22, public = false, tier = "database" }
+  }
+
+  # Mapa de tags EKS por tier
+  eks_tags = {
+    "public" = {
+      "kubernetes.io/role/elb"                    = "1"
+      "kubernetes.io/cluster/${var.project_name}"  = "shared"
+    }
+    "private" = {
+      "kubernetes.io/role/internal-elb"           = "1"
+      "kubernetes.io/cluster/${var.project_name}"  = "shared"
+    }
+    "database" = {} # Sin tags EKS
+  }
+}
 ```
 
-### Conectarse via SSM Session Manager
+#### Paso 2: Actualizar los tags de las subredes
 
-> **Requisito:** Instalar el [plugin de Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) para la AWS CLI.
+Reemplaza la lógica condicional de tags por un `lookup` en el mapa. **Importante:** este cambio afecta también a las 6 subredes existentes — pasan a leer `Tier` desde `each.value.tier` y los tags EKS desde `lookup(local.eks_tags, each.value.tier, {})`. Como los valores resultantes son idénticos a los que ya tenían (`Tier = "public"`/`"private"` y los mismos tags EKS), Terraform no debería marcar cambios; pero **vigila el `plan` antes de aplicar** para detectar cualquier diferencia accidental (espacios, comillas, claves nuevas).
 
-```bash
-INSTANCE_ID=$(terraform output -raw test_instance_id)
+```hcl
+resource "aws_subnet" "this" {
+  for_each = local.subnets
 
-aws ssm start-session --target $INSTANCE_ID
+  vpc_id            = aws_vpc.main.id
+  availability_zone = local.azs[each.value.az_index]
+  cidr_block        = cidrsubnet(aws_vpc.main.cidr_block, 8, each.value.subnet_index)
+
+  map_public_ip_on_launch = each.value.public
+
+  tags = merge(
+    local.common_tags,
+    {
+      Name = "${var.project_name}-${each.key}"
+      Tier = each.value.tier
+    },
+    lookup(local.eks_tags, each.value.tier, {})
+  )
+}
 ```
 
-Una vez dentro de la sesión:
+#### Paso 3: Añadir el output
 
-```bash
-# Test 1: Verificar salida a Internet (a través del NAT)
-curl -s --max-time 5 https://checkip.amazonaws.com
-# Debe mostrar la IP pública del NAT (EIP del NAT Gateway o IP pública de la instancia NAT)
+Añade en `outputs.tf`:
 
-# Test 2: Verificar acceso a S3 (a través del VPC Endpoint, sin pasar por NAT)
-aws s3 ls --region us-east-1 2>&1 | head -5
-# Debe listar buckets (si el role tiene permisos) o dar error de permisos (NO timeout). Ojo, sólo mostrará los buckets de S3 de la región donde está desplegada la instancia de prueba
-
-# Test 3: Verificar que la IP de salida coincide con el NAT
-echo "IP de salida: $(curl -s https://checkip.amazonaws.com)"
-exit
+```hcl
+output "database_subnet_ids" {
+  description = "IDs de las subredes de base de datos"
+  value = {
+    for key, subnet in aws_subnet.this :
+    key => subnet.id if local.subnets[key].tier == "database"
+  }
+}
 ```
 
-La IP que devuelve `checkip.amazonaws.com` debe coincidir con una de las IPs del output `nat_public_ips` (la correspondiente a la AZ de `private-1`):
+#### Paso 4: Aplicar y verificar
 
 ```bash
-terraform output nat_public_ips
-# Debe coincidir con la IP del Test 1
+terraform plan
+# Resultado esperado (refactor "limpio"):
+#   Plan: 3 to add, 0 to change, 0 to destroy.
 ```
 
-### Si SSM no conecta
-
-Si `start-session` se queda colgado, verifica:
-
-1. **La instancia está running:** `aws ec2 describe-instance-status --instance-ids $INSTANCE_ID`
-2. **El NAT funciona:** SSM necesita salida a Internet para conectarse a los endpoints de Systems Manager. Si el NAT no funciona, SSM tampoco.
-3. **El SSM agent arrancó:** Espera 2-3 minutos tras el despliegue para que el agente se registre.
+> **Nota:** el `0 to change` depende de que el refactor produzca exactamente los mismos tags que tenían las 6 subredes originales. Si tu mapa `eks_tags` introduce alguna clave o valor distinto (por ejemplo, otro valor para `kubernetes.io/cluster/...`), Terraform detectará el cambio y lo reportará como `~ update in-place` sobre las subredes existentes. Eso no rompe nada (las modificaciones de tags se aplican en caliente), pero conviene revisar el `plan` línea por línea para descartar cambios involuntarios antes del `apply`.
 
 ```bash
-aws ssm describe-instance-information \
-  --filters Key=InstanceIds,Values=$INSTANCE_ID \
-  --query 'InstanceInformationList[].{ID: InstanceId, Ping: PingStatus}' \
+terraform apply
+```
+
+Verifica que las 6 subredes originales no fueron modificadas (`0 to change`) y las 3 nuevas se crearon correctamente. Filtramos por el tag `Name` (que siempre vale `lab17-database-N`) en lugar de por `Tier`, ya que el valor de `Tier` depende del camino que hayas elegido en el Reto: con el refactor "limpio" será `database`, pero si optaste por la alternativa menos invasiva que solo toca el ternario de tags EKS, el `Tier` de las nuevas subredes seguirá siendo `private` (porque `public = false`):
+
+```bash
+aws ec2 describe-subnets \
+  --filters "Name=tag:Project,Values=lab17" "Name=tag:Name,Values=lab17-database-*" \
+  --query 'Subnets[*].[Tags[?Key==`Name`].Value|[0],AvailabilityZone,CidrBlock,Tags[?Key==`Tier`].Value|[0]]' \
   --output table
-# PingStatus debe ser "Online"
 ```
+
+</details>
 
 ---
 
@@ -442,15 +390,7 @@ aws ssm describe-instance-information \
 terraform destroy
 ```
 
-Si desplegaste con `-var="use_nat_instance=true"`, incluye la misma variable:
-
-```bash
-terraform destroy \
-  -var="region=us-east-1" \
-  -var="use_nat_instance=true"
-```
-
-> **Nota:** El laboratorio no crea ningún bucket S3 propio. No destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
+> **Nota:** El laboratorio no crea ningún bucket S3 propio. No destruyas el bucket de tfstate del lab02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -458,27 +398,23 @@ terraform destroy \
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-La Instancia NAT no está disponible en LocalStack (requiere AMIs reales de EC2). Solo se despliega la variante con NAT Gateway.
-
 ---
 
 ## Buenas prácticas aplicadas
 
-- **NAT Gateway por AZ en producción**: desplegar un NAT Gateway por AZ elimina la dependencia de una única zona para la conectividad de salida. Si una AZ cae, las instancias de las otras AZs mantienen salida a Internet.
-- **Instancia NAT solo en desarrollo**: la Instancia NAT es más barata que el NAT Gateway (~$12.26/mes en `t4g.small` vs ~$32/mes por NAT Gateway, ahorro ~62%) pero tiene menor throughput, sin alta disponibilidad gestionada y requiere mantenimiento del SO (parches, iptables, monitoreo). Usarla solo en entornos no críticos.
-- **VPC Gateway Endpoint para S3 y DynamoDB**: el Gateway Endpoint no tiene costo y evita que el tráfico hacia S3 o DynamoDB salga por el NAT Gateway (ahorrando costes de procesamiento). Siempre debe activarse en VPCs con subnets privadas.
-- **`for_each` mutuamente excluyente para despliegue condicional**: usar `for_each = var.use_nat_instance ? toset([]) : toset(local.azs)` (y la negación en el otro recurso) permite elegir entre NAT Gateway e Instancia NAT en tiempo de despliegue con una sola variable, sin duplicar código y manteniendo la granularidad por AZ.
-- **IP Elástica para el NAT Gateway**: la IP fija del NAT Gateway permite configurar reglas de firewall en los destinos que solo permiten IPs conocidas, sin depender de IPs efímeras.
-- **Disable source/dest check en la Instancia NAT**: las instancias EC2 normales descartan paquetes que no van dirigidos a su IP. La Instancia NAT necesita este check deshabilitado para poder reenviar paquetes de otras instancias.
-- **`ingress = []` explícito en Security Groups sin entrada**: aunque un SG sin reglas de ingreso ya bloquea por defecto todo el tráfico entrante, declarar `ingress = []` de forma explícita (como en `aws_security_group.test`) deja documentada la intención de "deny all inbound" y evita findings falsos de linters de seguridad (tfsec, Checkov, etc.) que marcan los SGs sin bloque `ingress` declarado. La administración de la instancia se realiza por SSM Session Manager, que sólo requiere tráfico saliente.
+- **`cidrsubnet()` para calcular subredes dinámicamente**: calcular los bloques CIDR de las subredes a partir del CIDR de la VPC usando `cidrsubnet()` garantiza que no hay solapamientos y que el código escala sin modificación cuando cambia el número de AZs.
+- **Selección dinámica de AZs**: derivar `local.azs` de `data.aws_availability_zones.available.names` con `slice(...)` en lugar de hardcodear `["us-east-1a", "us-east-1b"]` hace el código portable entre regiones sin modificación.
+- **Tags de discovery para EKS**: los tags `kubernetes.io/role/elb` y `kubernetes.io/role/internal-elb` son requeridos por EKS para descubrir automáticamente las subnets donde crear los Load Balancers.
+- **Postcondición para validar RFC 1918**: una postcondición que verifica que el CIDR de la VPC pertenece al espacio privado (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) detecta errores de configuración antes de que lleguen a producción.
+- **Separación lógica de subredes públicas y privadas desde el plano de direccionamiento**: aunque en este laboratorio la diferencia entre "pública" y "privada" se materializa **únicamente** a nivel de `map_public_ip_on_launch` y de tags (no hay aún Internet Gateway, NAT Gateway ni tablas de rutas), reservar desde el principio rangos CIDR distintos (`10.x.0.0/24`–`10.x.2.0/24` para públicas, `10.x.10.0/24`–`10.x.12.0/24` para privadas) y etiquetar la intención facilita aplicar más adelante políticas de routing y seguridad diferenciadas por capa. El **routing real a Internet (IGW para públicas, NAT Gateway para privadas) se añade en el [lab-18](../lab-18/README.md)**; en lab-17 una subred "pública" todavía no tiene salida a Internet.
 
 ---
 
 ## Recursos
 
-- [AWS: NAT Gateway Pricing](https://aws.amazon.com/vpc/pricing/)
-- [AWS: VPC Gateway Endpoints](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html)
-- [AWS: NAT Instances (Legacy)](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_NAT_Instance.html)
-- [AWS: Comparison of NAT Gateway vs NAT Instance](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-comparison.html)
-- [Terraform: `aws_nat_gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/nat_gateway)
-- [Terraform: `aws_vpc_endpoint`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint)
+- [Terraform: `cidrsubnet()` Function](https://developer.hashicorp.com/terraform/language/functions/cidrsubnet)
+- [Terraform: `for_each` Meta-Argument](https://developer.hashicorp.com/terraform/language/meta-arguments/for_each)
+- [Terraform: `merge()` Function](https://developer.hashicorp.com/terraform/language/functions/merge)
+- [Terraform: Custom Conditions (Preconditions & Postconditions)](https://developer.hashicorp.com/terraform/language/validate)
+- [AWS: VPC Subnet Basics](https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html)
+- [EKS: Subnet Discovery Tags](https://docs.aws.amazon.com/eks/latest/userguide/network-reqs.html)

@@ -1,104 +1,54 @@
-output "db_endpoint" {
-  description = "Endpoint de la instancia RDS principal (DNS:puerto)"
-  value       = "${aws_db_instance.main.address}:${aws_db_instance.main.port}"
-}
-
-output "db_host" {
-  description = "Hostname de la instancia RDS principal"
-  value       = aws_db_instance.main.address
-}
-
-output "db_port" {
-  description = "Puerto PostgreSQL"
-  value       = aws_db_instance.main.port
-}
-
-output "db_name" {
-  description = "Nombre de la base de datos"
-  value       = aws_db_instance.main.db_name
-}
-
-output "db_username" {
-  description = "Usuario maestro"
-  value       = aws_db_instance.main.username
-}
-
-output "db_resource_id" {
-  description = "Resource ID de la instancia principal (usado en la politica IAM de autenticacion)"
-  value       = aws_db_instance.main.resource_id
-}
-
-output "replica_endpoint" {
-  description = "Endpoint de la read replica (DNS:puerto)"
-  value       = "${aws_db_instance.replica.address}:${aws_db_instance.replica.port}"
-}
-
-output "replica_resource_id" {
-  description = "Resource ID de la read replica"
-  value       = aws_db_instance.replica.resource_id
-}
-
-output "secret_arn" {
-  description = "ARN del secreto en Secrets Manager"
-  value       = aws_secretsmanager_secret.db_password.arn
-}
-
-output "secret_name" {
-  description = "Nombre del secreto en Secrets Manager"
-  value       = aws_secretsmanager_secret.db_password.name
-}
-
-output "kms_key_arn" {
-  description = "ARN de la CMK KMS"
-  value       = aws_kms_key.rds.arn
-}
-
-output "kms_alias" {
-  description = "Alias de la CMK KMS"
-  value       = aws_kms_alias.rds.name
-}
-
 output "vpc_id" {
   description = "ID de la VPC"
-  value       = aws_vpc.main.id
+  value       = module.vpc.vpc_id
 }
 
-output "app_role_arn" {
-  description = "ARN del rol IAM de la aplicacion (para autenticacion IAM a RDS)"
-  value       = aws_iam_role.app.arn
+output "instance_id" {
+  description = "ID de la instancia EC2"
+  value       = module.ec2.instance_id
 }
 
-output "app_url" {
-  description = "URL publica de la aplicacion web via ALB"
-  value       = "http://${aws_lb.main.dns_name}"
+output "ebs_volume_id" {
+  description = "ID del volumen EBS gp3"
+  value       = module.ec2.ebs_volume_id
 }
 
-output "alb_dns" {
-  description = "DNS del Application Load Balancer"
-  value       = aws_lb.main.dns_name
+output "ebs_volume_arn" {
+  description = "ARN del volumen EBS gp3"
+  value       = module.ec2.ebs_volume_arn
 }
 
-output "app_artifacts_bucket" {
-  description = "Bucket S3 con el codigo de la aplicacion"
-  value       = aws_s3_bucket.app_artifacts.bucket
+output "dlm_policy_id" {
+  description = "ID de la politica DLM de snapshots automaticos"
+  value       = aws_dlm_lifecycle_policy.ebs_backup.id
 }
 
-output "asg_name" {
-  description = "Nombre del Auto Scaling Group"
-  value       = aws_autoscaling_group.app.name
+output "efs_file_system_id" {
+  description = "ID del EFS File System"
+  value       = module.efs_share.file_system_id
 }
 
-output "launch_template_id" {
-  description = "ID del Launch Template"
-  value       = aws_launch_template.app.id
+output "efs_dns_name" {
+  description = "DNS name del EFS para construir comandos de montaje"
+  value       = module.efs_share.file_system_dns_name
 }
 
-output "get_secret_command" {
-  description = "Comando para recuperar las credenciales desde Secrets Manager"
-  value       = "aws secretsmanager get-secret-value --secret-id ${aws_secretsmanager_secret.db_password.name} --query SecretString --output text | python3 -m json.tool"
+output "efs_access_point_id" {
+  description = "ID del EFS Access Point de la aplicacion"
+  value       = module.efs_share.access_point_id
 }
 
-output "generate_iam_token_command" {
-  description = "Comando para generar un token IAM de autenticacion a RDS"
-  value       = "aws rds generate-db-auth-token --hostname ${aws_db_instance.main.address} --port ${aws_db_instance.main.port} --region ${var.region} --username ${var.db_username}"
+output "efs_access_point_arn" {
+  description = "ARN del EFS Access Point (usar en el comando de montaje)"
+  value       = module.efs_share.access_point_arn
+}
+
+output "efs_mount_targets" {
+  description = "Mapa AZ → ID del mount target"
+  value       = module.efs_share.mount_target_ids
+}
+
+output "mount_command" {
+  description = "Comando para montar el EFS via Access Point en la instancia EC2"
+  value       = "sudo mount -t efs -o tls,accesspoint=${module.efs_share.access_point_id} ${module.efs_share.file_system_id}:/ /mnt/efs"
 }

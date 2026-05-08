@@ -72,7 +72,7 @@ Al finalizar el curso completo, el alumno será capaz de:
 El curso combina:
 
 - **Teoría progresiva:** cada concepto se introduce con contexto y motivación antes de mostrar el código.
-- **Laboratorios prácticos:** 51 laboratorios que refuerzan cada sección con infraestructura real en AWS.
+- **Laboratorios prácticos:** 50 laboratorios que refuerzan cada sección con infraestructura real en AWS.
 - **Seguimiento con documentación:** este proyecto Markdown acompaña al alumno durante las explicaciones del instructor.
 
 ---

@@ -1,57 +1,39 @@
-# --- Red ---
-
 output "vpc_id" {
   description = "ID de la VPC"
-  value       = module.corporate_rds.vpc_id
+  value       = module.network.vpc_id
 }
 
 output "vpc_cidr" {
-  description = "CIDR de la VPC"
-  value       = module.corporate_rds.vpc_cidr
+  description = "CIDR de la VPC (validado como RFC 1918)"
+  value       = module.network.vpc_cidr
 }
 
 output "private_subnet_ids" {
   description = "IDs de las subredes privadas"
-  value       = module.corporate_rds.private_subnet_ids
+  value       = module.network.private_subnet_ids
 }
 
-# --- Base de datos ---
-
-output "db_endpoint" {
-  description = "Endpoint de conexión de la instancia RDS"
-  value       = module.corporate_rds.db_instance_endpoint
+output "bucket_id" {
+  description = "Nombre del bucket S3 (validado con prefijo corporativo)"
+  value       = module.corporate_bucket.bucket_id
 }
 
-output "db_port" {
-  description = "Puerto de la instancia RDS"
-  value       = module.corporate_rds.db_instance_port
+output "bucket_arn" {
+  description = "ARN del bucket S3"
+  value       = module.corporate_bucket.bucket_arn
 }
 
-output "db_name" {
-  description = "Nombre de la base de datos"
-  value       = module.corporate_rds.db_instance_name
+output "db_config_summary" {
+  description = "Resumen de la configuración de la base de datos (sin contraseña)"
+  value       = module.database.config_summary
 }
 
-output "db_secret_arn" {
-  description = "ARN del secreto con la contraseña (gestionada por RDS)"
-  value       = module.corporate_rds.db_master_user_secret_arn
+output "secret_arn" {
+  description = "ARN del secreto en Secrets Manager (la contraseña NO se expone en outputs)"
+  value       = module.database.secret_arn
 }
 
-# --- Compliance ---
-
-output "db_storage_encrypted" {
-  description = "Confirmación: almacenamiento cifrado"
-  value       = module.corporate_rds.db_storage_encrypted
-}
-
-output "db_deletion_protection" {
-  description = "Confirmación: protección contra borrado"
-  value       = module.corporate_rds.db_deletion_protection
-}
-
-# --- Security group ---
-
-output "security_group_id" {
-  description = "ID del security group de RDS"
-  value       = module.corporate_rds.security_group_id
+output "ssm_prefix" {
+  description = "Prefijo de los parámetros SSM de configuración de DB"
+  value       = module.database.ssm_prefix
 }

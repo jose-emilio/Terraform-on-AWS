@@ -1,273 +1,227 @@
-# ── Data Sources ──────────────────────────────────────────────────────────────
-
-data "aws_caller_identity" "current" {}
-
 # ── Locales ───────────────────────────────────────────────────────────────────
 
 locals {
-  account_id = data.aws_caller_identity.current.account_id
-  caller_arn = data.aws_caller_identity.current.arn
-
   tags = {
     Project   = var.project
     ManagedBy = "terraform"
   }
-
-  # Si no se proporcionan administradores explícitos, se usa el caller actual.
-  # Esto garantiza que siempre haya al menos un administrador y evita el error
-  # "The new key policy will not allow you to update the key policy in the future"
-  # que AWS lanza cuando ningún principal tiene kms:PutKeyPolicy.
-  admin_arns = length(var.admin_principal_arns) > 0 ? var.admin_principal_arns : [local.caller_arn]
 }
 
-# ── Key Policy segregada ──────────────────────────────────────────────────────
+# ── Grupo IAM de Desarrolladores ─────────────────────────────────────────────
 #
-# Una Key Policy en KMS tiene tres roles diferenciados:
-#
-#   1. Root account (Sid "EnableRootAccess"):
-#      La cuenta raíz siempre debe tener acceso total para recuperar el control
-#      ante cambios de policy incorrectos. Sin este statement, si se borran todos
-#      los administradores, la llave queda irrecuperable.
-#
-#   2. Administradores (Sid "AllowKeyAdministration"):
-#      Pueden gestionar el ciclo de vida de la llave (rotación, desactivación,
-#      borrado programado, cambio de policy) pero NO pueden usarla para
-#      cifrar/descifrar datos. La segregación impide que un administrador
-#      de infraestructura pueda leer datos cifrados de producción.
-#
-#   3. Usuarios finales/aplicaciones (Sid "AllowKeyUsage"):
-#      Pueden cifrar y descifrar datos pero NO pueden modificar la policy,
-#      deshabilitar la llave ni programar su borrado. Es el único conjunto
-#      de permisos que debe tener el rol de una aplicación.
+# Un grupo agrupa usuarios con las mismas necesidades de acceso.
+# Las políticas se adjuntan al grupo, no a los usuarios individuales,
+# lo que simplifica la gestión y evita inconsistencias.
 
-data "aws_iam_policy_document" "cmk_policy" {
-  # Statement 1 — Acceso total desde la cuenta raíz
-  statement {
-    sid    = "EnableRootAccess"
-    effect = "Allow"
-
-    principals {
-      type        = "AWS"
-      identifiers = ["arn:aws:iam::${local.account_id}:root"]
-    }
-
-    actions   = ["kms:*"]
-    resources = ["*"]
-  }
-
-  # Statement 2 — Administradores: gestión del ciclo de vida, sin uso de datos
-  statement {
-    sid    = "AllowKeyAdministration"
-    effect = "Allow"
-
-    principals {
-      type        = "AWS"
-      identifiers = local.admin_arns
-    }
-
-    actions = [
-      "kms:Create*",
-      "kms:Describe*",
-      "kms:Enable*",
-      "kms:List*",
-      "kms:Put*",
-      "kms:Update*",
-      "kms:Revoke*",
-      "kms:Disable*",
-      "kms:Get*",
-      "kms:Delete*",
-      "kms:TagResource",
-      "kms:UntagResource",
-      "kms:ScheduleKeyDeletion",
-      "kms:CancelKeyDeletion",
-    ]
-
-    resources = ["*"]
-  }
-
-  # Statement 3 — Usuarios finales: solo cifrado/descifrado
-  # Se omite si app_principal_arns está vacío (condition evita policy inválida).
-  dynamic "statement" {
-    for_each = length(var.app_principal_arns) > 0 ? [1] : []
-    content {
-      sid    = "AllowKeyUsage"
-      effect = "Allow"
-
-      principals {
-        type        = "AWS"
-        identifiers = var.app_principal_arns
-      }
-
-      actions = [
-        "kms:Encrypt",
-        "kms:Decrypt",
-        "kms:ReEncrypt*",
-        "kms:GenerateDataKey*",
-        "kms:DescribeKey",
-      ]
-
-      resources = ["*"]
-    }
-  }
-
-  # Statement 4 — Permite que los servicios AWS (S3, EBS) usen la CMK
-  # cuando el acceso viene de una solicitud de esos servicios en la misma cuenta.
-  statement {
-    sid    = "AllowAWSServicesViaGrants"
-    effect = "Allow"
-
-    principals {
-      type        = "AWS"
-      identifiers = ["arn:aws:iam::${local.account_id}:root"]
-    }
-
-    actions = [
-      "kms:CreateGrant",
-      "kms:ListGrants",
-      "kms:RevokeGrant",
-    ]
-
-    resources = ["*"]
-
-    condition {
-      test     = "Bool"
-      variable = "kms:GrantIsForAWSResource"
-      values   = ["true"]
-    }
-  }
+resource "aws_iam_group" "developers" {
+  name = "${var.project}-developers"
+  path = "/"
 }
 
-# ── Customer Managed Key (CMK) ────────────────────────────────────────────────
-#
-# enable_key_rotation = true: KMS rota automáticamente el material criptográfico
-# cada año. El alias y el Key ID permanecen igual — no hay cambios en el código.
-# Los datos cifrados con material antiguo siguen siendo descifrables porque KMS
-# mantiene todos los materiales históricos.
-#
-# deletion_window_in_days = 7: el mínimo que permite AWS (default = 30).
-# Durante esta ventana la llave está deshabilitada pero no eliminada, lo que
-# permite cancelar un borrado accidental con kms:CancelKeyDeletion.
-#
-# multi_region = false: llave regional. Para replicar datos cifrados entre
-# regiones se necesitaría multi_region = true + aws_kms_replica_key.
-
-resource "aws_kms_key" "main" {
-  description             = "CMK del Lab13 — cifrado de EBS y S3"
-  enable_key_rotation     = true
-  deletion_window_in_days = 7
-  multi_region            = false
-  policy                  = data.aws_iam_policy_document.cmk_policy.json
-
-  tags = merge(local.tags, { Name = "${var.project}-cmk" })
-}
-
-# ── Alias ─────────────────────────────────────────────────────────────────────
-#
-# El alias es un nombre amigable que apunta al Key ID.
-# Cuando se rota el material criptográfico o se sustituye la CMK por otra
-# (por ejemplo tras un incidente), basta con apuntar el alias a la nueva llave.
-# Todo el código que referencia "alias/lab13-main" sigue funcionando sin cambios.
-#
-# Convención de nombres: alias/<proyecto>-<propósito>
-# Prefijo "alias/" es obligatorio y gestionado automáticamente por Terraform.
-
-resource "aws_kms_alias" "main" {
-  name          = "alias/${var.project}-main"
-  target_key_id = aws_kms_key.main.key_id
-}
-
-# ── Volumen EBS cifrado con la CMK ────────────────────────────────────────────
-#
-# encrypted = true + kms_key_id = alias ARN fuerzan el cifrado con la CMK.
-# Si se omite kms_key_id pero se pone encrypted = true, AWS usa la llave
-# gestionada por el servicio (aws/ebs) en lugar de la CMK personalizada.
-#
-# Diferencias CMK vs llave gestionada por servicio:
-#   - CMK: control total de la policy, rotación configurable, auditable en CloudTrail.
-#   - aws/ebs: sin control de policy, rotación automática por AWS, menor visibilidad.
-
-resource "aws_ebs_volume" "main" {
-  availability_zone = var.availability_zone
-  size              = var.ebs_volume_size_gb
-  type              = "gp3"
-  encrypted         = true
-  kms_key_id        = aws_kms_alias.main.arn
-
-  tags = merge(local.tags, { Name = "${var.project}-ebs" })
-}
-
-# ── Bucket S3 cifrado con la CMK ──────────────────────────────────────────────
-#
-# apply_server_side_encryption_by_default: cifra todos los objetos nuevos con
-# la CMK especificada (SSE-KMS). Los objetos ya existentes no se re-cifran.
-#
-# bucket_key_enabled = true: activa S3 Bucket Key, que reduce las llamadas a
-# la API de KMS generando una llave de datos temporal a nivel de bucket.
-# Reduce el coste de KMS hasta un 99% en buckets con alta densidad de objetos.
-
-resource "aws_s3_bucket" "main" {
-  bucket        = "${var.project}-data-${local.account_id}"
-  force_destroy = true
-
-  tags = merge(local.tags, { Name = "${var.project}-data" })
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
-  bucket = aws_s3_bucket.main.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
-      kms_master_key_id = aws_kms_alias.main.arn
-    }
-    bucket_key_enabled = true
-  }
-}
-
-# Bloqueo de acceso público: el bucket es privado por defecto.
-resource "aws_s3_bucket_public_access_block" "main" {
-  bucket                  = aws_s3_bucket.main.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# Política de bucket: deniega explícitamente cualquier carga de objeto que
-# no use SSE-KMS. Esto impide que un cliente suba objetos sin cifrado o
-# con una llave diferente, garantizando el cifrado forzoso.
-resource "aws_s3_bucket_policy" "enforce_kms" {
-  bucket = aws_s3_bucket.main.id
+# Política inline del grupo: lectura de recursos EC2 e IAM.
+# Con esta política, cualquier miembro del grupo puede inspeccionar la
+# infraestructura sin poder modificarla.
+resource "aws_iam_group_policy" "developers_read" {
+  name  = "${var.project}-developers-read"
+  group = aws_iam_group.developers.name
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid       = "DenyNonKMSUploads"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "s3:PutObject"
-        Resource  = "${aws_s3_bucket.main.arn}/*"
-        Condition = {
-          StringNotEqualsIfExists = {
-            "s3:x-amz-server-side-encryption" = "aws:kms"
-          }
-        }
+        Sid      = "EC2ReadOnly"
+        Effect   = "Allow"
+        Action   = ["ec2:Describe*", "ec2:Get*"]
+        Resource = "*"
       },
       {
-        Sid       = "DenyWrongKMSKey"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "s3:PutObject"
-        Resource  = "${aws_s3_bucket.main.arn}/*"
-        Condition = {
-          StringNotEqualsIfExists = {
-            "s3:x-amz-server-side-encryption-aws-kms-key-id" = aws_kms_key.main.arn
-          }
-        }
+        Sid      = "IAMReadOnly"
+        Effect   = "Allow"
+        Action   = ["iam:Get*", "iam:List*"]
+        Resource = "*"
+      },
+      {
+        Sid      = "STSCallerIdentity"
+        Effect   = "Allow"
+        Action   = "sts:GetCallerIdentity"
+        Resource = "*"
       }
     ]
   })
+}
 
-  depends_on = [aws_s3_bucket_public_access_block.main]
+# ── Usuario IAM dev-01 ────────────────────────────────────────────────────────
+#
+# Terraform crea el objeto usuario pero no genera Access Keys.
+# Las credenciales de acceso programático deben crearse manualmente en la
+# consola o con la CLI de AWS para evitar almacenarlas en el estado de Terraform
+# (el tfstate no está cifrado por defecto en disco local).
+#
+# force_destroy = true permite eliminar el usuario aunque tenga Access Keys
+# vinculadas, facilitando la limpieza al final del laboratorio.
+
+resource "aws_iam_user" "dev01" {
+  name          = "${var.project}-dev-01"
+  path          = "/"
+  force_destroy = true
+
+  tags = merge(local.tags, { Name = "${var.project}-dev-01" })
+}
+
+# Membresía programática: asocia dev-01 al grupo de desarrolladores.
+# A partir de este momento, dev-01 hereda todas las políticas del grupo.
+resource "aws_iam_user_group_membership" "dev01" {
+  user   = aws_iam_user.dev01.name
+  groups = [aws_iam_group.developers.name]
+}
+
+# ── Trust Policy del Rol EC2 ──────────────────────────────────────────────────
+#
+# La Trust Policy (política de confianza) responde a la pregunta:
+# "¿Quién puede asumir este rol?".
+#
+# Principal = "ec2.amazonaws.com" significa que únicamente el servicio EC2
+# de AWS puede llamar a sts:AssumeRole sobre este rol. Ningún usuario,
+# otra función Lambda, ni ningún servicio externo puede hacerlo.
+#
+# Se usa data source (aws_iam_policy_document) en lugar de jsonencode()
+# para aprovechar la validación de sintaxis que hace el provider.
+
+data "aws_iam_policy_document" "ec2_trust" {
+  statement {
+    sid     = "AllowEC2AssumeRole"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+# ── Rol IAM para EC2 ──────────────────────────────────────────────────────────
+#
+# El rol define QUÉ puede hacer la instancia una vez que lo asume.
+# Las políticas adjuntas al rol responden a: "¿A qué recursos puede acceder?".
+#
+# Flujo completo de asunción de rol:
+#   1. EC2 detecta el Instance Profile al arrancar.
+#   2. El agente de EC2 llama a sts:AssumeRole usando la Trust Policy.
+#   3. STS devuelve credenciales temporales (AccessKeyId + SecretAccessKey + Token).
+#   4. Las credenciales se renuevan automáticamente antes de expirar y se
+#      exponen en el IMDS en: /latest/meta-data/iam/security-credentials/<rol>.
+
+resource "aws_iam_role" "ec2" {
+  name               = "${var.project}-ec2-role"
+  path               = "/"
+  assume_role_policy = data.aws_iam_policy_document.ec2_trust.json
+  description        = "Rol para instancias EC2 del Lab12"
+
+  tags = merge(local.tags, { Name = "${var.project}-ec2-role" })
+}
+
+# AmazonSSMManagedInstanceCore: permite que SSM Agent gestione la instancia.
+# Sin esta política no es posible abrir sesiones con SSM Session Manager.
+resource "aws_iam_role_policy_attachment" "ec2_ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# AmazonEC2ReadOnlyAccess: permite que la instancia llame a ec2:Describe*
+# para demostrar que las credenciales temporales funcionan con la API de AWS.
+resource "aws_iam_role_policy_attachment" "ec2_readonly" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+}
+
+# ── Instance Profile ──────────────────────────────────────────────────────────
+#
+# El Instance Profile es el contenedor que une un Rol IAM con una instancia EC2.
+# EC2 no puede usar un rol directamente; necesita este "envoltorio".
+# Una instancia solo puede tener un Instance Profile (con un único rol dentro).
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.project}-ec2-profile"
+  role = aws_iam_role.ec2.name
+
+  tags = merge(local.tags, { Name = "${var.project}-ec2-profile" })
+}
+
+# ── Data Source: AMI Amazon Linux 2023 (ARM64) ────────────────────────────────
+
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-arm64"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# ── Security Group ────────────────────────────────────────────────────────────
+#
+# Sin reglas inbound: la instancia no necesita recibir conexiones entrantes.
+# SSM Session Manager funciona en modo "salida" — el SSM Agent en la instancia
+# abre una conexión WebSocket saliente hacia los endpoints de SSM en AWS.
+#
+# Egress 443 es imprescindible para que SSM Agent y las llamadas a la API
+# de AWS (STS, EC2, etc.) funcionen correctamente.
+
+resource "aws_security_group" "ec2" {
+  name        = "${var.project}-ec2-sg"
+  description = "Sin inbound; egress HTTPS para SSM Agent y AWS API"
+
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS para SSM Agent, STS y EC2 API"
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-ec2-sg" })
+}
+
+# ── Instancia EC2 ─────────────────────────────────────────────────────────────
+#
+# Al asociar iam_instance_profile, EC2 expone credenciales temporales en IMDS.
+# El script user_data.sh valida este comportamiento leyendo el IMDS y
+# ejecutando aws sts get-caller-identity.
+#
+# IMDSv2 (http_tokens = "required") obliga a usar un token de sesión en cada
+# petición al metadata service, bloqueando ataques SSRF que intentan
+# leer http://169.254.169.254 sin autenticación.
+
+resource "aws_instance" "app" {
+  ami                  = data.aws_ami.al2023.id
+  instance_type        = var.instance_type
+  iam_instance_profile = aws_iam_instance_profile.ec2.name
+
+  vpc_security_group_ids      = [aws_security_group.ec2.id]
+  user_data                   = file("${path.module}/../user_data.sh")
+  user_data_replace_on_change = true
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-app" })
+
+  depends_on = [
+    aws_iam_role_policy_attachment.ec2_ssm,
+    aws_iam_role_policy_attachment.ec2_readonly,
+  ]
 }

@@ -1,13 +1,13 @@
 variable "region" {
   type        = string
-  description = "Región declarada al provider AWS. En LocalStack es informativa (todos los servicios responden bajo el mismo endpoint local), pero se respeta para mantener paridad con la versión aws/."
+  description = "Región usada en el service_name del VPC Endpoint (en LocalStack los endpoints son emulados, pero el ARN se respeta)"
   default     = "us-east-1"
 }
 
 variable "vpc_cidr" {
   type        = string
   description = "CIDR block de la VPC"
-  default     = "10.14.0.0/16"
+  default     = "10.13.0.0/16"
 }
 
 variable "project_name" {
@@ -22,20 +22,6 @@ variable "environment" {
   default     = "lab"
 }
 
-variable "alb_ingress_ports" {
-  type        = list(number)
-  description = "Lista de puertos TCP que el ALB acepta desde Internet"
-  default     = [80, 443]
-}
-
-variable "blocked_ip" {
-  type        = string
-  description = "CIDR de la IP maliciosa a bloquear en la NACL (ej: 203.0.113.0/32)"
-  default     = "203.0.113.0/32"
-}
-
-variable "flow_log_retention_days" {
-  type        = number
-  description = "Días de retención de los VPC Flow Logs en CloudWatch"
-  default     = 7
-}
+# Nota: en la versión aws/ existe `use_nat_instance` para alternar entre NAT
+# Gateway y NAT Instance. En LocalStack siempre se despliega NAT Gateway
+# (la NAT Instance requiere AMI real de EC2), por lo que esa variable se omite.

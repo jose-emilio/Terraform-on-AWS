@@ -75,8 +75,8 @@ variable "slack_webhook_url" {
 
     Deja en blanco ("") para omitir la suscripcion HTTPS y usar solo email.
   EOT
-  default   = ""
-  sensitive = true
+  default     = ""
+  sensitive   = true
 
   validation {
     condition     = var.slack_webhook_url == "" || can(regex("^https://", var.slack_webhook_url))
@@ -93,7 +93,7 @@ variable "notification_email" {
 
     Deja en blanco ("") para omitir la suscripcion de email.
   EOT
-  default = ""
+  default     = ""
 
   validation {
     condition     = var.notification_email == "" || can(regex("^[^@]+@[^@]+\\.[^@]+$", var.notification_email))

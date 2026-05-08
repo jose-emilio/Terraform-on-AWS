@@ -3,27 +3,42 @@
 data "aws_availability_zones" "available" {
   state = "available"
 
+  # Excluye Local Zones y Wavelength Zones: estas zonas requieren opt-in
+  # explícito y no soportan todos los servicios (NAT Gateway entre ellos).
   filter {
     name   = "opt-in-status"
     values = ["opt-in-not-required"]
   }
 }
 
-data "aws_caller_identity" "current" {}
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
 
-# ── Locales ───────────────────────────────────────────────────────────────────
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-arm64"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+}
+
+# ── Red ───────────────────────────────────────────────────────────────────────
 
 locals {
-  azs          = slice(data.aws_availability_zones.available.names, 0, 2)
-  public_cidrs = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 1)]
+  # Limita a 2 AZs para controlar el coste del laboratorio
+  azs           = slice(data.aws_availability_zones.available.names, 0, 2)
+  public_cidrs  = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 1)]
+  private_cidrs = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 11)]
 
   tags = {
     Project   = var.project
     ManagedBy = "terraform"
   }
 }
-
-# ── Red ───────────────────────────────────────────────────────────────────────
 
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
@@ -39,12 +54,41 @@ resource "aws_subnet" "public" {
   cidr_block        = local.public_cidrs[count.index]
   availability_zone = local.azs[count.index]
 
+  # Las instancias del ALB necesitan IPs públicas; las instancias del ASG no.
+  map_public_ip_on_launch = false
+
   tags = merge(local.tags, { Name = "${var.project}-public-${local.azs[count.index]}" })
+}
+
+resource "aws_subnet" "private" {
+  count             = length(local.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = local.private_cidrs[count.index]
+  availability_zone = local.azs[count.index]
+
+  tags = merge(local.tags, { Name = "${var.project}-private-${local.azs[count.index]}" })
 }
 
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
   tags   = merge(local.tags, { Name = "${var.project}-igw" })
+}
+
+# Un EIP y un NAT Gateway por AZ para que un fallo de zona no corte
+# la conectividad de salida de las instancias privadas de las demás AZs.
+resource "aws_eip" "nat" {
+  count      = length(local.azs)
+  domain     = "vpc"
+  depends_on = [aws_internet_gateway.main]
+  tags       = merge(local.tags, { Name = "${var.project}-nat-eip-${local.azs[count.index]}" })
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = length(local.azs)
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+  depends_on    = [aws_internet_gateway.main]
+  tags          = merge(local.tags, { Name = "${var.project}-nat-${local.azs[count.index]}" })
 }
 
 resource "aws_route_table" "public" {
@@ -64,47 +108,38 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# ── Seguridad ─────────────────────────────────────────────────────────────────
+# Una route table privada por AZ, cada una apuntando a su propio NAT Gateway.
+resource "aws_route_table" "private" {
+  count  = length(local.azs)
+  vpc_id = aws_vpc.main.id
 
-resource "aws_security_group" "ecs" {
-  name        = "${var.project}-ecs-sg"
-  description = "Trafico para los contenedores Fargate y el proxy Service Connect"
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-private-rt-${local.azs[count.index]}" })
+}
+
+resource "aws_route_table_association" "private" {
+  count          = length(aws_subnet.private)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# ── Seguridad ──────────────────────────────────────────────────────────────────
+
+resource "aws_security_group" "alb" {
+  name        = "${var.project}-alb-sg"
+  description = "Permite trafico HTTP desde Internet al ALB"
   vpc_id      = aws_vpc.main.id
 
-  # Puerto 80 desde Internet → servicio Web accesible directamente por el navegador
   ingress {
-    description = "HTTP desde Internet al servicio Web"
+    description = "HTTP desde Internet"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Puerto 80 entre tareas del cluster (Service Connect para el servicio Web)
-  ingress {
-    description = "Puerto 80 entre tareas ECS (Service Connect)"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    self        = true
-  }
-
-  # Puerto 8080 entre tareas del cluster (Web → API via Service Connect)
-  ingress {
-    description = "Puerto 8080 entre tareas ECS (Web llama a API)"
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    self        = true
-  }
-
-  # El proxy Envoy de Service Connect usa el rango 15000–15010 internamente
-  ingress {
-    description = "Proxy Envoy de Service Connect entre tareas"
-    from_port   = 15000
-    to_port     = 15010
-    protocol    = "tcp"
-    self        = true
   }
 
   egress {
@@ -114,389 +149,212 @@ resource "aws_security_group" "ecs" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = merge(local.tags, { Name = "${var.project}-ecs-sg" })
+  tags = merge(local.tags, { Name = "${var.project}-alb-sg" })
 }
 
-# ── Ciclo de Vida de Imágenes: Repositorio ECR ────────────────────────────────
+resource "aws_security_group" "instances" {
+  name        = "${var.project}-instances-sg"
+  description = "Permite trafico al puerto 8080 solo desde el ALB"
+  vpc_id      = aws_vpc.main.id
 
-resource "aws_ecr_repository" "app" {
-  name                 = "${var.project}/api"
-  image_tag_mutability = "IMMUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
+  ingress {
+    description     = "Puerto de aplicacion desde el ALB"
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
   }
 
-  tags = merge(local.tags, { Name = "${var.project}-ecr" })
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-instances-sg" })
 }
 
-resource "aws_ecr_lifecycle_policy" "app" {
-  repository = aws_ecr_repository.app.name
+# ── Balanceo de Carga (L7) ────────────────────────────────────────────────────
 
-  policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Mantener solo las 10 imagenes mas recientes"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 10
-      }
-      action = {
-        type = "expire"
-      }
-    }]
-  })
+resource "aws_lb" "main" {
+  name               = "${var.project}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id
+
+  tags = merge(local.tags, { Name = "${var.project}-alb" })
 }
 
-# ── Inyección de Secretos: SSM Parameter Store ────────────────────────────────
+resource "aws_lb_target_group" "web" {
+  name     = "${var.project}-tg"
+  port     = 8080
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main.id
 
-resource "aws_ssm_parameter" "api_key" {
-  name        = "/${var.project}/api-key"
-  description = "Clave de API compartida entre los microservicios Web y API"
-  type        = "SecureString"
-  value       = var.api_key
+  # Reduce el tiempo de drenaje al mínimo razonable para el laboratorio.
+  # En producción, ajustar según la duración máxima de las peticiones en curso.
+  deregistration_delay = 30
 
-  tags = merge(local.tags, { Name = "${var.project}-api-key" })
+  health_check {
+    path                = "/"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    interval            = 30
+    timeout             = 5
+    matcher             = "200"
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-tg" })
 }
 
-# ── CloudWatch Logs ────────────────────────────────────────────────────────────
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
 
-resource "aws_cloudwatch_log_group" "web" {
-  name              = "/ecs/${var.project}/web"
-  retention_in_days = 7
-  tags              = local.tags
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web.arn
+  }
 }
 
-resource "aws_cloudwatch_log_group" "api" {
-  name              = "/ecs/${var.project}/api"
-  retention_in_days = 7
-  tags              = local.tags
-}
+# ── IAM (SSM) ─────────────────────────────────────────────────────────────────
 
-# ── IAM ───────────────────────────────────────────────────────────────────────
-
-resource "aws_iam_role" "execution" {
-  name = "${var.project}-execution-role"
+resource "aws_iam_role" "ssm" {
+  name = "${var.project}-ssm-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
+      Principal = { Service = "ec2.amazonaws.com" }
       Action    = "sts:AssumeRole"
     }]
   })
 
-  tags = merge(local.tags, { Name = "${var.project}-execution-role" })
+  tags = merge(local.tags, { Name = "${var.project}-ssm-role" })
 }
 
-resource "aws_iam_role_policy_attachment" "execution_basic" {
-  role       = aws_iam_role.execution.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ssm.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_role_policy" "ssm_read" {
-  name = "${var.project}-ssm-read"
-  role = aws_iam_role.execution.id
+resource "aws_iam_instance_profile" "ssm" {
+  name = "${var.project}-ssm-profile"
+  role = aws_iam_role.ssm.name
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ssm:GetParameters",
-        "kms:Decrypt"
-      ]
-      Resource = [
-        aws_ssm_parameter.api_key.arn,
-        "arn:aws:kms:${var.region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"
-      ]
-    }]
-  })
+  tags = merge(local.tags, { Name = "${var.project}-ssm-profile" })
 }
 
-resource "aws_iam_role" "task" {
-  name = "${var.project}-task-role"
+# ── Flota de Cómputo ──────────────────────────────────────────────────────────
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+resource "aws_launch_template" "web" {
+  name_prefix   = "${var.project}-web-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = var.instance_type
 
-  tags = merge(local.tags, { Name = "${var.project}-task-role" })
-}
-
-resource "aws_iam_role_policy" "execute_command" {
-  name = "${var.project}-execute-command"
-  role = aws_iam_role.task.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ssmmessages:CreateControlChannel",
-        "ssmmessages:CreateDataChannel",
-        "ssmmessages:OpenControlChannel",
-        "ssmmessages:OpenDataChannel"
-      ]
-      Resource = "*"
-    }]
-  })
-}
-
-# ── Cluster ECS ───────────────────────────────────────────────────────────────
-
-resource "aws_ecs_cluster" "main" {
-  name = "${var.project}-cluster"
-
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ssm.name
   }
 
-  tags = merge(local.tags, { Name = "${var.project}-cluster" })
-}
-
-# ── Malla de Servicios: Namespace de Service Connect ──────────────────────────
-
-resource "aws_service_discovery_http_namespace" "main" {
-  name        = var.project
-  description = "Namespace Service Connect del cluster ${var.project}"
-  tags        = local.tags
-}
-
-# ── Task Definition: Servicio Web ─────────────────────────────────────────────
-# Sirve la página HTML. nginx escucha en el puerto 80 y hace proxy_pass
-# a http://api:8080/ (resuelto por Service Connect) para /api-data.
-
-resource "aws_ecs_task_definition" "web" {
-  family                   = "${var.project}-web"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
-
-  execution_role_arn = aws_iam_role.execution.arn
-  task_role_arn      = aws_iam_role.task.arn
-
-  container_definitions = jsonencode([{
-    name      = "web"
-    image     = var.container_image
-    essential = true
-    cpu       = 256
-    memory    = 512
-
-    command = ["/bin/sh", "-c", file("${path.module}/startup.sh")]
-
-    portMappings = [{
-      name          = "web-http"
-      containerPort = 80
-      protocol      = "tcp"
-      appProtocol   = "http"
-    }]
-
-    secrets = [{
-      name      = "API_KEY"
-      valueFrom = aws_ssm_parameter.api_key.arn
-    }]
-
-    environment = [
-      { name = "APP_ENV",     value = "production" },
-      { name = "APP_REGION",  value = var.region },
-      { name = "APP_PROJECT", value = var.project },
-    ]
-
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.web.name
-        "awslogs-region"        = var.region
-        "awslogs-stream-prefix" = "web"
-      }
-    }
-  }])
-
-  tags = merge(local.tags, { Name = "${var.project}-web-task-def" })
-}
-
-# ── Task Definition: Microservicio API ────────────────────────────────────────
-# Sirve una respuesta JSON con metadatos de la tarea ECS.
-# nginx escucha en el puerto 8080, accesible únicamente via Service Connect.
-
-resource "aws_ecs_task_definition" "api" {
-  family                   = "${var.project}-api"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
-
-  execution_role_arn = aws_iam_role.execution.arn
-  task_role_arn      = aws_iam_role.task.arn
-
-  container_definitions = jsonencode([{
-    name      = "api"
-    image     = var.container_image
-    essential = true
-    cpu       = 256
-    memory    = 512
-
-    command = ["/bin/sh", "-c", file("${path.module}/startup-api.sh")]
-
-    portMappings = [{
-      name          = "api-http"
-      containerPort = 8080
-      protocol      = "tcp"
-      appProtocol   = "http"
-    }]
-
-    # El servicio API necesita la clave para validar el header X-API-Key
-    # en cada petición entrante. startup-api.sh embebe el valor en el
-    # bloque map{} del config de nginx en tiempo de arranque.
-    secrets = [{
-      name      = "API_KEY"
-      valueFrom = aws_ssm_parameter.api_key.arn
-    }]
-
-    environment = [
-      { name = "APP_ENV",     value = "production" },
-      { name = "APP_REGION",  value = var.region },
-      { name = "APP_PROJECT", value = var.project },
-    ]
-
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.api.name
-        "awslogs-region"        = var.region
-        "awslogs-stream-prefix" = "api"
-      }
-    }
-  }])
-
-  tags = merge(local.tags, { Name = "${var.project}-api-task-def" })
-}
-
-# ── Servicio ECS: Web ─────────────────────────────────────────────────────────
-
-resource "aws_ecs_service" "web" {
-  name            = "${var.project}-web"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.web.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
-
-  enable_execute_command = true
-
-  network_configuration {
-    subnets          = aws_subnet.public[*].id
-    security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = true
+  # Las instancias viven en subredes privadas; no necesitan IP pública.
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.instances.id]
   }
 
-  # El servicio Web se registra como servidor ("web" DNS) Y como cliente
-  # que puede llamar a "api:8080". Ambos roles en el mismo namespace.
-  service_connect_configuration {
-    enabled   = true
-    namespace = aws_service_discovery_http_namespace.main.arn
+  # templatefile() lee user_data.sh e interpola ${app_version};
+  # las variables bash ($TOKEN, $AZ, $ID) no usan llaves y no son afectadas.
+  user_data = base64encode(templatefile("${path.module}/user_data.sh", {
+    app_version = var.app_version
+  }))
 
-    service {
-      port_name      = "web-http"
-      discovery_name = "web"
-
-      client_alias {
-        port     = 80
-        dns_name = "web"
-      }
-    }
-
-    log_configuration {
-      log_driver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.web.name
-        "awslogs-region"        = var.region
-        "awslogs-stream-prefix" = "service-connect-web"
-      }
-    }
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(local.tags, { Name = "${var.project}-web" })
   }
 
-  deployment_circuit_breaker {
-    enable   = true
-    rollback = true
+  lifecycle {
+    create_before_destroy = true
   }
 
-  deployment_maximum_percent         = 200
-  deployment_minimum_healthy_percent = 100
+  tags = merge(local.tags, { Name = "${var.project}-launch-template" })
+}
 
-  depends_on = [
-    aws_iam_role_policy_attachment.execution_basic,
-    aws_iam_role_policy.ssm_read,
+resource "aws_autoscaling_group" "web" {
+  name = "${var.project}-asg"
+
+  # Distribuye instancias entre todas las subredes privadas disponibles
+  vpc_zone_identifier = aws_subnet.private[*].id
+
+  # Apunta siempre a la última versión del Launch Template.
+  # Al cambiar la versión, el campo `version` cambia y Terraform activa el instance_refresh.
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = aws_launch_template.web.latest_version
+  }
+
+  target_group_arns         = [aws_lb_target_group.web.arn]
+  health_check_type         = "ELB"
+  health_check_grace_period = 60
+
+  # Publica métricas del ASG en CloudWatch cada minuto. Sin esto, el Target
+  # Tracking solo dispone de las métricas de instancia individuales (EC2),
+  # que tienen granularidad de 5 minutos en el tier gratuito.
+  metrics_granularity = "1Minute"
+  enabled_metrics = [
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupPendingInstances",
+    "GroupTerminatingInstances",
+    "GroupTotalInstances",
   ]
 
-  tags = merge(local.tags, { Name = "${var.project}-web-service" })
+  min_size         = var.min_size
+  max_size         = var.max_size
+  desired_capacity = var.desired_capacity
+
+  # Reemplaza instancias de forma gradual cuando cambia el Launch Template,
+  # manteniendo al menos el 90% de la capacidad deseada en todo momento.
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 90
+      instance_warmup        = 60
+    }
+    triggers = ["launch_template"]
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${var.project}-web"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "ManagedBy"
+    value               = "terraform"
+    propagate_at_launch = true
+  }
 }
 
-# ── Servicio ECS: API ─────────────────────────────────────────────────────────
+resource "aws_autoscaling_policy" "cpu" {
+  name                   = "${var.project}-cpu-tracking"
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  policy_type            = "TargetTrackingScaling"
 
-resource "aws_ecs_service" "api" {
-  name            = "${var.project}-api"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.api.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
-
-  enable_execute_command = true
-
-  network_configuration {
-    subnets          = aws_subnet.public[*].id
-    security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = true
-  }
-
-  # El servicio API se registra como "api" en el namespace.
-  # El servicio Web llama a http://api:8080/ y Service Connect enruta
-  # la petición a cualquiera de las tareas activas del servicio API.
-  service_connect_configuration {
-    enabled   = true
-    namespace = aws_service_discovery_http_namespace.main.arn
-
-    service {
-      port_name      = "api-http"
-      discovery_name = "api"
-
-      client_alias {
-        port     = 8080
-        dns_name = "api"
-      }
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
     }
-
-    log_configuration {
-      log_driver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.api.name
-        "awslogs-region"        = var.region
-        "awslogs-stream-prefix" = "service-connect-api"
-      }
-    }
+    # El ASG añade o elimina instancias para mantener la CPU media en torno al 50%
+    target_value = 50.0
   }
-
-  deployment_circuit_breaker {
-    enable   = true
-    rollback = true
-  }
-
-  deployment_maximum_percent         = 200
-  deployment_minimum_healthy_percent = 100
-
-  depends_on = [
-    aws_iam_role_policy_attachment.execution_basic,
-    aws_iam_role_policy.ssm_read,
-  ]
-
-  tags = merge(local.tags, { Name = "${var.project}-api-service" })
 }

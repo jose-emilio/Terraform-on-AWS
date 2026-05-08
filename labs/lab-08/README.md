@@ -10,7 +10,7 @@
 
 En este laboratorio aprenderás a gestionar el ciclo de vida completo de un recurso usando las primitivas declarativas de Terraform 1.5+/1.7+: adoptarás un recurso existente con `import {}` y `-generate-config-out`, lo renombrarás en el estado sin recrearlo con `moved {}`, y finalmente dejarás de gestionarlo sin eliminarlo con `removed {}`.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -28,7 +28,7 @@ Al finalizar este laboratorio serás capaz de:
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### Bloque `import {}`
 
@@ -129,7 +129,7 @@ lab-08/
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Código Terraform
 

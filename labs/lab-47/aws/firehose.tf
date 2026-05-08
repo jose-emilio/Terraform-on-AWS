@@ -78,17 +78,17 @@ resource "aws_iam_role_policy" "firehose" {
         # Con bucket_key_enabled = true en el bucket, S3 gestiona internamente
         # la mayoría de las llamadas KMS con una clave de bucket. Firehose aún
         # necesita GenerateDataKey para el cifrado inicial antes de subir a S3.
-        Sid    = "KMSAccess"
-        Effect = "Allow"
-        Action = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Sid      = "KMSAccess"
+        Effect   = "Allow"
+        Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
         Resource = aws_kms_key.main.arn
       },
       {
         # Permite a Firehose escribir sus propios errores de entrega en el
         # log group de diagnóstico. Solo se otorga acceso al stream "delivery".
-        Sid    = "CloudWatchLogsAccess"
-        Effect = "Allow"
-        Action = ["logs:PutLogEvents"]
+        Sid      = "CloudWatchLogsAccess"
+        Effect   = "Allow"
+        Action   = ["logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.firehose.arn}:log-stream:${aws_cloudwatch_log_stream.firehose_delivery.name}"
       }
     ]

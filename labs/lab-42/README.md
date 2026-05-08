@@ -24,7 +24,7 @@ La inmutabilidad es la propiedad clave: una vez publicado `vpc-module@1.0.0`,
 CodeArtifact impide sobrescribir esa versión. La misma URL siempre devuelve
 el mismo binario, verificable por hash SHA-256.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Aprovisionar un dominio y un repositorio CodeArtifact cifrados con una CMK
   gestionada por Terraform (no la clave AWS/codeartifact por defecto).

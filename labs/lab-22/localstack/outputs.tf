@@ -1,29 +1,34 @@
-output "logs_bucket_id" {
-  description = "Nombre del bucket de logs"
-  value       = module.logs_bucket.bucket_id
+output "vpc_id" {
+  description = "ID de la VPC"
+  value       = aws_vpc.main.id
 }
 
-output "logs_bucket_arn" {
-  description = "ARN del bucket de logs"
-  value       = module.logs_bucket.bucket_arn
+output "zone_id" {
+  description = "ID de la Zona Hospedada Privada"
+  value       = aws_route53_zone.internal.zone_id
 }
 
-output "logs_bucket_domain_name" {
-  description = "Nombre de dominio del bucket de logs"
-  value       = module.logs_bucket.bucket_domain_name
+output "internal_domain" {
+  description = "Nombre del dominio interno"
+  value       = var.internal_domain
 }
 
-output "data_bucket_id" {
-  description = "Nombre del bucket de datos"
-  value       = module.data_bucket.bucket_id
+output "web_fqdn" {
+  description = "FQDN del registro web"
+  value       = aws_route53_record.web.fqdn
 }
 
-output "data_bucket_arn" {
-  description = "ARN del bucket de datos"
-  value       = module.data_bucket.bucket_arn
+output "db_fqdn" {
+  description = "FQDN del registro db"
+  value       = aws_route53_record.db.fqdn
 }
 
-output "data_bucket_domain_name" {
-  description = "Nombre de dominio del bucket de datos"
-  value       = module.data_bucket.bucket_domain_name
+output "db_private_ip" {
+  description = "IP privada de la instancia db"
+  value       = aws_instance.db.private_ip
+}
+
+output "test_instance_id" {
+  description = "ID de la instancia de test"
+  value       = aws_instance.test.id
 }

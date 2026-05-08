@@ -33,7 +33,7 @@ final del build.
 El trigger es completamente automático: cada `git push` a la rama `main` del
 repositorio CodeCommit dispara el build via EventBridge, sin intervención manual.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Diseñar y construir un Dockerfile multi-stage con Terraform, TFLint, Trivy y
   Checkov con versiones exactas pinneadas, verificando la integridad SHA-256 de

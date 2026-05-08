@@ -4,22 +4,10 @@ variable "region" {
   default     = "us-east-1"
 }
 
-variable "app_cidr" {
+variable "vpc_cidr" {
   type        = string
-  description = "CIDR block de la VPC app"
-  default     = "10.15.0.0/16"
-}
-
-variable "db_cidr" {
-  type        = string
-  description = "CIDR block de la VPC db"
-  default     = "10.16.0.0/16"
-}
-
-variable "c_cidr" {
-  type        = string
-  description = "CIDR block de la VPC C (para demostrar no transitividad)"
-  default     = "10.17.0.0/16"
+  description = "CIDR block de la VPC"
+  default     = "10.14.0.0/16"
 }
 
 variable "project_name" {
@@ -32,4 +20,22 @@ variable "environment" {
   type        = string
   description = "Entorno de despliegue (lab, dev, staging, production)"
   default     = "lab"
+}
+
+variable "alb_ingress_ports" {
+  type        = list(number)
+  description = "Lista de puertos TCP que el ALB acepta desde Internet"
+  default     = [80, 443]
+}
+
+variable "blocked_ip" {
+  type        = string
+  description = "CIDR de la IP maliciosa a bloquear en la NACL (ej: 203.0.113.0/32)"
+  default     = "203.0.113.0/32"
+}
+
+variable "flow_log_retention_days" {
+  type        = number
+  description = "Días de retención de los VPC Flow Logs en CloudWatch"
+  default     = 7
 }

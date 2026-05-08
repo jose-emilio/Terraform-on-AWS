@@ -1,64 +1,76 @@
-# ── Locals ──────────────────────────────────────────────────────────────────
+# ── Locales ───────────────────────────────────────────────────────────────────
+
 locals {
-  common_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "terraform"
+  account_id = "000000000000" # ID de cuenta simulado por LocalStack
+  tags = {
+    Project   = var.project
+    ManagedBy = "terraform"
   }
 }
 
-# ── KMS: Clave maestra (emulada por LocalStack) ───────────────────────────────
-resource "aws_kms_key" "secrets" {
-  description             = "CMK para ${var.project_name}: cifra Secrets Manager y RDS"
-  deletion_window_in_days = 7
+# ── Customer Managed Key (CMK) ────────────────────────────────────────────────
+# LocalStack soporta KMS completo: CMK, alias, cifrado y descifrado.
+# enable_key_rotation se acepta pero la rotación no se ejecuta realmente.
+
+resource "aws_kms_key" "main" {
+  description             = "CMK del Lab13 — cifrado de EBS y S3"
   enable_key_rotation     = true
+  deletion_window_in_days = 7
+  multi_region            = false
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_name}-secrets-cmk"
+  # En LocalStack se usa una policy simplificada sin data source de caller identity.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableRootAccess"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${local.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      }
+    ]
   })
+
+  tags = merge(local.tags, { Name = "${var.project}-cmk" })
 }
 
-resource "aws_kms_alias" "secrets" {
-  name          = "alias/${var.project_name}-secrets"
-  target_key_id = aws_kms_key.secrets.key_id
+resource "aws_kms_alias" "main" {
+  name          = "alias/${var.project}-main"
+  target_key_id = aws_kms_key.main.key_id
 }
 
-# ── Contraseña criptográficamente segura ────────────────────────────────────
-resource "random_password" "db" {
-  length           = 32
-  special          = true
-  override_special = "!#$%&*()-_=+[]{}<>:?"
+# ── Bucket S3 cifrado con la CMK ──────────────────────────────────────────────
+# EBS no está disponible en LocalStack Community, se omite.
+# S3 con SSE-KMS sí es funcional en LocalStack.
+
+resource "aws_s3_bucket" "main" {
+  bucket        = "${var.project}-data-${local.account_id}"
+  force_destroy = true
+
+  tags = merge(local.tags, { Name = "${var.project}-data" })
 }
 
-# ── Secrets Manager: contenedor del secreto ─────────────────────────────────
-resource "aws_secretsmanager_secret" "db" {
-  name        = "${var.project_name}/rds/master-credentials"
-  description = "Credenciales maestras de RDS para ${var.project_name}"
-  kms_key_id  = aws_kms_key.secrets.key_id
+resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
+  bucket = aws_s3_bucket.main.id
 
-  recovery_window_in_days = 0
-
-  tags = merge(local.common_tags, {
-    Name = "${var.project_name}-db-credentials"
-  })
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_alias.main.arn
+    }
+    bucket_key_enabled = true
+  }
 }
 
-# ── Secrets Manager: versión con credenciales en formato JSON ────────────────
-# El host se deja como placeholder ya que RDS no está disponible en
-# LocalStack Community. En AWS real, se reemplaza por aws_db_instance.main.address.
-resource "aws_secretsmanager_secret_version" "db" {
-  secret_id = aws_secretsmanager_secret.db.id
-
-  secret_string = jsonencode({
-    username = var.db_username
-    password = random_password.db.result
-    engine   = "mysql"
-    host     = "localhost"
-    port     = 3306
-    dbname   = var.db_name
-  })
+resource "aws_s3_bucket_public_access_block" "main" {
+  bucket                  = aws_s3_bucket.main.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
 
-# RDS, VPC, subredes y security group se omiten en LocalStack Community:
-# el servicio RDS no está incluido en la licencia Community.
-# Todos esos recursos están disponibles en la versión aws/.
+# Nota: aws_s3_bucket_policy se omite en LocalStack ya que la evaluación de
+# condiciones de política (StringNotEqualsIfExists) no está implementada
+# en LocalStack Community y devuelve error al hacer PutBucketPolicy.

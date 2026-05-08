@@ -1,9 +1,18 @@
+# Configuración del backend de Terraform y versión mínima del provider de AWS
 terraform {
-  required_version = ">= 1.10"  # terraform_data: 1.4 | postcondition/check: 1.5 | use_lockfile (backend S3): 1.10
+  required_version = ">= 1.10"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 6.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
     }
   }
 
@@ -16,3 +25,6 @@ terraform {
 provider "aws" {
   region = var.region
 }
+
+provider "random" {}
+provider "archive" {}

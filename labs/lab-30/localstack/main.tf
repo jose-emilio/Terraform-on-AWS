@@ -1,191 +1,485 @@
-# Versión LocalStack de Lab30.
-#
-# Recursos disponibles en LocalStack Community:
-#   SQS (colas, redrive_policy, DLQ), Lambda, IAM, CloudWatch Logs,
-#   archive_file, aws_lambda_event_source_mapping, aws_iam_role_policy.
-#
-# Limitaciones conocidas:
-#   filter_criteria  — soporte parcial; en Community los filtros pueden no
-#                      aplicarse y todos los mensajes activarían Lambda.
-#   Lambda Destinations (aws_lambda_function_event_invoke_config) — soporte
-#                      parcial; el recurso se crea sin errores pero LocalStack
-#                      Community puede no enrutar el resultado a las colas.
-#
-# Para verificar el flujo completo con filtros y destinos garantizados usa AWS real.
+# Mismo código que aws/main.tf. LocalStack simula ECR, ECS, SSM e IAM
+# mediante sus endpoints locales. Ver localstack/README.md para limitaciones.
+
+# ── Datos ─────────────────────────────────────────────────────────────────────
+
+data "aws_availability_zones" "available" {
+  state = "available"
+
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
+  }
+}
+
+data "aws_caller_identity" "current" {}
 
 # ── Locales ───────────────────────────────────────────────────────────────────
 
 locals {
+  azs          = slice(data.aws_availability_zones.available.names, 0, 2)
+  public_cidrs = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 1)]
+
   tags = {
     Project   = var.project
     ManagedBy = "terraform"
   }
 }
 
-# ── Empaquetado del código fuente ─────────────────────────────────────────────
+# ── Red ───────────────────────────────────────────────────────────────────────
 
-data "archive_file" "function" {
-  type        = "zip"
-  source_dir  = "${path.module}/src/function"
-  output_path = "${path.module}/function.zip"
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(local.tags, { Name = "${var.project}-vpc" })
 }
 
-# ── SQS: Dead Letter Queue ────────────────────────────────────────────────────
+resource "aws_subnet" "public" {
+  count             = length(local.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = local.public_cidrs[count.index]
+  availability_zone = local.azs[count.index]
 
-resource "aws_sqs_queue" "dlq" {
-  name                      = "${var.project}-dlq"
-  message_retention_seconds = 1209600 # 14 días
-  tags                      = merge(local.tags, { Name = "${var.project}-dlq" })
+  tags = merge(local.tags, { Name = "${var.project}-public-${local.azs[count.index]}" })
 }
 
-# ── SQS: Colas de destino para Lambda Destinations ───────────────────────────
-
-resource "aws_sqs_queue" "success" {
-  name = "${var.project}-success"
-  tags = merge(local.tags, { Name = "${var.project}-success" })
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = merge(local.tags, { Name = "${var.project}-igw" })
 }
 
-resource "aws_sqs_queue" "failure" {
-  name = "${var.project}-failure"
-  tags = merge(local.tags, { Name = "${var.project}-failure" })
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-public-rt" })
 }
 
-# ── SQS: Cola principal de órdenes ───────────────────────────────────────────
+resource "aws_route_table_association" "public" {
+  count          = length(aws_subnet.public)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
 
-resource "aws_sqs_queue" "orders" {
-  name                       = "${var.project}-orders"
-  visibility_timeout_seconds = 30
-  message_retention_seconds  = 86400 # 1 día
+# ── Seguridad ─────────────────────────────────────────────────────────────────
 
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.dlq.arn
-    maxReceiveCount     = 3
+resource "aws_security_group" "ecs" {
+  name        = "${var.project}-ecs-sg"
+  description = "Trafico para los contenedores Fargate y el proxy Service Connect"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "HTTP desde Internet al servicio Web"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Puerto 80 entre tareas ECS (Service Connect)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    self        = true
+  }
+
+  ingress {
+    description = "Puerto 8080 entre tareas ECS (Web llama a API)"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    self        = true
+  }
+
+  ingress {
+    description = "Proxy Envoy de Service Connect entre tareas"
+    from_port   = 15000
+    to_port     = 15010
+    protocol    = "tcp"
+    self        = true
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-ecs-sg" })
+}
+
+# ── ECR ───────────────────────────────────────────────────────────────────────
+
+resource "aws_ecr_repository" "app" {
+  name                 = "${var.project}/api"
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-ecr" })
+}
+
+resource "aws_ecr_lifecycle_policy" "app" {
+  repository = aws_ecr_repository.app.name
+
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Mantener solo las 10 imagenes mas recientes"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = {
+        type = "expire"
+      }
+    }]
   })
+}
 
-  tags = merge(local.tags, { Name = "${var.project}-orders" })
+# ── SSM ───────────────────────────────────────────────────────────────────────
+
+resource "aws_ssm_parameter" "api_key" {
+  name        = "/${var.project}/api-key"
+  description = "Clave de API compartida entre los microservicios Web y API"
+  type        = "SecureString"
+  value       = var.api_key
+
+  tags = merge(local.tags, { Name = "${var.project}-api-key" })
 }
 
 # ── CloudWatch Logs ────────────────────────────────────────────────────────────
 
-resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${var.project}-processor"
+resource "aws_cloudwatch_log_group" "web" {
+  name              = "/ecs/${var.project}/web"
+  retention_in_days = 7
+  tags              = local.tags
+}
+
+resource "aws_cloudwatch_log_group" "api" {
+  name              = "/ecs/${var.project}/api"
   retention_in_days = 7
   tags              = local.tags
 }
 
 # ── IAM ───────────────────────────────────────────────────────────────────────
 
-resource "aws_iam_role" "lambda" {
-  name = "${var.project}-lambda-role"
+resource "aws_iam_role" "execution" {
+  name = "${var.project}-execution-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
-      Principal = { Service = "lambda.amazonaws.com" }
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
       Action    = "sts:AssumeRole"
     }]
   })
 
-  tags = merge(local.tags, { Name = "${var.project}-lambda-role" })
+  tags = merge(local.tags, { Name = "${var.project}-execution-role" })
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_basic" {
-  role       = aws_iam_role.lambda.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+resource "aws_iam_role_policy_attachment" "execution_basic" {
+  role       = aws_iam_role.execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-resource "aws_iam_role_policy" "sqs" {
-  name = "${var.project}-sqs-policy"
-  role = aws_iam_role.lambda.id
+resource "aws_iam_role_policy" "ssm_read" {
+  name = "${var.project}-ssm-read"
+  role = aws_iam_role.execution.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "ReadOrdersQueue"
-        Effect = "Allow"
-        Action = [
-          "sqs:ReceiveMessage",
-          "sqs:DeleteMessage",
-          "sqs:GetQueueAttributes",
-        ]
-        Resource = aws_sqs_queue.orders.arn
-      },
-      {
-        Sid    = "WriteDestinationQueues"
-        Effect = "Allow"
-        Action = ["sqs:SendMessage"]
-        Resource = [
-          aws_sqs_queue.success.arn,
-          aws_sqs_queue.failure.arn,
-        ]
-      },
-    ]
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ssm:GetParameters",
+        "kms:Decrypt"
+      ]
+      Resource = [
+        aws_ssm_parameter.api_key.arn,
+        "arn:aws:kms:us-east-1:000000000000:alias/aws/ssm"
+      ]
+    }]
   })
 }
 
-# ── Lambda Function ───────────────────────────────────────────────────────────
+resource "aws_iam_role" "task" {
+  name = "${var.project}-task-role"
 
-resource "aws_lambda_function" "processor" {
-  function_name    = "${var.project}-processor"
-  filename         = data.archive_file.function.output_path
-  source_code_hash = data.archive_file.function.output_base64sha256
-  runtime          = var.runtime
-  handler          = "handler.lambda_handler"
-  role             = aws_iam_role.lambda.arn
-  timeout          = 30
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
 
-  environment {
-    variables = {
-      APP_ENV     = var.app_env
-      APP_PROJECT = var.project
+  tags = merge(local.tags, { Name = "${var.project}-task-role" })
+}
+
+resource "aws_iam_role_policy" "execute_command" {
+  name = "${var.project}-execute-command"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+# ── Cluster ECS ───────────────────────────────────────────────────────────────
+
+resource "aws_ecs_cluster" "main" {
+  name = "${var.project}-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-cluster" })
+}
+
+# ── Namespace Service Connect ──────────────────────────────────────────────────
+
+resource "aws_service_discovery_http_namespace" "main" {
+  name        = var.project
+  description = "Namespace Service Connect del cluster ${var.project}"
+  tags        = local.tags
+}
+
+# ── Task Definition: Web ──────────────────────────────────────────────────────
+
+resource "aws_ecs_task_definition" "web" {
+  family                   = "${var.project}-web"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+
+  execution_role_arn = aws_iam_role.execution.arn
+  task_role_arn      = aws_iam_role.task.arn
+
+  container_definitions = jsonencode([{
+    name      = "web"
+    image     = var.container_image
+    essential = true
+    cpu       = 256
+    memory    = 512
+
+    command = ["/bin/sh", "-c", file("${path.module}/startup.sh")]
+
+    portMappings = [{
+      name          = "web-http"
+      containerPort = 80
+      protocol      = "tcp"
+      appProtocol   = "http"
+    }]
+
+    secrets = [{
+      name      = "API_KEY"
+      valueFrom = aws_ssm_parameter.api_key.arn
+    }]
+
+    environment = [
+      { name = "APP_ENV",     value = "production" },
+      { name = "APP_REGION",  value = "us-east-1" },
+      { name = "APP_PROJECT", value = var.project },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.web.name
+        "awslogs-region"        = "us-east-1"
+        "awslogs-stream-prefix" = "web"
+      }
+    }
+  }])
+
+  tags = merge(local.tags, { Name = "${var.project}-web-task-def" })
+}
+
+# ── Task Definition: API ──────────────────────────────────────────────────────
+
+resource "aws_ecs_task_definition" "api" {
+  family                   = "${var.project}-api"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+
+  execution_role_arn = aws_iam_role.execution.arn
+  task_role_arn      = aws_iam_role.task.arn
+
+  container_definitions = jsonencode([{
+    name      = "api"
+    image     = var.container_image
+    essential = true
+    cpu       = 256
+    memory    = 512
+
+    command = ["/bin/sh", "-c", file("${path.module}/startup-api.sh")]
+
+    portMappings = [{
+      name          = "api-http"
+      containerPort = 8080
+      protocol      = "tcp"
+      appProtocol   = "http"
+    }]
+
+    secrets = [{
+      name      = "API_KEY"
+      valueFrom = aws_ssm_parameter.api_key.arn
+    }]
+
+    environment = [
+      { name = "APP_ENV",     value = "production" },
+      { name = "APP_REGION",  value = "us-east-1" },
+      { name = "APP_PROJECT", value = var.project },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.api.name
+        "awslogs-region"        = "us-east-1"
+        "awslogs-stream-prefix" = "api"
+      }
+    }
+  }])
+
+  tags = merge(local.tags, { Name = "${var.project}-api-task-def" })
+}
+
+# ── Servicio ECS: Web ─────────────────────────────────────────────────────────
+
+resource "aws_ecs_service" "web" {
+  name            = "${var.project}-web"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.web.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.ecs.id]
+    assign_public_ip = true
+  }
+
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_http_namespace.main.arn
+
+    service {
+      port_name      = "web-http"
+      discovery_name = "web"
+
+      client_alias {
+        port     = 80
+        dns_name = "web"
+      }
+    }
+
+    log_configuration {
+      log_driver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.web.name
+        "awslogs-region"        = "us-east-1"
+        "awslogs-stream-prefix" = "service-connect-web"
+      }
     }
   }
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
 
   depends_on = [
-    aws_iam_role_policy_attachment.lambda_basic,
-    aws_iam_role_policy.sqs,
-    aws_cloudwatch_log_group.lambda,
+    aws_iam_role_policy_attachment.execution_basic,
+    aws_iam_role_policy.ssm_read,
   ]
 
-  tags = merge(local.tags, { Name = "${var.project}-processor" })
+  tags = merge(local.tags, { Name = "${var.project}-web-service" })
 }
 
-# ── Lambda Destinations ───────────────────────────────────────────────────────
-# Soporte parcial en LocalStack Community. El recurso se crea correctamente
-# pero el enrutamiento hacia las colas puede no ejecutarse.
+# ── Servicio ECS: API ─────────────────────────────────────────────────────────
 
-resource "aws_lambda_function_event_invoke_config" "processor" {
-  function_name = aws_lambda_function.processor.function_name
+resource "aws_ecs_service" "api" {
+  name            = "${var.project}-api"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
 
-  destination_config {
-    on_success {
-      destination = aws_sqs_queue.success.arn
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.ecs.id]
+    assign_public_ip = true
+  }
+
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_http_namespace.main.arn
+
+    service {
+      port_name      = "api-http"
+      discovery_name = "api"
+
+      client_alias {
+        port     = 8080
+        dns_name = "api"
+      }
     }
-    on_failure {
-      destination = aws_sqs_queue.failure.arn
+
+    log_configuration {
+      log_driver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.api.name
+        "awslogs-region"        = "us-east-1"
+        "awslogs-stream-prefix" = "service-connect-api"
+      }
     }
   }
-}
 
-# ── Event Source Mapping ──────────────────────────────────────────────────────
-# filter_criteria tiene soporte parcial en LocalStack Community.
-# Si los filtros no se aplican, mensajes de cualquier order_type activarán Lambda.
-
-resource "aws_lambda_event_source_mapping" "orders" {
-  event_source_arn = aws_sqs_queue.orders.arn
-  function_name    = aws_lambda_function.processor.arn
-  batch_size       = 10
-  enabled          = true
-
-  filter_criteria {
-    filter {
-      pattern = jsonencode({
-        body = {
-          order_type = ["premium"]
-        }
-      })
-    }
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
   }
+
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
+
+  depends_on = [
+    aws_iam_role_policy_attachment.execution_basic,
+    aws_iam_role_policy.ssm_read,
+  ]
+
+  tags = merge(local.tags, { Name = "${var.project}-api-service" })
 }

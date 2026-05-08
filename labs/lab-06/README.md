@@ -10,7 +10,7 @@
 
 En este laboratorio usarás Terraform exclusivamente como herramienta de consulta: sin crear infraestructura AWS, extraerás información de una cuenta activa usando data sources y generarás un reporte de auditoría en disco mediante una plantilla. El objetivo es dominar el uso de data sources para el descubrimiento dinámico de recursos existentes.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -28,7 +28,7 @@ Al finalizar este laboratorio serás capaz de:
 - Laboratorio 01 completado (entorno configurado)
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### Data Sources de solo lectura
 
@@ -203,7 +203,7 @@ lab-06/
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Código Terraform
 

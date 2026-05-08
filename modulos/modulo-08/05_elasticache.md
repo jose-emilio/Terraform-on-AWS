@@ -461,7 +461,7 @@ output "redis_endpoint" {
 - `automatic_failover_enabled = true` siempre en producción.
 - Backups diarios con `snapshot_retention_limit >= 7`.
 
-> **El profesor resume:** "ElastiCache es el multiplicador de tu base de datos. Con el caché bien implementado, una instancia RDS `db.r6g.large` puede servir la misma carga que necesitaría `db.r6g.4xlarge` sin caché. El ahorro en la BD paga con creces el costo del cluster Redis. El truco está en la invalidación: si no tienes una estrategia clara para cuándo y cómo invalidas el caché, eventualmente tendrás usuarios viendo datos incorrectos en producción."
+> **Nota importante:** "ElastiCache es el multiplicador de tu base de datos. Con el caché bien implementado, una instancia RDS `db.r6g.large` puede servir la misma carga que necesitaría `db.r6g.4xlarge` sin caché. El ahorro en la BD paga con creces el costo del cluster Redis. El truco está en la invalidación: si no tienes una estrategia clara para cuándo y cómo invalidas el caché, eventualmente tendrás usuarios viendo datos incorrectos en producción."
 
 ---
 

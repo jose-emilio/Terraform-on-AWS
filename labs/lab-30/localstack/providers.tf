@@ -5,10 +5,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.0"
-    }
   }
 }
 
@@ -25,10 +21,13 @@ provider "aws" {
   s3_use_path_style = true
 
   endpoints {
-    iam    = "http://localhost.localstack.cloud:4566"
-    lambda = "http://localhost.localstack.cloud:4566"
-    logs   = "http://localhost.localstack.cloud:4566"
-    sqs    = "http://localhost.localstack.cloud:4566"
-    sts    = "http://localhost.localstack.cloud:4566"
+    ec2              = "http://localhost.localstack.cloud:4566"
+    ecr              = "http://localhost.localstack.cloud:4566"
+    ecs              = "http://localhost.localstack.cloud:4566"
+    iam              = "http://localhost.localstack.cloud:4566"
+    logs             = "http://localhost.localstack.cloud:4566"
+    servicediscovery = "http://localhost.localstack.cloud:4566"
+    ssm              = "http://localhost.localstack.cloud:4566"
+    sts              = "http://localhost.localstack.cloud:4566"
   }
 }

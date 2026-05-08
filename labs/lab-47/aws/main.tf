@@ -37,8 +37,8 @@ resource "aws_kms_key" "main" {
         # CloudWatch Logs requiere este statement para cifrar eventos antes de
         # escribirlos en disco. La condición ArnLike limita el acceso a los
         # log groups de esta cuenta, evitando el uso cruzado entre cuentas.
-        Sid    = "AllowCloudWatchLogs"
-        Effect = "Allow"
+        Sid       = "AllowCloudWatchLogs"
+        Effect    = "Allow"
         Principal = { Service = "logs.${var.region}.amazonaws.com" }
         Action = [
           "kms:Encrypt*", "kms:Decrypt*", "kms:ReEncrypt*",
@@ -55,8 +55,8 @@ resource "aws_kms_key" "main" {
         # CloudTrail necesita GenerateDataKey para cifrar cada archivo de log
         # antes de subirlo a S3. La condición StringLike vincula la clave al
         # ARN del trail, evitando que otros trails de otras cuentas la usen.
-        Sid    = "AllowCloudTrail"
-        Effect = "Allow"
+        Sid       = "AllowCloudTrail"
+        Effect    = "Allow"
         Principal = { Service = "cloudtrail.amazonaws.com" }
         Action    = ["kms:GenerateDataKey*", "kms:Decrypt", "kms:DescribeKey"]
         Resource  = "*"
@@ -69,8 +69,8 @@ resource "aws_kms_key" "main" {
       {
         # Kinesis Firehose necesita GenerateDataKey para cifrar los datos
         # con SSE-KMS antes de entregarlos al bucket S3 de archivo.
-        Sid    = "AllowFirehose"
-        Effect = "Allow"
+        Sid       = "AllowFirehose"
+        Effect    = "Allow"
         Principal = { Service = "firehose.amazonaws.com" }
         Action    = ["kms:GenerateDataKey*", "kms:Decrypt", "kms:Encrypt*"]
         Resource  = "*"

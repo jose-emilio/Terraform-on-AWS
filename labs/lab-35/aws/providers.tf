@@ -6,10 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.0"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
   }
 
   # Configuracion parcial del backend. Todos los parametros estan en
@@ -21,5 +17,3 @@ terraform {
 provider "aws" {
   region = var.region
 }
-
-provider "random" {}

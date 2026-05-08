@@ -1,46 +1,35 @@
-# Laboratorio 22 — Refactorización Avanzada de S3 (De Monolítico a Modular)
+# Laboratorio 22 — Zonas Hospedadas Privadas y Resolución DNS
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
 
-[← Módulo 6 — Módulos de Terraform](../../modulos/modulo-06/README.md)
+[← Módulo 5 — Networking en AWS con Terraform](../../modulos/modulo-05/README.md)
 
 
 ## Visión general
 
-Transformar un recurso S3 "hardcoded" en un componente flexible y profesional mediante un **módulo reutilizable**. Aplicar buenas prácticas de modularización: tríada estándar (`main.tf`, `variables.tf`, `outputs.tf`), combinación inteligente de etiquetas con `merge()`, protección contra destrucción accidental con `lifecycle`, e invocación múltiple desde el Root Module con diferentes configuraciones.
+Implementar un sistema de nombres interno (`.internal`) sin necesidad de un dominio comprado en Internet, utilizando una **Zona Hospedada Privada** en Route 53. Verificar que los nombres solo resuelven desde dentro de la VPC.
 
 ## Arquitectura
 
-![Comparación lado a lado: enfoque monolítico (recursos hardcoded) vs módulo s3-bucket reutilizable invocado N veces](arch/diagrama.svg)
+![Route 53 Private Hosted Zone + ALB + EC2 db/test, demostrando que la zona NO resuelve desde Internet](arch/diagrama.svg)
 
-El diagrama contrasta los dos enfoques que estudiamos en este lab:
-
-- **Izquierda (antes):** dos `aws_s3_bucket` declarados inline en el root, con tags inconsistentes (`Env` vs `Environment`), sin `lifecycle.prevent_destroy`, sin `aws_s3_bucket_public_access_block` y sin versionado. Cada bucket nuevo obliga a duplicar y editar el bloque entero.
-- **Derecha (después):** un único módulo `s3-bucket` (tríada `main.tf` + `variables.tf` + `outputs.tf`) con valores por defecto seguros (`enable_versioning = true`, `force_destroy = false`, `prevent_destroy`, public access block). El root invoca el módulo dos veces con parámetros distintos para `logs_bucket` y `data_bucket`. Cambios al módulo se propagan automáticamente a todas las invocaciones.
+Una VPC con:
+- Una **Zona Hospedada Privada** `app.internal` asociada a la VPC
+- Un registro **Alias** `web.app.internal` que apunta al ALB
+- Un registro **A** `db.app.internal` que apunta a la IP privada de una instancia (simulando una DB)
+- Una instancia de test para verificar la resolución DNS con `nslookup` y `dig`
 
 ## Conceptos clave
 
 | Concepto | Descripción |
 |---|---|
-| **Módulo Terraform** | Contenedor reutilizable de recursos. Cualquier directorio con archivos `.tf` es un módulo. El Root Module llama a Child Modules con el bloque `module {}` |
-| **Root Module** | El directorio donde ejecutas `terraform apply`. Orquesta la infraestructura llamando a módulos hijos y pasando variables |
-| **Tríada estándar** | Convención de organizar cada módulo con tres archivos: `main.tf` (recursos), `variables.tf` (entradas) y `outputs.tf` (salidas) |
-| **`merge()`** | Función de Terraform que combina dos o más mapas. Las claves del mapa posterior sobreescriben las del anterior. Ideal para combinar etiquetas globales con específicas |
-| **`locals`** | Bloque que define valores intermedios calculados. Útil para construir mapas de tags, nombres compuestos o valores derivados que se usan en múltiples recursos |
-| **`lifecycle`** | Meta-argumento que controla el comportamiento del ciclo de vida de un recurso. `prevent_destroy = true` impide que `terraform destroy` elimine el recurso |
-| **Bloqueo de acceso público** | `aws_s3_bucket_public_access_block` con las cuatro opciones en `true` garantiza que ningún objeto del bucket sea accesible públicamente, incluso si alguien añade una policy permisiva |
-
-## Comparativa: Monolítico vs. Modular
-
-| Aspecto | Enfoque monolítico | Enfoque modular |
-|---|---|---|
-| Reutilización | Copiar y pegar bloques | Invocar el módulo con `source = "..."` |
-| Consistencia | Fácil divergencia entre recursos | Una sola definición, múltiples instancias |
-| Mantenimiento | Cambiar en N sitios | Cambiar una vez, se propaga |
-| Etiquetado | Tags duplicados o inconsistentes | `merge()` centralizado en el módulo |
-| Protección | Olvidar `lifecycle` en alguna copia | Incluido por defecto en el módulo |
-| Testing | Difícil de probar aislado | Se puede testear el módulo por separado |
+| **Route 53** | Servicio de DNS gestionado de AWS. Además de dominios públicos, permite crear zonas privadas visibles solo dentro de una o más VPCs |
+| **Zona Hospedada Privada (PHZ)** | Zona DNS que solo responde a consultas originadas desde las VPCs asociadas. Ideal para nombres internos como `db.app.internal` o `api.corp` sin registrar un dominio |
+| **Registro A** | Registro DNS que mapea un nombre a una dirección IPv4. En Route 53, puede ser un registro A simple (IP fija) o un Alias (apunta a un recurso AWS como un ALB) |
+| **Registro Alias** | Extensión de Route 53 que permite apuntar un nombre a un recurso AWS (ALB, CloudFront, S3, etc.) en vez de a una IP. No tiene coste adicional por consultas y resuelve automáticamente la IP del recurso |
+| **VPC DNS Resolution** | `enable_dns_support = true` activa el resolutor DNS de AWS en la VPC (servidor `169.254.169.253`). `enable_dns_hostnames = true` asigna nombres DNS públicos a las instancias con IP pública |
+| **Split-horizon DNS** | Patrón donde un mismo nombre resuelve a IPs diferentes según desde donde se consulte: IP privada dentro de la VPC, IP pública desde Internet (requiere zona pública adicional) |
 
 ## Requisitos previos
 
@@ -58,282 +47,113 @@ echo "Bucket: $BUCKET"
 
 ```
 lab-22/
-├── README.md                          <- Esta guía
+├── README.md                    <- Esta guía
 ├── arch/
-│   └── diagrama.svg                   <- Diagrama de la arquitectura del lab
+│   └── diagrama.svg             <- Diagrama de la arquitectura del lab
 ├── aws/
-│   ├── providers.tf                   <- Backend S3 parcial
-│   ├── variables.tf                   <- Variables: región, proyecto, entorno
-│   ├── main.tf                        <- Root Module: invoca s3-bucket 2 veces
-│   ├── outputs.tf                     <- ARN y nombres de ambos buckets
-│   ├── aws.s3.tfbackend               <- Parámetros del backend (sin bucket)
-│   └── modules/
-│       └── s3-bucket/
-│           ├── main.tf                <- Bucket + versionado + bloqueo público + lifecycle
-│           ├── variables.tf           <- Entradas: nombre, versionado, tags, force_destroy
-│           └── outputs.tf             <- Salidas: id, arn, domain_name
+│   ├── providers.tf             <- Backend S3 parcial
+│   ├── variables.tf             <- Variables: región, CIDR, proyecto, dominio interno
+│   ├── main.tf                  <- VPC + ALB + EC2 + Route 53 PHZ + registros DNS
+│   ├── outputs.tf               <- Zona hospedada, nombres DNS, IPs
+│   └── aws.s3.tfbackend         <- Parámetros del backend (sin bucket)
 └── localstack/
-    ├── README.md                      <- Guía específica para LocalStack
+    ├── README.md                <- Guía específica para LocalStack
     ├── providers.tf
     ├── variables.tf
-    ├── main.tf                        <- Root Module adaptado a LocalStack
+    ├── main.tf                  <- VPC + Route 53 PHZ (sin ALB en Community)
     ├── outputs.tf
-    ├── localstack.s3.tfbackend        <- Backend completo para LocalStack
-    └── modules/
-        └── s3-bucket/
-            ├── main.tf               <- Módulo sin prevent_destroy ni public_access_block
-            ├── variables.tf
-            └── outputs.tf
+    └── localstack.s3.tfbackend  <- Backend completo para LocalStack
 ```
 
 ## Análisis del código
 
-### El problema: enfoque monolítico
-
-Antes de modularizar, el código típico para crear dos buckets S3 se ve así:
+### Zona Hospedada Privada — DNS solo interno
 
 ```hcl
-# ❌ Enfoque monolítico — código duplicado, tags inconsistentes, sin protección
+resource "aws_route53_zone" "internal" {
+  name = var.internal_domain
 
-resource "aws_s3_bucket" "logs" {
-  bucket = "mi-proyecto-logs-123456789012"
-  tags = {
-    Name        = "mi-proyecto-logs"
-    Environment = "lab"
-    Project     = "mi-proyecto"
+  vpc {
+    vpc_id = aws_vpc.main.id
   }
-}
 
-resource "aws_s3_bucket" "data" {
-  bucket = "mi-proyecto-data-123456789012"
-  tags = {
-    Name        = "mi-proyecto-data"
-    Env         = "lab"          # <-- inconsistencia: "Env" vs "Environment"
-    Project     = "mi-proyecto"
-    # Falta ManagedBy = "terraform"
-  }
-}
-```
-
-Problemas evidentes:
-- **Tags inconsistentes**: un bucket usa `Environment`, otro `Env`
-- **Sin protección**: ningún `lifecycle` previene la destrucción accidental del bucket de datos críticos
-- **Sin bloqueo público**: el bucket queda expuesto si alguien añade una policy permisiva
-- **Sin versionado**: no hay forma de recuperar objetos eliminados accidentalmente
-- **Copia-pega**: cada nuevo bucket requiere duplicar y adaptar todo el bloque
-
-### La solución: módulo `s3-bucket`
-
-#### Estructura del módulo
-
-```
-modules/s3-bucket/
-├── main.tf         <- Recursos: bucket, versionado, bloqueo público, lifecycle
-├── variables.tf    <- Entradas: bucket_name, enable_versioning, tags, force_destroy
-└── outputs.tf      <- Salidas: bucket_id, bucket_arn, bucket_domain_name
-```
-
-#### Variables del módulo (`variables.tf`)
-
-```hcl
-variable "bucket_name" {
-  type        = string
-  description = "Nombre del bucket S3. Debe ser globalmente único"
-}
-
-variable "enable_versioning" {
-  type        = bool
-  description = "Habilitar versionado en el bucket"
-  default     = true
-}
-
-variable "force_destroy" {
-  type        = bool
-  description = "Permitir destruir el bucket aunque contenga objetos"
-  default     = false
-}
-
-variable "tags" {
-  type        = map(string)
-  description = "Etiquetas adicionales que se combinan con las etiquetas por defecto del módulo"
-  default     = {}
+  tags = merge(local.common_tags, {
+    Name = "phz-${var.internal_domain}-${var.project_name}"
+  })
 }
 ```
 
 Puntos clave:
-- `bucket_name` no tiene `default` → es **obligatorio** al invocar el módulo
-- `enable_versioning` tiene `default = true` → activo por defecto (buena práctica)
-- `force_destroy` tiene `default = false` → protección por defecto contra eliminación de objetos
-- `tags` es un mapa abierto → el Root Module puede pasar cualquier etiqueta
+- El bloque `vpc {}` convierte la zona en **privada**. Sin él, sería una zona pública accesible desde Internet
+- Solo las instancias dentro de las VPCs asociadas pueden resolver los nombres de esta zona
+- No se necesita comprar ni registrar el dominio `.internal` — es un nombre arbitrario que solo existe dentro de la VPC
+- Se puede asociar la misma zona a múltiples VPCs (incluso en otras cuentas)
 
-#### Lógica de tags con `merge()` (`main.tf`)
+**¿Por qué `.internal` y no `.local`?**
 
-```hcl
-locals {
-  default_tags = {
-    ManagedBy = "terraform"
-    Module    = "s3-bucket"
-  }
+`.local` está reservado para mDNS (Multicast DNS) y puede causar conflictos. AWS recomienda usar TLDs como `.internal`, `.corp`, `.private` o dominios propios con un subdominio dedicado (ej: `internal.miempresa.com`).
 
-  effective_tags = merge(local.default_tags, var.tags)
-}
-```
-
-La función `merge()` opera en cascada:
-
-```
-default_tags:     { ManagedBy = "terraform", Module = "s3-bucket" }
-      +
-var.tags:         { Environment = "lab", Project = "lab22", Purpose = "logs" }
-      =
-effective_tags:   { ManagedBy = "terraform", Module = "s3-bucket",
-                    Environment = "lab", Project = "lab22", Purpose = "logs" }
-```
-
-Si `var.tags` contiene una clave que ya existe en `default_tags`, el valor de `var.tags` gana (el mapa posterior tiene prioridad). Esto permite que el Root Module sobreescriba valores por defecto cuando sea necesario.
-
-Luego, al crear el bucket, se aplica un segundo `merge()` para añadir el tag `Name`:
+### Registro Alias — Apuntar al ALB
 
 ```hcl
-resource "aws_s3_bucket" "this" {
-  bucket        = var.bucket_name
-  force_destroy = var.force_destroy
+resource "aws_route53_record" "web" {
+  zone_id = aws_route53_zone.internal.zone_id
+  name    = "web.${var.internal_domain}"
+  type    = "A"
 
-  tags = merge(local.effective_tags, {
-    Name = var.bucket_name
-  })
-
-  lifecycle {
-    prevent_destroy = true
+  alias {
+    name                   = aws_lb.main.dns_name
+    zone_id                = aws_lb.main.zone_id
+    evaluate_target_health = true
   }
 }
 ```
 
-#### Control de destrucción: `lifecycle`
+Un registro Alias es diferente de un CNAME:
 
-```hcl
-lifecycle {
-  prevent_destroy = true
-}
-```
-
-Con `prevent_destroy = true`, Terraform **rechaza** cualquier plan que intente destruir el bucket:
-
-```
-Error: Instance cannot be destroyed
-  on modules/s3-bucket/main.tf line XX:
-  Resource module.data_bucket.aws_s3_bucket.this has lifecycle.prevent_destroy
-  set, but the plan calls for this resource to be destroyed.
-```
-
-Esto protege buckets de datos críticos contra:
-- Un `terraform destroy` accidental
-- Eliminar el bloque `module` del código sin pensar en las consecuencias
-- Cambiar un parámetro que fuerza la recreación del recurso (como el nombre del bucket)
-
-> **Importante:** `prevent_destroy` no acepta variables — debe ser un literal `true` o `false`. Esta es una limitación intencional de Terraform para evitar que la protección dependa de un valor dinámico que podría cambiar.
-
-#### Bloqueo de acceso público
-
-```hcl
-resource "aws_s3_bucket_public_access_block" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-```
-
-Las cuatro opciones en `true` crean una defensa en profundidad:
-
-| Opción | Protege contra |
-|---|---|
-| `block_public_acls` | Subir objetos con ACL pública |
-| `block_public_policy` | Aplicar bucket policies que concedan acceso público |
-| `ignore_public_acls` | ACLs públicas existentes (las ignora) |
-| `restrict_public_buckets` | Acceso público a través de cross-account policies |
-
-### Root Module — Invocación múltiple
-
-```hcl
-locals {
-  account_id = data.aws_caller_identity.current.account_id
-
-  common_tags = {
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Project     = var.project_name
-  }
-}
-```
-
-El Root Module define `common_tags` que se pasan a ambos módulos. Cada invocación añade tags específicas:
-
-```hcl
-# Bucket de logs: sin versionado, destruible
-module "logs_bucket" {
-  source = "./modules/s3-bucket"
-
-  bucket_name       = "${var.project_name}-logs-${local.account_id}"
-  enable_versioning = false
-  force_destroy     = true
-
-  tags = merge(local.common_tags, {
-    Purpose            = "logs"
-    DataClassification = "internal"
-  })
-}
-
-# Bucket de datos: con versionado, NO destruible
-module "data_bucket" {
-  source = "./modules/s3-bucket"
-
-  bucket_name       = "${var.project_name}-data-${local.account_id}"
-  enable_versioning = true
-  force_destroy     = false
-
-  tags = merge(local.common_tags, {
-    Purpose            = "data"
-    DataClassification = "confidential"
-  })
-}
-```
-
-La cascada completa de tags para el bucket de datos:
-
-```
-Módulo default_tags:   { ManagedBy = "terraform", Module = "s3-bucket" }
-      +
-Root common_tags:      { Environment = "lab", ManagedBy = "terraform", Project = "lab22" }
-  + específicas:       { Purpose = "data", DataClassification = "confidential" }
-      +
-Bucket Name:           { Name = "lab22-data-123456789012" }
-      =
-Tags finales:          { ManagedBy = "terraform", Module = "s3-bucket",
-                         Environment = "lab", Project = "lab22",
-                         Purpose = "data", DataClassification = "confidential",
-                         Name = "lab22-data-123456789012" }
-```
-
-Nota que `ManagedBy` aparece en `default_tags` y en `common_tags` con el mismo valor. Si tuvieran valores diferentes, el de `common_tags` ganaría (último merge tiene prioridad).
-
-### Diferencias entre ambas instancias
-
-| Parámetro | `logs_bucket` | `data_bucket` |
+| Aspecto | CNAME | Alias |
 |---|---|---|
-| Versionado | Desactivado | Activado |
-| `force_destroy` | `true` (se puede vaciar y destruir) | `false` (protegido) |
-| `Purpose` | `logs` | `data` |
-| `DataClassification` | `internal` | `confidential` |
-| Caso de uso | Logs temporales, rotables | Datos críticos del negocio |
+| Destino | Cualquier nombre DNS | Solo recursos AWS (ALB, CloudFront, S3...) |
+| Apex domain | No permitido (`app.internal` no puede ser CNAME) | Sí permitido |
+| Coste por consulta | $0.40/millón | $0 (gratuito) |
+| Resolución | Dos consultas DNS (CNAME → IP) | Una consulta (resuelve directo a IP) |
 
-Ambos buckets comparten: bloqueo de acceso público, tags de proyecto, y protección `prevent_destroy`.
+`evaluate_target_health = true` hace que Route 53 deje de responder con este registro si el ALB no tiene targets sanos, evitando enviar tráfico a un servicio caído.
+
+### Registro A — IP fija para la "base de datos"
+
+```hcl
+resource "aws_route53_record" "db" {
+  zone_id = aws_route53_zone.internal.zone_id
+  name    = "db.${var.internal_domain}"
+  type    = "A"
+  ttl     = 300
+  records = [aws_instance.db.private_ip]
+}
+```
+
+Un registro A simple que mapea `db.app.internal` a la IP privada de la instancia. El TTL de 300 segundos (5 minutos) indica cuánto tiempo los clientes DNS deben cachear la respuesta.
+
+> **Nota:** En producción, para una base de datos RDS se usaría un registro Alias apuntando al endpoint de RDS en vez de una IP fija. Las IPs de las instancias EC2 cambian si se detienen y reinician.
+
+### VPC DNS — Requisitos
+
+```hcl
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true    # Activa el resolutor DNS de AWS
+  enable_dns_hostnames = true    # Asigna nombres DNS a instancias
+}
+```
+
+Ambas opciones deben estar habilitadas para que Route 53 Private Hosted Zones funcione:
+
+- **`enable_dns_support`**: Sin esto, las instancias no pueden resolver ningún nombre DNS (ni público ni privado)
+- **`enable_dns_hostnames`**: Sin esto, las instancias no reciben un nombre DNS automático (como `ip-10-17-10-10.ec2.internal`)
 
 ---
 
-## Despliegue
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-22/aws
@@ -345,308 +165,301 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará **6 recursos** en la versión `aws/`:
-- 2 × `aws_s3_bucket` (logs y data)
-- 2 × `aws_s3_bucket_versioning` (uno Enabled, otro Suspended)
-- 2 × `aws_s3_bucket_public_access_block`
-
-> **Nota — versión LocalStack:** el módulo de LocalStack omite `aws_s3_bucket_public_access_block` (LocalStack Community no emula esa API completamente), así que `terraform apply` en `localstack/` crea **4 recursos** (2 buckets + 2 versionings). El resto del comportamiento es idéntico.
+Terraform creará ~32 recursos: 1 VPC, 4 subredes (2 públicas + 2 privadas), 1 IGW + tabla pública + ruta + 2 asociaciones, 1 EIP + 1 NAT Gateway, 1 tabla privada + ruta + 2 asociaciones, 4 Security Groups (alb, web, db, test), 1 ALB + 1 Target Group + 1 listener + 1 target group attachment, 3 IAM (rol SSM + attachment + instance profile), 3 instancias EC2 (web, db, test), 1 Route 53 Private Hosted Zone y 2 registros DNS (web Alias + db A).
 
 ```bash
 terraform output
-# logs_bucket_id           = "lab22-logs-123456789012"
-# logs_bucket_arn          = "arn:aws:s3:::lab22-logs-123456789012"
-# logs_bucket_domain_name  = "lab22-logs-123456789012.s3.amazonaws.com"
-# data_bucket_id           = "lab22-data-123456789012"
-# data_bucket_arn          = "arn:aws:s3:::lab22-data-123456789012"
-# data_bucket_domain_name  = "lab22-data-123456789012.s3.amazonaws.com"
+# zone_id                = "Z0123456789ABCDEF"
+# internal_domain        = "app.internal"
+# web_fqdn               = "web.app.internal"
+# db_fqdn                = "db.app.internal"
+# db_private_ip          = "10.17.10.10"
+# web_private_ip         = "10.17.10.5"
+# alb_dns_name           = "lab22-alb-xxxxxxxxx.us-east-1.elb.amazonaws.com"
+# test_instance_id       = "i-0abc..."
 ```
 
 ---
 
 ## Verificación final
 
-### Verificar los buckets creados
+### Zona Hospedada Privada
+
+Verificar que la zona existe y está asociada a la VPC:
 
 ```bash
-LOGS_BUCKET=$(terraform output -raw logs_bucket_id)
-DATA_BUCKET=$(terraform output -raw data_bucket_id)
+ZONE_ID=$(terraform output -raw zone_id)
 
-# Listar ambos buckets
-aws s3 ls | grep lab22
-# 2026-xx-xx lab22-logs-123456789012
-# 2026-xx-xx lab22-data-123456789012
+aws route53 get-hosted-zone \
+  --id $ZONE_ID \
+  --query '{Name: HostedZone.Name, Private: HostedZone.Config.PrivateZone, VPCs: VPCs[].VPCId}' \
+  --output json
 ```
 
-### Verificar etiquetas
+Debe mostrar `PrivateZone: true` y el ID de la VPC.
+
+### Registros DNS
+
+Listar los registros de la zona:
 
 ```bash
-# Tags del bucket de logs
-aws s3api get-bucket-tagging \
-  --bucket $LOGS_BUCKET \
-  --query 'TagSet[].{Key: Key, Value: Value}' \
+aws route53 list-resource-record-sets \
+  --hosted-zone-id $ZONE_ID \
+  --query 'ResourceRecordSets[].{Name: Name, Type: Type, AliasTarget: AliasTarget.DNSName, Records: ResourceRecords[].Value}' \
   --output table
 ```
 
-Debe mostrar las etiquetas combinadas: `ManagedBy=terraform`, `Module=s3-bucket`, `Environment=lab`, `Project=lab22`, `Purpose=logs`, `DataClassification=internal`, `Name=lab22-logs-...`.
+Deberías ver:
+- `web.app.internal.` tipo A (Alias → ALB)
+- `db.app.internal.` tipo A (IP privada)
+- `app.internal.` tipo NS y SOA (creados automáticamente)
+
+### Verificar resolución DNS desde dentro de la VPC
+
+Conectarse a la instancia de test via SSM:
 
 ```bash
-# Tags del bucket de datos
-aws s3api get-bucket-tagging \
-  --bucket $DATA_BUCKET \
-  --query 'TagSet[].{Key: Key, Value: Value}' \
-  --output table
+INSTANCE_TEST=$(terraform output -raw test_instance_id)
+
+aws ssm start-session --target $INSTANCE_TEST
 ```
 
-Debe mostrar `Purpose=data` y `DataClassification=confidential` en lugar de los valores del bucket de logs.
-
-### Verificar versionado
+Una vez dentro de la sesión:
 
 ```bash
-# Logs: versionado desactivado
-aws s3api get-bucket-versioning --bucket $LOGS_BUCKET
-# { "Status": "Suspended" }
+# Test 1: Resolver web.app.internal (debe devolver IPs del ALB)
+nslookup web.app.internal
+# Server:    10.17.0.2 (resolutor DNS de la VPC)
+# Address:   10.17.0.2#53
+# Name:      web.app.internal
+# Address:   10.17.x.x (IPs privadas del ALB)
 
-# Data: versionado activado
-aws s3api get-bucket-versioning --bucket $DATA_BUCKET
-# { "Status": "Enabled" }
+# Test 2: Resolver db.app.internal (debe devolver la IP fija de la instancia)
+nslookup db.app.internal
+# Address:   10.17.10.10
+
+# Test 3: Usar dig para ver más detalles (TTL, tipo de registro)
+dig web.app.internal
+dig db.app.internal +short
+
+# Test 4: Verificar que la aplicación responde via el nombre DNS
+curl -s http://web.app.internal
+# Debe mostrar la página de la instancia web
+
+# Test 5: Verificar que el nombre NO resuelve desde Internet
+# (esto no se puede probar desde dentro de la VPC, pero se puede
+#  intentar resolver un nombre de la zona pública para comparar)
+
+exit
 ```
 
-### Verificar bloqueo de acceso público
+### Verificar que el nombre no resuelve desde fuera
+
+Desde tu máquina local (fuera de la VPC):
 
 ```bash
-aws s3api get-public-access-block --bucket $DATA_BUCKET \
-  --query 'PublicAccessBlockConfiguration'
-# {
-#   "BlockPublicAcls": true,
-#   "IgnorePublicAcls": true,
-#   "BlockPublicPolicy": true,
-#   "RestrictPublicBuckets": true
-# }
+nslookup web.app.internal
+# ** server can't find web.app.internal: NXDOMAIN
+
+dig web.app.internal
+# status: NXDOMAIN (el nombre no existe fuera de la VPC)
 ```
 
-### Verificar protección contra destrucción
-
-```bash
-# Intentar destruir — debe fallar por prevent_destroy
-terraform destroy
-# Error: Instance cannot be destroyed
-```
-
-Terraform se negará a destruir los buckets porque el módulo tiene `prevent_destroy = true`. Este es el comportamiento esperado.
+Esto confirma que la zona es **estrictamente privada** — los nombres solo existen dentro de las VPCs asociadas.
 
 ---
 
 ## Retos
 
-### Reto 1 — Añadir regla de ciclo de vida para expiración de logs
+### Reto 1 — Ampliar la zona con nuevos registros y comparar tipos
 
-**Situación**: El equipo de operaciones quiere que los objetos del bucket de logs se eliminen automáticamente después de 90 días para reducir costes de almacenamiento. El bucket de datos debe retener los objetos indefinidamente.
-
-**Tu objetivo**:
-
-1. Añadir una variable `expiration_days` al módulo `s3-bucket` con valor por defecto `0` (desactivado)
-2. Crear un recurso `aws_s3_bucket_lifecycle_configuration` dentro del módulo que aplique una regla de expiración **solo cuando** `expiration_days > 0`
-3. En el Root Module, pasar `expiration_days = 90` al bucket de logs y no pasarlo al de datos (usará el default de 0)
-4. Verificar con AWS CLI que la regla solo existe en el bucket de logs
-
-**Pistas**:
-- Usa un bloque `dynamic` o `count` para crear la regla condicionalmente
-- El recurso `aws_s3_bucket_lifecycle_configuration` necesita un bloque `rule` con `expiration { days = ... }` y `status = "Enabled"`
-- `filter {}` vacío aplica la regla a todos los objetos del bucket
-- Verifica con: `aws s3api get-bucket-lifecycle-configuration --bucket <bucket>`
-
-### Reto 2 — Cifrado con SSE-KMS para datos confidenciales
-
-**Situación**: El equipo de seguridad requiere que el bucket de datos críticos use cifrado **SSE-KMS** con una clave gestionada por el cliente (CMK), mientras que el bucket de logs puede usar el cifrado por defecto **SSE-S3** (más económico). El módulo debe soportar ambos escenarios de forma configurable.
+**Situación**: El equipo de desarrollo necesita registros DNS internos adicionales para sus microservicios. Quieren entender las diferencias prácticas entre registros A, CNAME y Alias dentro de la zona privada.
 
 **Tu objetivo**:
 
-1. Crear una clave KMS (`aws_kms_key`) en el Root Module, dedicada al cifrado del bucket de datos
-2. Añadir una variable `kms_key_arn` al módulo `s3-bucket` con valor por defecto `null` (sin KMS)
-3. Crear un recurso `aws_s3_bucket_server_side_encryption_configuration` dentro del módulo que:
-   - Use `aws:kms` con la clave proporcionada si `kms_key_arn != null`
-   - Use `AES256` (SSE-S3) si `kms_key_arn` es null
-4. Pasar la clave KMS solo al bucket de datos
-5. Verificar con AWS CLI que cada bucket usa el tipo de cifrado correcto
+1. Crear un registro A `api.app.internal` que apunte directamente a la IP privada de la instancia web (acceso directo sin ALB)
+2. Crear un registro CNAME `api-lb.app.internal` que apunte al DNS interno del ALB (`aws_lb.main.dns_name`)
+3. Desde la instancia de test, comparar con `dig` el comportamiento de los tres registros:
+   - `web.app.internal` (Alias → ALB): resuelve directo a IP en una consulta
+   - `api.app.internal` (A → IP fija): resuelve directo a IP en una consulta
+   - `api-lb.app.internal` (CNAME → ALB DNS): resuelve en dos pasos (CNAME + resolución del target)
 
 **Pistas**:
-- `aws_kms_key` necesita una `description` y opcionalmente `enable_key_rotation = true`
-- El recurso de cifrado usa un bloque `rule { apply_server_side_encryption_by_default { ... } }`
-- La clave de `sse_algorithm` es `"aws:kms"` o `"AES256"`
-- `kms_master_key_id` solo se necesita cuando `sse_algorithm = "aws:kms"`
-- Verifica con: `aws s3api get-bucket-encryption --bucket <bucket>`
+- No puedes tener un CNAME y un A para el mismo nombre — usa nombres diferentes (`api` vs `api-lb`)
+- `dig +short` muestra solo la respuesta, `dig` completo muestra la sección ANSWER con el tipo de registro
+- Un CNAME en el apex del dominio (`app.internal`) no está permitido — solo se puede en subdominios
+
+### Reto 2 — Delegación de subdominio a otra zona privada
+
+**Situación**: El equipo de base de datos quiere gestionar sus propios registros DNS bajo `db.app.internal` de forma independiente, sin depender del equipo de plataforma que administra la zona `app.internal`. Necesitan una zona privada delegada donde puedan crear registros como `primary.db.app.internal` y `replica.db.app.internal` autónomamente.
+
+**Tu objetivo**:
+
+1. Crear una segunda Zona Hospedada Privada para el subdominio `db.app.internal`, asociada a la misma VPC
+2. Eliminar el registro A `db.app.internal` de la zona padre (no puede coexistir un A y un NS para el mismo nombre)
+3. En la zona padre (`app.internal`), crear un registro NS que delegue `db.app.internal` a los nameservers de la zona hija
+4. Crear registros A en la zona hija: `primary.db.app.internal` → IP privada de la instancia db, y `replica.db.app.internal` → otra IP (puede ser ficticia como `10.17.10.20`)
+5. Verificar desde la instancia de test que `primary.db.app.internal` y `replica.db.app.internal` resuelven correctamente con `dig`, y que `db.app.internal` ya no resuelve (el registro A fue eliminado y la delegación NS solo aplica a subdominios)
+
+**Pistas**:
+- La zona hija tiene sus propios nameservers (atributo `name_servers` del recurso `aws_route53_zone`)
+- El registro NS en la zona padre debe apuntar a esos nameservers exactos
+- Ambas zonas deben estar asociadas a la misma VPC
+- La delegación permite que cada equipo gestione su subdominio con permisos IAM independientes
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Añadir regla de ciclo de vida para expiración de logs</strong></summary>
+<summary><strong>Solución al Reto 1 — Ampliar la zona con nuevos registros y comparar tipos</strong></summary>
 
-### Solución al Reto 1 — Añadir regla de ciclo de vida para expiración de logs
+### Solución al Reto 1 — Ampliar la zona con nuevos registros y comparar tipos
 
-#### Paso 1: Nueva variable en `modules/s3-bucket/variables.tf`
+#### Paso 1: Registro A directo
 
 ```hcl
-variable "expiration_days" {
-  type        = number
-  description = "Días tras los cuales los objetos expiran automáticamente. 0 = desactivado"
-  default     = 0
+resource "aws_route53_record" "api" {
+  zone_id = aws_route53_zone.internal.zone_id
+  name    = "api.${var.internal_domain}"
+  type    = "A"
+  ttl     = 60
+  records = [aws_instance.web.private_ip]
 }
 ```
 
-#### Paso 2: Recurso condicional en `modules/s3-bucket/main.tf`
+#### Paso 2: Registro CNAME hacia el ALB
 
 ```hcl
-resource "aws_s3_bucket_lifecycle_configuration" "this" {
-  count  = var.expiration_days > 0 ? 1 : 0
-  bucket = aws_s3_bucket.this.id
-
-  rule {
-    id     = "auto-expire"
-    status = "Enabled"
-
-    filter {}
-
-    expiration {
-      days = var.expiration_days
-    }
-  }
+resource "aws_route53_record" "api_lb" {
+  zone_id = aws_route53_zone.internal.zone_id
+  name    = "api-lb.${var.internal_domain}"
+  type    = "CNAME"
+  ttl     = 300
+  records = [aws_lb.main.dns_name]
 }
 ```
 
-`count = var.expiration_days > 0 ? 1 : 0` crea el recurso solo cuando se especifica un valor mayor que 0. Si `expiration_days` es 0 (default), el recurso no se crea en absoluto.
-
-#### Paso 3: Invocar desde el Root Module
-
-```hcl
-module "logs_bucket" {
-  source = "./modules/s3-bucket"
-
-  bucket_name       = "${var.project_name}-logs-${local.account_id}"
-  enable_versioning = false
-  force_destroy     = true
-  expiration_days   = 90
-
-  tags = merge(local.common_tags, {
-    Purpose            = "logs"
-    DataClassification = "internal"
-  })
-}
-
-# data_bucket no pasa expiration_days → usa default = 0 → sin regla
-```
-
-#### Paso 4: Verificar
+#### Paso 3: Comparar los tres tipos desde la instancia de test
 
 ```bash
-terraform apply
-
-# Bucket de logs: debe tener regla de expiración
-aws s3api get-bucket-lifecycle-configuration \
-  --bucket $(terraform output -raw logs_bucket_id)
-# {
-#   "Rules": [
-#     {
-#       "Expiration": { "Days": 90 },
-#       "ID": "auto-expire",
-#       "Filter": { "Prefix": "" },   ← AWS normaliza filter {} a Prefix: ""
-#       "Status": "Enabled"
-#     }
-#   ]
-# }
-# Nota: aunque en HCL declaramos `filter {}` (sin atributos, "todos los
-# objetos"), AWS lo persiste como `Filter: { "Prefix": "" }` — un prefix
-# vacío que matchea cualquier key. Es semánticamente equivalente.
-
-# Bucket de datos: no debe tener regla
-aws s3api get-bucket-lifecycle-configuration \
-  --bucket $(terraform output -raw data_bucket_id)
-# An error occurred (NoSuchLifecycleConfiguration) when calling the
-# GetBucketLifecycleConfiguration operation: The lifecycle configuration
-# does not exist
-# (esto es correcto — count = 0 en el módulo, no se creó ninguna regla)
+aws ssm start-session --target $(terraform output -raw test_instance_id)
 ```
 
----
+```bash
+# Alias (web) → resuelve directo a IPs del ALB. El ALB está desplegado en
+# 2 AZs (subnets private-1 y private-2), así que tiene 2 ENIs con 2 IPs
+# privadas, y la respuesta DNS contiene AMBAS — el cliente hace round-robin
+# entre ellas. Por eso ves DOS líneas, no una.
+dig web.app.internal +short
+# 10.17.x.x      ← IP del ALB en la primera AZ
+# 10.17.y.y      ← IP del ALB en la segunda AZ
+
+# A (api) → resuelve directo a la IP fija de la instancia web (registro A
+# simple, una única IP).
+dig api.app.internal +short
+# 10.17.10.x
+
+# CNAME (api-lb) → la ANSWER SECTION suele incluir el CNAME y las As del
+# target en la misma respuesta porque el resolutor de la VPC sigue la
+# cadena automáticamente. Si solo aparece el CNAME, ejecuta dig de nuevo
+# sobre el target o usa `dig +trace api-lb.app.internal` para ver el
+# camino completo paso a paso.
+dig api-lb.app.internal
+# ;; ANSWER SECTION:
+# api-lb.app.internal.   300  IN  CNAME  internal-lab22-alb-xxxx.us-east-1.elb.amazonaws.com.
+# internal-lab22-alb-xxxx.us-east-1.elb.amazonaws.com.  60  IN  A  10.17.x.x
+# internal-lab22-alb-xxxx.us-east-1.elb.amazonaws.com.  60  IN  A  10.17.y.y
+
+# Si solo viste el CNAME, sigue la cadena manualmente:
+dig +short $(dig api-lb.app.internal +short | head -1)
+# 10.17.x.x
+# 10.17.y.y
+
+exit
+```
+
+La diferencia clave: el CNAME requiere **resolver dos nombres** (el alias y luego el target), aunque el resolutor moderno de Route 53 normalmente devuelve ambos registros en una sola consulta para ahorrar latencia. El registro **Alias** no necesita ese paso intermedio porque Route 53 sabe que el target es un recurso AWS y devuelve directamente la(s) IP(s) en la respuesta. Además, el CNAME **expone el nombre DNS del ALB** al cliente, mientras que el Alias lo oculta — útil si quieres cambiar de ALB sin tocar a los consumidores.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Cifrado con SSE-KMS para datos confidenciales</strong></summary>
+<summary><strong>Solución al Reto 2 — Delegación de subdominio a otra zona privada</strong></summary>
 
-### Solución al Reto 2 — Cifrado con SSE-KMS para datos confidenciales
+### Solución al Reto 2 — Delegación de subdominio a otra zona privada
 
-#### Paso 1: Clave KMS en el Root Module (`main.tf`)
-
-```hcl
-resource "aws_kms_key" "data" {
-  description         = "Clave KMS para cifrado del bucket de datos - ${var.project_name}"
-  enable_key_rotation = true
-
-  tags = merge(local.common_tags, {
-    Purpose = "s3-data-encryption"
-  })
-}
-
-resource "aws_kms_alias" "data" {
-  name          = "alias/${var.project_name}-data-key"
-  target_key_id = aws_kms_key.data.key_id
-}
-```
-
-#### Paso 2: Nueva variable en `modules/s3-bucket/variables.tf`
+#### Paso 1: Zona hija para db.app.internal
 
 ```hcl
-variable "kms_key_arn" {
-  type        = string
-  description = "ARN de la clave KMS para cifrado SSE-KMS. null = usar SSE-S3 (AES256)"
-  default     = null
-}
-```
+resource "aws_route53_zone" "db" {
+  name = "db.${var.internal_domain}"
 
-#### Paso 3: Recurso de cifrado en `modules/s3-bucket/main.tf`
-
-```hcl
-resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm     = var.kms_key_arn != null ? "aws:kms" : "AES256"
-      kms_master_key_id = var.kms_key_arn
-    }
-    bucket_key_enabled = var.kms_key_arn != null
+  vpc {
+    vpc_id = aws_vpc.main.id
   }
+
+  tags = merge(local.common_tags, {
+    Name = "phz-db-${var.internal_domain}-${var.project_name}"
+  })
 }
 ```
 
-`bucket_key_enabled = true` reduce costes de KMS al cachear la clave de datos a nivel de bucket en vez de generar una por cada objeto. Solo tiene sentido con SSE-KMS.
+#### Paso 2: Eliminar el registro A de db.app.internal en la zona padre
 
-> **Nota — qué cambia para cada bucket tras este Reto:**
->
-> - **logs_bucket** (`kms_key_arn = null`): el módulo aplica `sse_algorithm = "AES256"`, lo que es **funcionalmente equivalente** al cifrado SSE-S3 que AWS ya aplica por defecto en cualquier bucket nuevo desde 2023. Lo que cambia es que ahora el cifrado es **explícito en el state**: `terraform plan` lo enseña, los auditores lo ven, y queda blindado frente a un futuro cambio del comportamiento por defecto de AWS.
-> - **data_bucket** (`kms_key_arn = aws_kms_key.data.arn`): cambia el cifrado **real**, pasa de SSE-S3 (default implícito) a SSE-KMS con una CMK gestionada por el cliente. Esto **sí** modifica el comportamiento — cada `GET` y `PUT` requiere ahora permisos `kms:Decrypt` / `kms:GenerateDataKey` además de los permisos S3.
-
-#### Paso 4: Invocar desde el Root Module
+El registro A `db.app.internal` creado en el laboratorio base entra en conflicto con la delegación — no puede existir un registro A y un NS para el mismo nombre. Eliminar o comentar el recurso `aws_route53_record.db` de `main.tf`:
 
 ```hcl
-module "data_bucket" {
-  source = "./modules/s3-bucket"
+# ELIMINAR:
+# resource "aws_route53_record" "db" {
+#   zone_id = aws_route53_zone.internal.zone_id
+#   name    = "db.${var.internal_domain}"
+#   type    = "A"
+#   ttl     = 300
+#   records = [aws_instance.db.private_ip]
+# }
+```
 
-  bucket_name       = "${var.project_name}-data-${local.account_id}"
-  enable_versioning = true
-  force_destroy     = false
-  kms_key_arn       = aws_kms_key.data.arn
+> **⚠️ Actualiza también `outputs.tf`:** el output `db_fqdn` referencia `aws_route53_record.db.fqdn`, así que al eliminar el recurso, `terraform plan` falla con `Reference to undeclared resource "aws_route53_record" "db"`. Repúntalo al nuevo registro NS de la delegación (creado en el Paso 3), conservando el nombre del output para no romper a quien ya consume `db_fqdn` desde otro state o desde scripts:
+>
+> ```hcl
+> output "db_fqdn" {
+>   description = "FQDN del subdominio delegado db (NS → zona hija)"
+>   value       = aws_route53_record.db_delegation.fqdn
+> }
+> ```
 
-  tags = merge(local.common_tags, {
-    Purpose            = "data"
-    DataClassification = "confidential"
-  })
+#### Paso 3: Registro NS en la zona padre (delegación)
+
+```hcl
+resource "aws_route53_record" "db_delegation" {
+  zone_id = aws_route53_zone.internal.zone_id
+  name    = "db.${var.internal_domain}"
+  type    = "NS"
+  ttl     = 300
+  records = aws_route53_zone.db.name_servers
+}
+```
+
+Este registro le dice al resolutor DNS de la VPC: "para cualquier consulta bajo `db.app.internal`, pregunta a los nameservers de la zona hija".
+
+#### Paso 4: Registros en la zona hija
+
+```hcl
+resource "aws_route53_record" "db_primary" {
+  zone_id = aws_route53_zone.db.zone_id
+  name    = "primary.db.${var.internal_domain}"
+  type    = "A"
+  ttl     = 300
+  records = [aws_instance.db.private_ip]
 }
 
-# logs_bucket no pasa kms_key_arn → usa default = null → SSE-S3 (AES256)
+resource "aws_route53_record" "db_replica" {
+  zone_id = aws_route53_zone.db.zone_id
+  name    = "replica.db.${var.internal_domain}"
+  type    = "A"
+  ttl     = 300
+  records = ["10.17.10.20"]
+}
 ```
 
 #### Paso 5: Verificar
@@ -654,47 +467,43 @@ module "data_bucket" {
 ```bash
 terraform apply
 
-# Bucket de datos: cifrado SSE-KMS
-aws s3api get-bucket-encryption \
-  --bucket $(terraform output -raw data_bucket_id) \
-  --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault'
-# {
-#   "SSEAlgorithm": "aws:kms",
-#   "KMSMasterKeyID": "arn:aws:kms:us-east-1:123456789012:key/..."
-# }
-
-# Bucket de logs: cifrado SSE-S3
-aws s3api get-bucket-encryption \
-  --bucket $(terraform output -raw logs_bucket_id) \
-  --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault'
-# {
-#   "SSEAlgorithm": "AES256"
-# }
+aws ssm start-session --target $(terraform output -raw test_instance_id)
 ```
 
-### Reflexión: ¿SSE-S3 o SSE-KMS?
+```bash
+# Registros de la zona hija (delegada)
+dig primary.db.app.internal +short
+# 10.17.10.10
 
-| Aspecto | SSE-S3 (AES256) | SSE-KMS |
+dig replica.db.app.internal +short
+# 10.17.10.20
+
+# db.app.internal ya no tiene un registro A: se eliminó de la zona padre
+# y la delegación NS solo aplica a subdominios como primary.db.app.internal.
+# Por eso una consulta de tipo A devuelve vacío:
+dig db.app.internal +short        # (sin respuesta — no hay registro A)
+
+# Pero la zona hija sí existe y tiene su apex con NS y SOA generados por
+# Route 53 automáticamente. Si consultas explícitamente por NS o SOA, sí
+# obtienes respuesta:
+dig db.app.internal NS +short     # ns-xxxx.awsdns-yy.com. ...
+dig db.app.internal SOA +short    # ns-xxxx.awsdns-yy.com. awsdns-hostmaster... 1 7200 900 1209600 86400
+
+exit
+```
+
+> **Nota técnica — nameservers de zonas privadas:** Route 53 publica nameservers para todas las zonas (públicas y privadas), pero los de las **zonas privadas no son resolibles desde Internet**. Funcionan exclusivamente desde dentro de las VPCs asociadas: el resolutor interno de la VPC (`169.254.169.253`) los reconoce y reenvía las consultas al servicio Route 53 internamente. Por eso la delegación NS de zona padre privada → zona hija privada funciona aunque los nameservers tengan aspecto de hostnames públicos (`ns-xxxx.awsdns-yy.com`) — la resolución la hace el resolutor de la VPC, no el DNS público.
+
+### Reflexión: ¿cuándo delegar?
+
+| Escenario | Zona única | Delegación |
 |---|---|---|
-| Coste | Incluido en S3 | ~$1/mes por clave + $0.03/10K requests |
-| Gestión de claves | Automática (AWS) | Controlada (puedes rotar, revocar, auditar) |
-| Auditoría | Solo acceso a objetos | Cada uso de la clave aparece en CloudTrail |
-| Permisos | Solo permisos S3 | Requiere permisos S3 + KMS |
-| Caso de uso | Datos internos, logs | Datos regulados, PII, financieros |
+| Equipo pequeño, pocos registros | Sí | Innecesario |
+| Múltiples equipos, autonomía | Complejo (permisos compartidos) | Sí (permisos IAM por zona) |
+| Entornos separados (dev/prod) | Riesgo de errores cruzados | Sí (una zona por entorno) |
+| Microservicios con nombres propios | Zona grande, difícil de gestionar | Sí (un subdominio por servicio) |
 
-En general: SSE-S3 es suficiente para la mayoría de casos. SSE-KMS es necesario cuando se requiere control granular sobre quién puede descifrar los datos o cuando hay requisitos de compliance que exigen claves gestionadas por el cliente.
-
-> **⚠️ Aviso al destruir — periodo de eliminación de claves KMS:** cuando ejecutas `terraform destroy` con un `aws_kms_key`, AWS **no la borra inmediatamente** sino que la pone en estado `PendingDeletion` durante un periodo configurable (default 30 días, mínimo 7). Durante ese tiempo la clave se sigue cobrando (~$1/mes). Si vas a crear y destruir el lab varias veces, acumularás claves "pending deletion" cada una con su factura. Dos formas de mitigarlo:
->
-> ```hcl
-> resource "aws_kms_key" "data" {
->   description             = "..."
->   enable_key_rotation     = true
->   deletion_window_in_days = 7    # mínimo permitido
-> }
-> ```
->
-> O bien cancelar la eliminación pendiente desde la consola y reutilizar la clave (más complejo). Para entornos de laboratorio, `deletion_window_in_days = 7` es lo razonable.
+La delegación permite que cada equipo gestione su subdominio con políticas IAM independientes, reduciendo el riesgo de que un equipo modifique registros de otro.
 
 </details>
 
@@ -702,31 +511,11 @@ En general: SSE-S3 es suficiente para la mayoría de casos. SSE-KMS es necesario
 
 ## Limpieza
 
-Dado que el módulo tiene `prevent_destroy = true`, antes de destruir debes desactivar la protección temporalmente:
-
-### Paso 1: Editar `modules/s3-bucket/main.tf`
-
-Cambiar `prevent_destroy = true` a `prevent_destroy = false`:
-
-```hcl
-lifecycle {
-  prevent_destroy = false
-}
-```
-
-> **Nota:** `prevent_destroy` es un meta-argumento del bloque `lifecycle`, **no se guarda en el state** de Terraform. Por eso cambiarlo no requiere un `apply` previo — basta con guardar el cambio en el `.tf` y el siguiente `plan` / `destroy` ya lo respeta. (Si ejecutas `terraform plan` después del cambio, verás `No changes. Your infrastructure matches the configuration.`).
-
-### Paso 2: Destruir
-
 ```bash
 terraform destroy
 ```
 
-### Paso 3: Restaurar la protección
-
-Si vas a seguir usando el módulo, revierte el cambio a `prevent_destroy = true`.
-
-> **Nota:** En producción, este paso manual es **intencional** — obliga a pensar dos veces antes de destruir datos críticos. El laboratorio no crea ningún bucket S3 propio aparte de los dos del módulo: no destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
+> **Nota:** El laboratorio no crea ningún bucket S3 propio. No destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -734,29 +523,26 @@ Si vas a seguir usando el módulo, revierte el cambio a `prevent_destroy = true`
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-LocalStack emula S3 completamente en Community Edition. La versión localstack usa `prevent_destroy = false` para facilitar la limpieza en entorno local.
+LocalStack emula Route 53 a nivel de API. El ALB no está disponible en Community, por lo que la versión localstack usa registros A con IPs fijas.
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Tríada estándar de módulo (`main.tf`, `variables.tf`, `outputs.tf`)**: separar la declaración de recursos, la interfaz de entrada y la de salida en ficheros independientes facilita la lectura y el mantenimiento del módulo.
-- **`merge()` para etiquetado en capas**: combinar tags del módulo con tags del llamador permite que el consumidor añada contexto sin perder los tags obligatorios impuestos por el módulo.
-- **`prevent_destroy = true` en buckets de datos**: proteger los buckets de borrado accidental durante un `terraform destroy` mal ejecutado evita pérdida de datos irreversible.
-- **Outputs con `value` y `description`**: documentar el propósito de cada output hace que el módulo sea autoexplicativo para los consumidores que solo leen la interfaz.
-- **Invocación múltiple del mismo módulo**: usar el mismo módulo para crear el bucket de aplicación y el de logs demuestra la reutilización real y garantiza que ambos tienen los mismos estándares de seguridad.
-- **Cifrado declarativo y opción de SSE-KMS para datos confidenciales** (Reto 2): el módulo base de este lab no declara explícitamente el cifrado — confía en el cifrado SSE-S3 que AWS aplica automáticamente desde 2023 a todo bucket nuevo. El Reto 2 añade `aws_s3_bucket_server_side_encryption_configuration` al módulo, lo que (a) hace el cifrado **explícito en el state** (visible en `plan` y auditable) y (b) permite **escalar a SSE-KMS** con una clave gestionada por el cliente cuando hace falta control granular o compliance. Como recomendación general: declarar el cifrado en Terraform (incluso si AWS lo aplicaría igual por defecto) hace el código autoexplicativo y resistente a cambios futuros de comportamiento por defecto del proveedor.
+- **Zona hospedada privada sin dominio público**: crear una PHZ con sufijo `.internal`, `.corp` o `.private` permite tener un sistema DNS interno completamente controlado sin comprar un dominio en Internet ni exponer nombres internos. Evitar `.local` (reservado para mDNS).
+- **Registros Alias para endpoints AWS**: usar registros Alias en lugar de CNAME para ALBs y otros recursos AWS (CloudFront, S3, NLB, Global Accelerator) evita el coste adicional de las resoluciones DNS, permite usarlo en el apex (`app.internal` puede ser Alias pero no CNAME) y delega en Route 53 la actualización de la IP cuando el endpoint cambia.
+- **Habilitar `enable_dns_support` y `enable_dns_hostnames` en la VPC**: sin estos dos atributos activos, Route 53 no puede resolver los nombres de la PHZ desde la VPC. Es la causa más frecuente de "la zona existe pero `nslookup` devuelve `NXDOMAIN` desde dentro".
+- **TTL bajo durante el desarrollo**: durante el laboratorio, un TTL de 60–300 segundos permite iterar rápidamente en los registros. En producción, valores de 600–3600 reducen la carga en los resolvers DNS y el coste por consulta a Route 53.
+- **Asociar la PHZ a múltiples VPCs cuando lo necesites**: el bloque `vpc {}` dentro de `aws_route53_zone` solo declara la **primera** asociación. Para añadir VPCs adicionales (incluso de otras cuentas) se usa el recurso aparte `aws_route53_zone_association` — útil en arquitecturas hub-and-spoke donde varias VPCs comparten la misma zona privada. Este lab solo asocia una VPC; el patrón multi-VPC se aplica replicando el `aws_route53_zone_association` por cada VPC adicional.
+- **Delegación de subdominio para autonomía por equipo**: una PHZ hija (`db.app.internal` → otra zona privada) con un registro NS en la zona padre permite que cada equipo gestione sus propios registros con permisos IAM independientes. Se demuestra en el Reto 2.
 
 ---
 
 ## Recursos
 
-- [Terraform: Modules Overview](https://developer.hashicorp.com/terraform/language/modules)
-- [Terraform: Module Structure](https://developer.hashicorp.com/terraform/language/modules/develop/structure)
-- [Terraform: `merge()` function](https://developer.hashicorp.com/terraform/language/functions/merge)
-- [Terraform: `lifecycle` meta-argument](https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle)
-- [AWS: S3 Bucket Naming Rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html)
-- [AWS: S3 Default Encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-encryption.html)
-- [AWS: S3 Block Public Access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
-- [Terraform: `aws_s3_bucket`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket)
-- [Terraform: `aws_s3_bucket_lifecycle_configuration`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_lifecycle_configuration)
+- [AWS: Route 53 Private Hosted Zones](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/hosted-zones-private.html)
+- [AWS: Choosing Between Alias and Non-Alias Records](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-choosing-alias-non-alias.html)
+- [AWS: Associating a PHZ with a VPC](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/hosted-zone-private-associate-vpcs.html)
+- [AWS: DNS Resolution in VPCs](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-dns.html)
+- [Terraform: `aws_route53_zone`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_zone)
+- [Terraform: `aws_route53_record`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record)

@@ -7,7 +7,7 @@ variable "region" {
 variable "vpc_cidr" {
   type        = string
   description = "CIDR block de la VPC"
-  default     = "10.14.0.0/16"
+  default     = "10.13.0.0/16"
 }
 
 variable "project_name" {
@@ -22,20 +22,8 @@ variable "environment" {
   default     = "lab"
 }
 
-variable "alb_ingress_ports" {
-  type        = list(number)
-  description = "Lista de puertos TCP que el ALB acepta desde Internet"
-  default     = [80, 443]
-}
-
-variable "blocked_ip" {
-  type        = string
-  description = "CIDR de la IP maliciosa a bloquear en la NACL (ej: 203.0.113.0/32)"
-  default     = "203.0.113.0/32"
-}
-
-variable "flow_log_retention_days" {
-  type        = number
-  description = "Días de retención de los VPC Flow Logs en CloudWatch"
-  default     = 7
+variable "use_nat_instance" {
+  type        = bool
+  description = "true = Instancia NAT EC2 (dev, ahorro ~62%); false = NAT Gateway (producción, alta disponibilidad)"
+  default     = false
 }

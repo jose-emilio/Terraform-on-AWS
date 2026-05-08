@@ -8,18 +8,6 @@ locals {
 }
 
 # ── Empaquetado del código fuente ─────────────────────────────────────────────
-#
-# archive_file genera ZIPs localmente (sin llamadas a AWS).
-# output_base64sha256 calcula el hash del contenido del ZIP; pasarlo a
-# source_code_hash de aws_lambda_function / aws_lambda_layer_version garantiza
-# que Terraform redepliegue la función o la capa cada vez que el código cambie,
-# aunque el nombre del fichero ZIP no varíe.
-
-data "archive_file" "layer" {
-  type        = "zip"
-  source_dir  = "${path.module}/src/layer"
-  output_path = "${path.module}/layer.zip"
-}
 
 data "archive_file" "function" {
   type        = "zip"
@@ -27,14 +15,58 @@ data "archive_file" "function" {
   output_path = "${path.module}/function.zip"
 }
 
-# ── CloudWatch Logs ────────────────────────────────────────────────────────────
+# ── SQS: Dead Letter Queue ────────────────────────────────────────────────────
 #
-# Crear el log group antes que la función garantiza que los logs de cold start
-# se capturen desde el primer instante; sin él, Lambda crea el grupo sin
-# retention_in_days, acumulando logs indefinidamente.
+# La DLQ recibe los mensajes que fallaron maxReceiveCount veces en la cola
+# principal. Retención de 14 días para análisis post-mortem.
+
+resource "aws_sqs_queue" "dlq" {
+  name                      = "${var.project}-dlq"
+  message_retention_seconds = 1209600 # 14 días
+  tags                      = merge(local.tags, { Name = "${var.project}-dlq" })
+}
+
+# ── SQS: Colas de destino para Lambda Destinations ───────────────────────────
+#
+# Estas colas reciben los registros de invocación generados por Lambda cuando
+# se invoca la función de forma asíncrona (InvocationType = Event).
+# No intervienen en el path de SQS Event Source Mapping.
+
+resource "aws_sqs_queue" "success" {
+  name = "${var.project}-success"
+  tags = merge(local.tags, { Name = "${var.project}-success" })
+}
+
+resource "aws_sqs_queue" "failure" {
+  name = "${var.project}-failure"
+  tags = merge(local.tags, { Name = "${var.project}-failure" })
+}
+
+# ── SQS: Cola principal de órdenes ───────────────────────────────────────────
+#
+# Cola de entrada del sistema. La política de redrive mueve los mensajes a
+# la DLQ tras 3 intentos fallidos de procesamiento.
+#
+# visibility_timeout debe ser >= timeout de la función Lambda para evitar
+# que el mensaje vuelva a ser visible mientras Lambda lo está procesando.
+
+resource "aws_sqs_queue" "orders" {
+  name                       = "${var.project}-orders"
+  visibility_timeout_seconds = 30
+  message_retention_seconds  = 86400 # 1 día
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 3
+  })
+
+  tags = merge(local.tags, { Name = "${var.project}-orders" })
+}
+
+# ── CloudWatch Logs ────────────────────────────────────────────────────────────
 
 resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${var.project}-function"
+  name              = "/aws/lambda/${var.project}-processor"
   retention_in_days = 7
   tags              = local.tags
 }
@@ -56,45 +88,55 @@ resource "aws_iam_role" "lambda" {
   tags = merge(local.tags, { Name = "${var.project}-lambda-role" })
 }
 
-# AWSLambdaBasicExecutionRole permite escribir logs en CloudWatch.
 resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# ── Lambda Layer ──────────────────────────────────────────────────────────────
-#
-# La Layer empaqueta el módulo 'utils' en python/utils.py. Lambda añade
-# python/ al sys.path del runtime, por lo que el handler puede importarlo
-# con: from utils import format_response, get_metadata
-#
-# La Layer y la función tienen source_code_hash independientes: un cambio en
-# utils.py solo redespliega la capa; un cambio en handler.py solo redespliega
-# la función. Sin source_code_hash, Terraform no detectaría cambios en el
-# contenido del ZIP (solo en el nombre del fichero).
+# Permisos SQS: leer de la cola de órdenes y escribir en las colas de destino.
+# El Event Source Mapping requiere ReceiveMessage + DeleteMessage + GetQueueAttributes.
+# Lambda Destinations requiere SendMessage en las colas de éxito y fallo.
 
-resource "aws_lambda_layer_version" "utils" {
-  layer_name          = "${var.project}-utils"
-  filename            = data.archive_file.layer.output_path
-  source_code_hash    = data.archive_file.layer.output_base64sha256
-  compatible_runtimes = [var.runtime]
-  description         = "Utilidades compartidas: format_response y get_metadata"
+resource "aws_iam_role_policy" "sqs" {
+  name = "${var.project}-sqs-policy"
+  role = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadOrdersQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+        ]
+        Resource = aws_sqs_queue.orders.arn
+      },
+      {
+        Sid    = "WriteDestinationQueues"
+        Effect = "Allow"
+        Action = ["sqs:SendMessage"]
+        Resource = [
+          aws_sqs_queue.success.arn,
+          aws_sqs_queue.failure.arn,
+        ]
+      },
+    ]
+  })
 }
 
 # ── Lambda Function ───────────────────────────────────────────────────────────
 
-resource "aws_lambda_function" "api" {
-  function_name    = "${var.project}-function"
+resource "aws_lambda_function" "processor" {
+  function_name    = "${var.project}-processor"
   filename         = data.archive_file.function.output_path
   source_code_hash = data.archive_file.function.output_base64sha256
   runtime          = var.runtime
   handler          = "handler.lambda_handler"
   role             = aws_iam_role.lambda.arn
-
-  # Referencia a la Layer por su ARN versionado.
-  # Al actualizar la capa (nueva layer_version), basta con que este ARN cambie
-  # para que Terraform redepliegue la función con la nueva versión.
-  layers = [aws_lambda_layer_version.utils.arn]
+  timeout          = 30
 
   environment {
     variables = {
@@ -103,93 +145,63 @@ resource "aws_lambda_function" "api" {
     }
   }
 
-  # depends_on garantiza que el log group exista antes de que Lambda
-  # intente escribir en él durante su primer arranque.
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic,
+    aws_iam_role_policy.sqs,
     aws_cloudwatch_log_group.lambda,
   ]
 
-  tags = merge(local.tags, { Name = "${var.project}-function" })
+  tags = merge(local.tags, { Name = "${var.project}-processor" })
 }
 
-# ── API Gateway v2 (HTTP API) ─────────────────────────────────────────────────
+# ── Lambda Destinations ───────────────────────────────────────────────────────
 #
-# API Gateway v2 ofrece HTTP API (más barata y rápida) y WebSocket API.
-# protocol_type = "HTTP" crea una HTTP API; la REST API (v1) usaría un recurso
-# aws_api_gateway_rest_api diferente.
-
-resource "aws_apigatewayv2_api" "main" {
-  name          = "${var.project}-api"
-  protocol_type = "HTTP"
-  description   = "HTTP API del Lab31 — Lambda, API Gateway v2 y Layers"
-  tags          = local.tags
-}
-
-# ── Stage ─────────────────────────────────────────────────────────────────────
+# Configura los destinos para invocaciones ASÍNCRONAS de Lambda.
+# Cuando se invoca la función con InvocationType = Event:
+#   - Si retorna con éxito → Lambda envía un registro a on_success (success-queue)
+#   - Si lanza una excepción → Lambda envía un registro a on_failure (failure-queue)
 #
-# El stage "$default" es el stage predeterminado de las HTTP API. Su URL no
-# incluye el nombre del stage en el path (a diferencia de REST API v1).
-# auto_deploy = true publica los cambios de rutas e integraciones de forma
-# automática; en producción se suele preferir auto_deploy = false y usar
-# aws_apigatewayv2_deployment explícito para mayor control.
+# IMPORTANTE: estos destinos NO se activan en el path de SQS Event Source Mapping
+# porque ese path usa invocación síncrona. Para el path SQS, los fallos se
+# gestionan con la redrive_policy de aws_sqs_queue.orders (→ DLQ tras 3 intentos).
 
-resource "aws_apigatewayv2_stage" "default" {
-  api_id      = aws_apigatewayv2_api.main.id
-  name        = "$default"
-  auto_deploy = true
-  tags        = local.tags
+resource "aws_lambda_function_event_invoke_config" "processor" {
+  function_name = aws_lambda_function.processor.function_name
+
+  destination_config {
+    on_success {
+      destination = aws_sqs_queue.success.arn
+    }
+    on_failure {
+      destination = aws_sqs_queue.failure.arn
+    }
+  }
 }
 
-# ── Integración AWS_PROXY ─────────────────────────────────────────────────────
+# ── Event Source Mapping ──────────────────────────────────────────────────────
 #
-# integration_type = "AWS_PROXY" delega toda la lógica HTTP a Lambda:
-# API Gateway reenvía el evento completo (método, path, headers, body…) y
-# Lambda devuelve la respuesta con el formato {statusCode, headers, body}.
-# payload_format_version = "2.0" usa el esquema simplificado de v2 que
-# proporciona requestContext.http.method, rawPath, etc.
-
-resource "aws_apigatewayv2_integration" "lambda" {
-  api_id                 = aws_apigatewayv2_api.main.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.api.invoke_arn
-  payload_format_version = "2.0"
-}
-
-# ── Rutas ─────────────────────────────────────────────────────────────────────
+# Configura el polling de Lambda sobre la cola de órdenes.
 #
-# route_key = "<MÉTODO> <path>". El placeholder {id} se expone en Lambda
-# como event["pathParameters"]["id"].
-
-resource "aws_apigatewayv2_route" "get_items" {
-  api_id    = aws_apigatewayv2_api.main.id
-  route_key = "GET /items"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-
-resource "aws_apigatewayv2_route" "get_item" {
-  api_id    = aws_apigatewayv2_api.main.id
-  route_key = "GET /items/{id}"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-
-resource "aws_apigatewayv2_route" "post_items" {
-  api_id    = aws_apigatewayv2_api.main.id
-  route_key = "POST /items"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-
-# ── Permiso Lambda ────────────────────────────────────────────────────────────
+# filter_criteria: Lambda solo procesa mensajes cuyo body (JSON parseado)
+# contenga "order_type": "premium". Los mensajes que no coincidan se eliminan
+# automáticamente de la cola sin invocar Lambda.
 #
-# Sin este recurso, API Gateway obtiene un 403 al invocar Lambda.
-# source_arn limita el permiso al ARN de ejecución de esta API concreta
-# (execution_arn/<stage>/<método>/<path>). El patrón "/*/*" cubre
-# cualquier stage, método y ruta de esta API — más seguro que "*".
+# batch_size = 10: Lambda acumula hasta 10 mensajes por invocación, reduciendo
+# el número de llamadas y aprovechando el paralelismo del handler.
 
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.api.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
+resource "aws_lambda_event_source_mapping" "orders" {
+  event_source_arn = aws_sqs_queue.orders.arn
+  function_name    = aws_lambda_function.processor.arn
+  batch_size       = 10
+  enabled          = true
+
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        body = {
+          order_type = ["premium"]
+        }
+      })
+    }
+  }
 }

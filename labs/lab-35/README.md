@@ -1,4 +1,4 @@
-# Laboratorio 35 — Base de Datos Relacional Crítica: RDS Multi-AZ y Replicación
+# Laboratorio 35 — Almacenamiento Híbrido: EBS de Alto Rendimiento y EFS Compartido
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,170 +8,156 @@
 
 ## Visión general
 
-En este laboratorio aprovisionarás una base de datos PostgreSQL de nivel empresarial con alta disponibilidad, seguridad en capas y escalado de lectura. La capa de aplicación es un CRM Dashboard Flask que se despliega en un **Auto Scaling Group** detrás de un **Application Load Balancer** y demuestra en tiempo real el failover de RDS Multi-AZ, la AZ activa de la primaria y la lectura desde la réplica.
+En este laboratorio implementarás las dos formas principales de almacenamiento persistente en AWS: **EBS** para discos individuales de alta velocidad y **EFS** para sistemas de archivos compartidos entre múltiples instancias. Aprenderás a desacoplar IOPS y throughput del tamaño del volumen con **gp3**, a automatizar respaldos basados en etiquetas con **Data Lifecycle Manager**, a crear un sistema de archivos elástico cifrado con **EFS Elastic Throughput**, a desplegar mount targets en múltiples AZs y a aislar datos de aplicaciones con un **EFS Access Point** que impone identidad POSIX.
 
-Aprenderás a configurar un **DB Subnet Group** y un **Parameter Group** que fuerza SSL, a desplegar RDS con **Multi-AZ** para failover automático en menos de 60 segundos, a habilitar la **autenticación IAM** con tokens efímeros, a gestionar credenciales con **Secrets Manager** cifrado con CMK propia, y a crear una **Read Replica** en una AZ distinta para descargar lecturas.
+La infraestructura se organiza en tres **módulos locales reutilizables**: `modules/vpc` gestiona la VPC y las subnets, `modules/ec2-client` encapsula la instancia, su acceso SSM y el volumen EBS, y `modules/efs-share` gestiona el file system EFS, los mount targets y el Access Point. El módulo raíz orquesta los tres módulos y gestiona directamente la política DLM.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Crear un `aws_db_subnet_group` en subnets privadas y entender por qué RDS requiere subnets en múltiples AZs
-- Configurar un `aws_db_parameter_group` con `rds.force_ssl = 1` para rechazar conexiones sin cifrado
-- Desplegar `aws_db_instance` con `multi_az = true` y comprender el mecanismo de failover automático
-- Activar `max_allocated_storage` para el autoscaling de almacenamiento sin tiempo de inactividad
-- Habilitar `iam_database_authentication_enabled` y generar tokens de autenticación temporales con la CLI
-- Gestionar la contraseña maestra con `aws_secretsmanager_secret` cifrado con CMK propia de KMS
-- Crear una `aws_db_instance` como read replica con `replicate_source_db` en una AZ distinta
-- Desplegar un `aws_launch_template` + `aws_autoscaling_group` con target tracking scaling
-- Observar el cambio de AZ de la primaria en la aplicación web antes y después de un failover
+- Estructurar la infraestructura en tres módulos locales (`vpc`, `ec2-client`, `efs-share`) con interfaces claras de variables y outputs
+- Crear un volumen `aws_ebs_volume` de tipo gp3 configurando IOPS y throughput de forma independiente al tamaño
+- Adjuntar el volumen a una instancia con `aws_volume_attachment`
+- Definir una política `aws_dlm_lifecycle_policy` que automatiza snapshots EBS diarios con retención de 14 días basada en etiquetas
+- Crear un `aws_efs_file_system` cifrado con `throughput_mode = "elastic"`
+- Desplegar `aws_efs_mount_target` en cada subnet privada con `for_each` sobre una lista de IDs
+- Configurar el Security Group del EFS para permitir TCP 2049 exclusivamente desde el Security Group de las instancias EC2
+- Implementar un `aws_efs_access_point` con `posix_user` y `root_directory` para aislar los datos de una aplicación
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre RDS, KMS, Secrets Manager, IAM, EC2, S3 y Auto Scaling
+- Perfil AWS con permisos sobre EC2, EBS, EFS, IAM y DLM
+- LocalStack en ejecución (para la sección de LocalStack)
 
 ---
 
 ## Arquitectura
 
-![ALB → ASG con Flask CRM en privadas a/b → RDS PostgreSQL Multi-AZ + Read Replica en AZ-c · Secrets Manager + KMS CMK + S3 app artifacts](arch/diagrama.svg)
+![EBS gp3 alto rendimiento adjunto a EC2 + EFS Multi-AZ con mount targets en 2 subredes + DLM con snapshots automáticos por tag](arch/diagrama.svg)
 
-Tres mecanismos de continuidad combinados sobre la misma VPC:
-
-- **RDS Multi-AZ** — la primaria tiene una standby síncrona en otra AZ; el failover es automático y el endpoint DNS no cambia.
-- **Read Replica** asíncrona en AZ-c — descarga las consultas de lectura para no saturar la primaria.
-- **Secrets Manager** con CMK propia — la contraseña la genera Terraform con `random_password` y se almacena cifrada; la EC2 la recupera en el `user_data` con permisos vía Instance Profile (sin secretos en el código). La rotación opcional vía Lambda se activa con `var.rotation_lambda_arn`.
-
-El parameter group personalizado fuerza `rds.force_ssl = 1`. La app Flask se descarga desde S3 en cada arranque del ASG, lo que permite actualizar el código publicando una nueva versión sin tocar el Launch Template.
+Una VPC con subredes privadas en 2 AZs aloja una **EC2 cliente** con un volumen **EBS gp3** dedicado (100 GB, 6000 IOPS, 400 MB/s) — almacenamiento rápido single-AZ por instancia. En paralelo, un **EFS** proporciona sistema de archivos compartido con **mount targets en cada AZ** (replicación automática) y un Access Point que fija UID/GID para la app. El SG de NFS solo admite 2049 desde el SG de la EC2 — sin CIDRs hardcodeados. Una política de **Data Lifecycle Manager** toma snapshots diarios a las 03:00 UTC de cualquier volumen con `tag Backup = true` (retención 14 snapshots), independientemente del código de la app.
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### DB Subnet Group: enrutamiento de red de RDS
+### gp3: desacoplamiento de rendimiento y capacidad
 
-Un `aws_db_subnet_group` es el contrato de red de RDS: le indica al motor en qué subnets (y por tanto en qué AZs) puede colocar la instancia primaria y la standby de Multi-AZ. Debe incluir subnets en al menos dos AZs distintas. Sin él, RDS no puede desplegarse en una VPC.
+`gp2` escala IOPS automáticamente con el tamaño del volumen (3 IOPS/GB, máximo 16 000). Un volumen de 100 GB tiene 300 IOPS baseline — insuficiente para cargas de trabajo intensivas. `gp3` rompe esta dependencia: puedes configurar hasta 16 000 IOPS y 1 000 MB/s de throughput en cualquier tamaño de volumen, sin coste adicional hasta 3 000 IOPS y 125 MB/s.
+
+```
+gp2 de 100 GB → 300 IOPS fijos (no configurable)
+gp3 de 100 GB → 6 000 IOPS + 400 MB/s (configuración independiente)
+```
+
+El coste de almacenamiento base de gp3 ($0.08/GB/mes) es un 20% inferior a gp2 ($0.10/GB/mes). El IOPS adicional se factura por separado (primeros 3 000 gratis).
+
+### Data Lifecycle Manager (DLM)
+
+DLM automatiza el ciclo de vida de snapshots EBS. En lugar de un script de cron o Lambda, defines una política declarativa que selecciona volúmenes por etiquetas, programa la creación de snapshots y gestiona la retención automática.
+
+La política requiere dos recursos: un rol IAM que DLM asume para crear snapshots en tu cuenta, y la propia política con sus reglas de programación:
 
 ```hcl
-resource "aws_db_subnet_group" "main" {
-  name       = "lab35-subnet-group"
-  subnet_ids = [for s in aws_subnet.private : s.id]
+# Rol IAM que DLM asume para operar en tu cuenta
+resource "aws_iam_role" "dlm" {
+  name = "${var.project}-dlm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "dlm.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
 }
-```
 
-### Parameter Group: SSL forzado
+resource "aws_iam_role_policy_attachment" "dlm" {
+  role       = aws_iam_role.dlm.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+}
 
-Un `aws_db_parameter_group` sobreescribe los parámetros del motor PostgreSQL. El parámetro `rds.force_ssl = 1` hace que el servidor rechace cualquier intento de conexión que no use TLS/SSL:
+# Política DLM
+resource "aws_dlm_lifecycle_policy" "ebs_backup" {
+  description        = "Snapshots diarios EBS - etiqueta Backup true - retencion 14 dias"
+  execution_role_arn = aws_iam_role.dlm.arn
+  state              = "ENABLED"
 
-```
-FATAL: no pg_hba.conf entry for host "...", user "dbadmin", database "appdb", no encryption
-```
+  policy_details {
+    resource_types = ["VOLUME"]
 
-Usar un Parameter Group propio (en lugar del `default.postgres15`) es obligatorio para poder modificar parámetros sin afectar otras instancias.
-
-### Multi-AZ: alta disponibilidad y failover automático
-
-Con `multi_az = true`, RDS despliega una instancia standby en una AZ distinta y replica los datos de forma síncrona. El failover es automático en menos de 60 segundos y transparente para la aplicación: el endpoint DNS no cambia, solo la AZ donde corre la primaria.
-
-```
-┌──────────────────────────────────────┐
-│  Endpoint DNS (no cambia en failover)│
-│  lab35-main.xxx.us-east-1.rds.aws    │
-└───────────────┬──────────────────────┘
-                │
-    ┌───────────┴────────────┐
-    │                        │
-┌───▼────────────┐    ┌──────▼─────────────┐
-│  PRIMARY       │    │  STANDBY (Multi-AZ)│
-│  us-east-1a    │◄───│  us-east-1b        │
-│  (escrituras)  │sync│  (no sirve lecturas│
-└────────────────┘    │   hasta failover)  │
-                      └────────────────────┘
-```
-
-El standby **no sirve lecturas** en condiciones normales — solo existe para failover. Para escalar lecturas se usa la Read Replica.
-
-### Auto Scaling Group + Launch Template
-
-El ASG gestiona el ciclo de vida de las instancias EC2 de la capa de aplicación:
-
-- **`aws_launch_template`**: define AMI, tipo de instancia, perfil IAM y `user_data`. Cada nueva versión del template puede aplicarse mediante un *instance refresh* sin tiempo de inactividad.
-- **Target Tracking Scaling**: el ASG escala para mantener la CPU media en el 60%. AWS gestiona automáticamente el cooldown entre escalados.
-- **`health_check_type = "ELB"`**: el ASG reemplaza instancias que el ALB marca como `unhealthy` (endpoint `/health` devuelve un código distinto de 200), no solo instancias apagadas.
-- **`health_check_grace_period = 600`**: da 10 minutos a cada instancia para completar el `user_data` (instalar dependencias, esperar a RDS, arrancar Flask) antes de evaluar su salud.
-
-```hcl
-resource "aws_autoscaling_policy" "cpu" {
-  policy_type            = "TargetTrackingScaling"
-  autoscaling_group_name = aws_autoscaling_group.app.name
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ASGAverageCPUUtilization"
+    # Selecciona todos los volúmenes EBS con la etiqueta Backup=true
+    target_tags = {
+      Backup = "true"
     }
-    target_value = 60.0
+
+    schedule {
+      name = "daily-14d"
+
+      create_rule {
+        interval      = 24
+        interval_unit = "HOURS"
+        times         = ["03:00"]   # hora UTC de inicio de la ventana
+      }
+
+      retain_rule {
+        count = 14   # conserva los 14 snapshots más recientes; elimina el resto
+      }
+
+      tags_to_add = {
+        SnapshotCreator = "DLM"
+        Project         = var.project
+      }
+
+      copy_tags = true   # hereda las etiquetas del volumen origen
+    }
   }
 }
 ```
 
-### S3 para artefactos de la aplicación
+La política selecciona volúmenes por etiqueta (`Backup = "true"`), no por ID. Esto significa que cualquier volumen nuevo que lleve esa etiqueta queda cubierto automáticamente sin modificar la política. El rol `AWSDataLifecycleManagerServiceRole` ya incluye los permisos necesarios (`ec2:CreateSnapshot`, `ec2:DeleteSnapshot`, `ec2:DescribeVolumes`, etc.) — no es necesario crear una política IAM personalizada.
 
-El código de la aplicación (`app.py`) se almacena en S3 en lugar de embeberse en el `user_data`. Esto resuelve el límite de 16 KB de EC2 `user_data` y permite actualizar la app sin modificar el Launch Template:
+### EFS Elastic Throughput
 
-```bash
-# Actualizar la app sin recrear el ASG:
-# 1. Modifica app.py
-# 2. terraform apply  → sube la nueva versión a S3
-# 3. Lanza un instance refresh en el ASG
-aws autoscaling start-instance-refresh \
-  --auto-scaling-group-name lab35-asg \
-  --preferences '{"MinHealthyPercentage":50}'
-```
+EFS ofrece tres modos de throughput:
 
-### Autoscaling de almacenamiento
+| Modo | Comportamiento | Uso recomendado |
+|---|---|---|
+| `bursting` | Throughput proporcional al tamaño del FS; acumula créditos | File systems pequeños con acceso esporádico |
+| `provisioned` | Throughput fijo garantizado; facturado por MB/s | Cargas predecibles y constantes |
+| `elastic` | Throughput automático hasta 3 GB/s lecturas / 1 GB/s escrituras | Cargas variables o desconocidas |
 
-`max_allocated_storage` activa el autoscaling: cuando el espacio libre cae por debajo del 10% durante 5 minutos, RDS amplía el volumen automáticamente hasta el límite configurado sin tiempo de inactividad.
+`elastic` es el modo recomendado para la mayoría de nuevos deployments: solo pagas por los MB/s consumidos, sin aprovisionar capacidad de antemano.
+
+### Mount Targets y AZs
+
+Un mount target es el punto de entrada de red de EFS en una subnet. Para alta disponibilidad y latencia óptima, se despliega uno por AZ. EFS replica los datos de forma transparente entre todas las AZs de la región; cada instancia se conecta al mount target de su propia AZ:
 
 ```hcl
-allocated_storage     = 20    # inicial
-max_allocated_storage = 100   # máximo alcanzable automáticamente
+resource "aws_efs_mount_target" "main" {
+  for_each = toset(var.subnet_ids)   # una iteración por subnet/AZ
+
+  file_system_id  = aws_efs_file_system.main.id
+  subnet_id       = each.value
+  security_groups = [aws_security_group.efs.id]
+}
 ```
 
-### IAM Database Authentication: tokens temporales
+El Security Group del EFS debe permitir TCP 2049 (protocolo NFS) exclusivamente desde el Security Group de las instancias EC2. Usar `source_security_group_id` en lugar de CIDR es más seguro y escala automáticamente cuando se añaden nuevas instancias.
 
-Con `iam_database_authentication_enabled = true`, las aplicaciones pueden autenticarse en PostgreSQL usando un token IAM en lugar de una contraseña estática. El token caduca a los 15 minutos:
+### EFS Access Point
 
-```bash
-aws rds generate-db-auth-token \
-  --hostname ENDPOINT --port 5432 \
-  --region us-east-1 --username dbadmin
-```
+Un Access Point virtualiza un directorio raíz dentro del EFS y aplica una identidad POSIX fija a todos los accesos:
 
-### Secrets Manager: credenciales centralizadas con CMK
+- **`posix_user`**: UID y GID que el sistema operativo impone en cada operación de fichero, independientemente del usuario real del proceso.
+- **`root_directory.path`**: el proceso ve este directorio como `/`, no puede navegar fuera de él.
+- **`creation_info`**: si el directorio no existe, EFS lo crea con el propietario y permisos indicados.
 
-El secreto se cifra con una Customer Managed Key de KMS. Esto permite auditar cada operación de descifrado en CloudTrail y revocar el acceso deshabilitando la clave. La instancia EC2 necesita tanto `secretsmanager:GetSecretValue` como `kms:Decrypt` sobre la CMK:
-
-```python
-import boto3, json
-secret = boto3.client('secretsmanager').get_secret_value(SecretId='lab35/db/master-password')
-creds  = json.loads(secret['SecretString'])
-# creds['host'], creds['port'], creds['password'], etc.
-```
-
-### Read Replica: escalado de lecturas
-
-Copia de solo lectura con replicación asíncrona. El CRM Dashboard dirige todas las consultas SELECT a la réplica y las escrituras al primario:
-
-```
-┌─────────────────┐   async   ┌──────────────────────┐
-│  PRIMARY        │──────────►│  READ REPLICA        │
-│  us-east-1a     │           │  us-east-1c          │
-│  escrituras     │           │  lecturas (CRM)      │
-└─────────────────┘           └──────────────────────┘
-```
-
-La replicación es asíncrona — puede haber un lag de milisegundos. Para datos que requieren consistencia inmediata, usa siempre el endpoint principal.
+Esto permite que múltiples aplicaciones compartan el mismo EFS con aislamiento total: cada una tiene su propio Access Point apuntando a su directorio, con su UID/GID, sin posibilidad de acceder a los datos de las demás.
 
 ---
 
@@ -182,14 +168,35 @@ labs/lab-35/
 ├── README.md
 ├── arch/
 │   └── diagrama.svg                       # Diagrama de arquitectura (referenciado en este README)
-└── aws/
-    ├── providers.tf
+├── aws/
+│   ├── providers.tf
+│   ├── variables.tf
+│   ├── main.tf
+│   ├── outputs.tf
+│   ├── aws.s3.tfbackend
+│   └── modules/
+│       ├── vpc/
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       ├── ec2-client/
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       └── efs-share/
+│           ├── main.tf
+│           ├── variables.tf
+│           └── outputs.tf
+└── localstack/
+    ├── README.md            # Limitaciones + comandos awslocal
+    ├── providers.tf         # Endpoints LocalStack (ec2, iam, sts)
     ├── variables.tf
-    ├── main.tf
+    ├── main.tf              # vpc + ec2-client (efs-share omitido en Community)
     ├── outputs.tf
-    ├── app.py
-    ├── user_data.sh.tpl
-    └── aws.s3.tfbackend
+    └── modules/
+        ├── vpc/
+        ├── ec2-client/
+        └── efs-share/       # Presente para paridad estructural; sin recursos EFS reales
 ```
 
 ---
@@ -197,7 +204,7 @@ labs/lab-35/
 ## Despliegue en AWS
 
 ```bash
-# Obtén el ID de cuenta para el backend
+# Obtén el ID de cuenta para el nombre del bucket de estado
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 # Desde labs/lab-35/aws/
@@ -209,256 +216,240 @@ terraform plan
 terraform apply
 ```
 
-> **Nota**: `terraform apply` puede tardar entre 20 y 30 minutos. RDS Multi-AZ y la read replica requieren tiempo para aprovisionar y sincronizar los volúmenes. El ASG espera a que RDS esté disponible antes de lanzar instancias.
-
-Una vez completado, obtén la URL de la aplicación:
-
-```bash
-terraform output app_url
-```
-
 ---
 
 ## Verificación final
 
-### Aplicación web — CRM Dashboard
+### Volumen EBS gp3
 
 ```bash
-APP_URL=$(terraform output -raw app_url)
+EBS_ID=$(terraform output -raw ebs_volume_id)
 
-# Health check
-curl -s "$APP_URL/health"
-# Debe devolver: {"status": "ok"}
+# Verifica tipo, IOPS y throughput
+aws ec2 describe-volumes \
+  --volume-ids "$EBS_ID" \
+  --query 'Volumes[0].{Tipo:VolumeType,GB:Size,IOPS:Iops,ThroughputMBs:Throughput,Cifrado:Encrypted}'
+# Debe mostrar: gp3, 100, 6000, 400, true
 
-# Abre el dashboard en el navegador
-echo "$APP_URL"
+# Verifica que está adjunto a la instancia
+aws ec2 describe-volumes \
+  --volume-ids "$EBS_ID" \
+  --query 'Volumes[0].Attachments[0].{Instancia:InstanceId,Dispositivo:Device,Estado:State}'
 ```
 
-El dashboard muestra:
-- **Tarjetas de estadísticas**: total de clientes, distribución por plan y MRR total
-- **Estado de conexiones**: primaria (escritura) y réplica (lectura) con indicador verde/rojo
-- **Card RDS Multi-AZ**: AZ actual de la instancia primaria, estado y botón **Failover**
-- **Tabla de clientes**: 15 clientes precargados, filtrables por nombre/email/país y plan
-
-### Instancia RDS y Multi-AZ
+### Política DLM
 
 ```bash
-# Estado, AZ y configuración de la primaria
-aws rds describe-db-instances \
-  --db-instance-identifier lab35-main \
-  --query 'DBInstances[0].{Estado:DBInstanceStatus,MultiAZ:MultiAZ,AZ:AvailabilityZone,AZStandby:SecondaryAvailabilityZone,Clase:DBInstanceClass,Motor:EngineVersion}'
+DLM_ID=$(terraform output -raw dlm_policy_id)
+EBS_ID=$(terraform output -raw ebs_volume_id)
 
-# Endpoint DNS
-aws rds describe-db-instances \
-  --db-instance-identifier lab35-main \
-  --query 'DBInstances[0].Endpoint'
-```
+# Verifica que la política está habilitada y el rol asignado
+aws dlm get-lifecycle-policy \
+  --policy-id "$DLM_ID" \
+  --query 'Policy.{Estado:State,Descripcion:Description,Rol:ExecutionRoleArn}'
+# Debe mostrar: State=ENABLED
 
-### Auto Scaling Group
+# Verifica las reglas: recursos objetivo, etiqueta selectora, horario y retención
+aws dlm get-lifecycle-policy \
+  --policy-id "$DLM_ID" \
+  --query 'Policy.PolicyDetails.Schedules[0].{Horario:CreateRule.Times,Intervalo:CreateRule.Interval,Retencion:RetainRule.Count}'
+# Debe mostrar: Times=["03:00"], Interval=24, Count=14
 
-```bash
-# Estado del ASG y número de instancias
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names lab35-asg \
-  --query 'AutoScalingGroups[0].{Min:MinSize,Deseado:DesiredCapacity,Max:MaxSize,Instancias:Instances[*].{ID:InstanceId,Estado:LifecycleState,Health:HealthStatus}}'
+# Verifica que el volumen EBS tiene la etiqueta Backup=true que activa la política
+aws ec2 describe-volumes \
+  --volume-ids "$EBS_ID" \
+  --query 'Volumes[0].Tags'
 
-# Instancias registradas en el target group del ALB
-TG_ARN=$(aws elbv2 describe-target-groups \
-  --names lab35-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+# Consulta snapshots creados por esta política (disponibles tras la primera ejecución a las 03:00 UTC)
+aws ec2 describe-snapshots \
+  --owner-ids self \
+  --filters \
+    "Name=volume-id,Values=$EBS_ID" \
+    "Name=tag:SnapshotCreator,Values=DLM" \
+  --query 'Snapshots[*].{ID:SnapshotId,Estado:State,Iniciado:StartTime,Tamanyo:VolumeSize}' \
+  --output table
 
-aws elbv2 describe-target-health \
-  --target-group-arn "$TG_ARN" \
-  --query 'TargetHealthDescriptions[*].{ID:Target.Id,Puerto:Target.Port,Estado:TargetHealth.State}'
-# Ambas instancias deben aparecer como "healthy"
-```
+# DLM no tiene un comando "ejecutar ahora" en la CLI. Para verificar sin esperar
+# a las 03:00 UTC, crea un snapshot manual del volumen y comprueba que el ciclo
+# de vida funciona cuando DLM ejecute su primera ventana.
+aws ec2 create-snapshot \
+  --volume-id "$EBS_ID" \
+  --description "Snapshot manual de prueba - lab35" \
+  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Project,Value=lab35},{Key=Origen,Value=manual}]" \
+  --query '{ID:SnapshotId,Estado:State}'
 
-### SSL forzado (Parameter Group)
-
-```bash
-aws rds describe-db-parameters \
-  --db-parameter-group-name lab35-pg15 \
-  --query 'Parameters[?ParameterName==`rds.force_ssl`].{Nombre:ParameterName,Valor:ParameterValue,Fuente:Source}'
-# Valor debe ser "1"
-```
-
-### Autoscaling de almacenamiento
-
-```bash
-aws rds describe-db-instances \
-  --db-instance-identifier lab35-main \
-  --query 'DBInstances[0].{Asignado:AllocatedStorage,MaxAsignado:MaxAllocatedStorage,Tipo:StorageType,Cifrado:StorageEncrypted}'
-# Debe mostrar: 20, 100, gp3, true
-```
-
-### Secrets Manager
-
-```bash
-SECRET=$(terraform output -raw secret_name)
-
-# Describe el secreto (cifrado con CMK)
-aws secretsmanager describe-secret \
-  --secret-id "$SECRET" \
-  --query '{Nombre:Name,KMS:KmsKeyId,RotacionActiva:RotationEnabled}'
-
-# Recupera las credenciales
-aws secretsmanager get-secret-value \
-  --secret-id "$SECRET" \
-  --query SecretString --output text | python3 -m json.tool
-# Debe mostrar: engine, host, port, dbname, username, password
-```
-
-### IAM Database Authentication
-
-```bash
-DB_HOST=$(terraform output -raw db_host)
-DB_USER=$(terraform output -raw db_username)
-
-# Genera un token IAM (caduca en 15 minutos)
-TOKEN=$(aws rds generate-db-auth-token \
-  --hostname "$DB_HOST" \
-  --port 5432 \
-  --region us-east-1 \
-  --username "$DB_USER")
-
-echo "Token generado (primeros 50 chars): ${TOKEN:0:50}..."
-
-# El token se usa como contraseña desde una instancia en la misma VPC:
-# PGPASSWORD="$TOKEN" psql "host=$DB_HOST port=5432 dbname=appdb user=$DB_USER sslmode=require"
-```
-
-### Read Replica
-
-```bash
-# Estado y AZ de la réplica
-aws rds describe-db-instances \
-  --db-instance-identifier lab35-replica \
-  --query 'DBInstances[0].{Estado:DBInstanceStatus,AZ:AvailabilityZone,Fuente:ReadReplicaSourceDBInstanceIdentifier}'
-
-# Lag de replicación en segundos (0 = sin lag)
-aws cloudwatch get-metric-statistics \
-  --namespace AWS/RDS \
-  --metric-name ReplicaLag \
-  --dimensions Name=DBInstanceIdentifier,Value=lab35-replica \
-  --start-time "$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
-  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --period 60 --statistics Average \
-  --query 'Datapoints[*].Average'
-```
-
-### Demostración de failover Multi-AZ
-
-El CRM Dashboard incluye un botón **⚡ Failover** que dispara un `reboot_db_instance` con `ForceFailover=True` desde la propia aplicación.
-
-**Procedimiento**:
-
-1. Abre el dashboard en el navegador: `terraform output app_url`
-2. Anota la AZ mostrada en el card **RDS Multi-AZ** (p. ej. `us-east-1a`)
-3. Pulsa el botón **⚡ Failover** y confirma el diálogo
-4. El banner verde indica que el failover se ha iniciado
-5. Espera ~60 segundos y recarga la página
-6. La AZ del card debe haber cambiado a la AZ del standby (p. ej. `us-east-1b`)
-7. El endpoint DNS de RDS no ha cambiado — la aplicación siguió funcionando
-
-Verifica los eventos de RDS para confirmar el failover:
-
-```bash
-aws rds describe-events \
-  --source-identifier lab35-main \
-  --source-type db-instance \
-  --duration 30 \
-  --query 'Events[*].{Hora:Date,Mensaje:Message}' \
+# Lista todos los snapshots del volumen (manuales + los que cree DLM a las 03:00 UTC)
+aws ec2 describe-snapshots \
+  --owner-ids self \
+  --filters "Name=volume-id,Values=$EBS_ID" \
+  --query 'Snapshots[*].{ID:SnapshotId,Estado:State,Fecha:StartTime,Descripcion:Description}' \
   --output table
 ```
 
-Debes ver: `Multi-AZ instance failover started` → `DB instance restarted` → `Multi-AZ instance failover completed` (~55 segundos).
+### EFS File System
+
+```bash
+EFS_ID=$(terraform output -raw efs_file_system_id)
+
+# Estado general del file system
+aws efs describe-file-systems \
+  --file-system-id "$EFS_ID" \
+  --query 'FileSystems[0].{ID:FileSystemId,Estado:LifeCycleState,Cifrado:Encrypted,Throughput:ThroughputMode,Tamanyo:SizeInBytes.Value}'
+
+# Mount targets (debe haber uno por AZ)
+aws efs describe-mount-targets \
+  --file-system-id "$EFS_ID" \
+  --query 'MountTargets[*].{ID:MountTargetId,AZ:AvailabilityZoneName,Subnet:SubnetId,IP:IpAddress,Estado:LifeCycleState}'
+```
+
+### EFS Access Point
+
+```bash
+AP_ID=$(terraform output -raw efs_access_point_id)
+
+aws efs describe-access-points \
+  --access-point-id "$AP_ID" \
+  --query 'AccessPoints[0].{ID:AccessPointId,Path:RootDirectory.Path,UID:PosixUser.Uid,GID:PosixUser.Gid,Estado:LifeCycleState}'
+# Debe mostrar path=/app/data, UID=1001, GID=1001
+```
+
+### Montaje del EFS desde la instancia (SSM)
+
+```bash
+# Los comandos terraform output se ejecutan en tu terminal local (donde corre
+# Terraform), no dentro de la instancia EC2. Obtén los valores antes de abrir
+# la sesión SSM y sustitúyelos manualmente en los comandos de la instancia.
+INSTANCE_ID=$(terraform output -raw instance_id)
+EFS_ID=$(terraform output -raw efs_file_system_id)
+AP_ID=$(terraform output -raw efs_access_point_id)
+
+echo "EFS_ID: $EFS_ID"
+echo "AP_ID:  $AP_ID"
+
+# Abre una sesión SSM (los valores de EFS_ID y AP_ID no existen en la instancia)
+aws ssm start-session --target "$INSTANCE_ID"
+
+# ── Dentro de la instancia (sustituye <EFS_ID> y <AP_ID> por los valores obtenidos arriba) ──
+
+sudo dnf install -y amazon-efs-utils
+sudo mkdir -p /mnt/efs
+
+# Monta via Access Point con TLS.
+# El mount helper de EFS acepta el ID en formato fsap-xxx, no el ARN.
+sudo mount -t efs -o tls,accesspoint=<AP_ID> <EFS_ID>:/ /mnt/efs
+
+# Verifica el montaje
+df -h /mnt/efs
+ls -la /mnt/efs   # muestra /app/data con UID/GID 1001
+
+# Escribe un fichero — verifica que el propietario es UID 1001
+echo "datos de la app" | sudo tee /mnt/efs/test.txt
+ls -la /mnt/efs/test.txt
+
+# ── Montaje permanente via /etc/fstab ─────────────────────────────────────────
+# La entrada en /etc/fstab hace que el EFS se monte automaticamente en cada
+# arranque. La opcion "_netdev" le indica al sistema que espere a que la red
+# este disponible antes de intentar el montaje — imprescindible para NFS.
+# "noresvport" mejora la disponibilidad reconectando desde un puerto no
+# reservado si se pierde la conexion con el mount target.
+# Sustituye <EFS_ID> y <AP_ID> por los valores obtenidos antes de la sesion SSM.
+
+echo "<EFS_ID>:/ /mnt/efs efs _netdev,tls,accesspoint=<AP_ID>,noresvport 0 0" \
+  | sudo tee -a /etc/fstab
+
+# Verifica que la entrada es correcta antes de reiniciar
+cat /etc/fstab
+
+# Prueba el fstab sin reiniciar (desmonta y vuelve a montar todo lo de fstab)
+sudo umount /mnt/efs
+sudo mount -a
+
+# Confirma que el EFS volvio a montarse
+df -h /mnt/efs
+```
 
 ---
 
 ## Retos
 
-### Reto 1 — Enhanced Monitoring
+### Reto 1 — EFS File System Policy (cifrado en tránsito obligatorio)
 
-RDS ofrece métricas estándar a nivel de hipervisor en CloudWatch. **Enhanced Monitoring** proporciona métricas del sistema operativo (CPU por proceso, memoria libre, IOPS de disco) con granularidad de hasta 1 segundo — imprescindible para diagnosticar cuellos de botella reales.
+El EFS acepta conexiones NFS sin TLS por defecto. En entornos regulados es obligatorio cifrar los datos en tránsito. Una **File System Policy** (política de recursos del EFS) permite denegar todas las conexiones que no usen TLS, de forma similar a una bucket policy en S3.
 
 **Requisitos**
 
-1. Crea un rol IAM con la política `AmazonRDSEnhancedMonitoringRole` que permita al agente de RDS enviar métricas a CloudWatch.
-2. Configura `monitoring_interval = 60` en `aws_db_instance.main` (valores válidos: 1, 5, 10, 15, 30, 60 segundos).
-3. Asocia el rol con `monitoring_role_arn`.
-4. Añade un output `monitoring_role_arn`.
+1. Añade un `aws_efs_file_system_policy` que aplique al file system creado por el módulo.
+2. La política debe denegar cualquier acción EFS a cualquier principal si la conexión no usa TLS (`aws:SecureTransport = false`).
+3. Añade un output `efs_policy` que muestre el JSON de la política aplicada.
+
+> El recurso `aws_efs_file_system_policy` va en el **módulo raíz** (`aws/main.tf`) y referencia el file system mediante `module.efs_share.file_system_id`. No es necesario modificar el módulo `efs-share` para este reto.
 
 **Criterios de éxito**
 
-- `aws rds describe-db-instances --query '..MonitoringInterval'` muestra `60`
-- La pestaña **Monitoring** de `lab35-main` en la consola RDS muestra métricas de OS: `Active Memory`, `CPU User`, `Free Memory`, etc.
-- Puedes explicar la diferencia entre métricas de hipervisor (CloudWatch estándar) y métricas de agente OS (Enhanced Monitoring)
+- `aws efs describe-file-system-policy --file-system-id "$EFS_ID"` muestra la política con `Effect: Deny` y condición `aws:SecureTransport`.
+- Un intento de montaje sin TLS (`-o notls`) desde la instancia falla con `access denied`.
 
-### Reto 2 — Snapshot manual y restauración
+### Reto 2 — Segundo Access Point para un equipo diferente
 
-`backup_retention_period = 7` habilita los backups automáticos y la restauración a cualquier punto en el tiempo dentro de esa ventana. Practicar la restauración antes de necesitarla es esencial en producción.
+El módulo `efs-share` gestiona el Access Point de la aplicación principal. Un segundo equipo necesita su propio espacio aislado en el mismo EFS con un UID/GID diferente y un directorio raíz propio.
 
 ### Requisitos
 
-1. Crea un snapshot manual de la instancia principal con `aws rds create-db-snapshot`
-2. Espera a que el snapshot esté en estado `available`
-3. Restaura el snapshot en una instancia nueva `lab35-restored`
-4. Verifica que arranca y contiene la base de datos `appdb`
-5. Elimina la instancia restaurada al terminar
+1. Añade un segundo `aws_efs_access_point` directamente en el **módulo raíz** (`aws/main.tf`), sin modificar el módulo `efs-share`.
+2. Usa `posix_user.uid = 1002`, `posix_user.gid = 1002` y `root_directory.path = "/analytics/data"`.
+3. El directorio debe crearse con `owner_uid = 1002`, `owner_gid = 1002` y `permissions = "750"`.
+4. Añade un output `analytics_access_point_id` con el ID del nuevo Access Point.
 
-> Este reto se realiza completamente con la CLI — no es necesario modificar Terraform.
+> El segundo Access Point referencia el file system del módulo mediante `module.efs_share.file_system_id`.
 
 **Criterios de éxito**
 
-- `aws rds describe-db-snapshots` muestra el snapshot con `Status: available`
-- `aws rds describe-db-instances --db-instance-identifier lab35-restored` muestra estado `available`
-- La instancia restaurada contiene la tabla `customers` con los datos originales
+- `aws efs describe-access-points` muestra dos Access Points: uno con path `/app/data` (UID 1001) y otro con `/analytics/data` (UID 1002).
+- Puedes explicar por qué los dos Access Points garantizan que un proceso con UID 1001 no puede leer los ficheros creados por un proceso con UID 1002, aunque ambos usen el mismo EFS.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Enhanced Monitoring</strong></summary>
+<summary><strong>Solución al Reto 1 — EFS File System Policy</strong></summary>
 
-### Solución al Reto 1 — Enhanced Monitoring
+### Solución al Reto 1 — EFS File System Policy
+
+El recurso `aws_efs_file_system_policy` va en el **módulo raíz** (`aws/main.tf`). No es necesario modificar el módulo `efs-share` porque el file system ID está disponible como output (`module.efs_share.file_system_id`).
 
 Añade en `aws/main.tf`:
 
 ```hcl
-resource "aws_iam_role" "rds_monitoring" {
-  name = "${var.project}-rds-monitoring-role"
+resource "aws_efs_file_system_policy" "tls_only" {
+  file_system_id = module.efs_share.file_system_id
 
-  assume_role_policy = jsonencode({
+  policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "monitoring.rds.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
+    Statement = [
+      {
+        Sid       = "DenyNonTLS"
+        Effect    = "Deny"
+        Principal = { AWS = "*" }
+        Action    = "elasticfilesystem:*"
+        Resource  = module.efs_share.file_system_arn
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      }
+    ]
   })
-
-  tags = local.tags
 }
-
-resource "aws_iam_role_policy_attachment" "rds_monitoring" {
-  role       = aws_iam_role.rds_monitoring.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
-}
-```
-
-Modifica `aws_db_instance.main` añadiendo:
-
-```hcl
-monitoring_interval = 60
-monitoring_role_arn = aws_iam_role.rds_monitoring.arn
 ```
 
 Añade en `aws/outputs.tf`:
 
 ```hcl
-output "monitoring_role_arn" {
-  description = "ARN del rol IAM para Enhanced Monitoring"
-  value       = aws_iam_role.rds_monitoring.arn
+output "efs_policy" {
+  description = "Politica de recursos del EFS (requiere TLS)"
+  value       = aws_efs_file_system_policy.tls_only.policy
 }
 ```
 
@@ -467,57 +458,76 @@ Verifica:
 ```bash
 terraform apply
 
-aws rds describe-db-instances \
-  --db-instance-identifier lab35-main \
-  --query 'DBInstances[0].{Intervalo:MonitoringInterval,RolARN:MonitoringRoleArn}'
+EFS_ID=$(terraform output -raw efs_file_system_id)
+
+# Verifica la política aplicada
+aws efs describe-file-system-policy \
+  --file-system-id "$EFS_ID" \
+  --query Policy --output text | python3 -m json.tool
+
+# Intento de montaje sin TLS — debe fallar con access denied
+# (dentro de la instancia via SSM)
+sudo mkdir /mnt/efs-notls
+sudo mount -t nfs4 \
+  -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+  "$EFS_ID".efs.us-east-1.amazonaws.com:/ /mnt/efs-notls
 ```
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Snapshot manual y restauración</strong></summary>
+<summary><strong>Solución al Reto 2 — Segundo Access Point para un equipo diferente</strong></summary>
 
-### Solución al Reto 2 — Snapshot manual y restauración
+### Solución al Reto 2 — Segundo Access Point para un equipo diferente
+
+El segundo Access Point va en el **módulo raíz** (`aws/main.tf`) referenciando el file system del módulo. No se modifica `modules/efs-share` porque añadir un recurso allí afectaría a todos los usos futuros del módulo; un Access Point adicional es un requisito de este deployment concreto.
+
+Añade en `aws/main.tf`:
+
+```hcl
+resource "aws_efs_access_point" "analytics" {
+  file_system_id = module.efs_share.file_system_id
+
+  posix_user {
+    uid = 1002
+    gid = 1002
+  }
+
+  root_directory {
+    path = "/analytics/data"
+    creation_info {
+      owner_uid   = 1002
+      owner_gid   = 1002
+      permissions = "750"
+    }
+  }
+
+  tags = merge(local.tags, { Name = "${var.project}-analytics-ap" })
+}
+```
+
+Añade en `aws/outputs.tf`:
+
+```hcl
+output "analytics_access_point_id" {
+  description = "ID del EFS Access Point del equipo de analytics"
+  value       = aws_efs_access_point.analytics.id
+}
+```
+
+Verifica:
 
 ```bash
-# Paso 1: Crea el snapshot manual
-aws rds create-db-snapshot \
-  --db-instance-identifier lab35-main \
-  --db-snapshot-identifier lab35-manual-snap-01
+terraform apply
 
-# Paso 2: Espera a que esté disponible (5-10 minutos)
-aws rds wait db-snapshot-available \
-  --db-snapshot-identifier lab35-manual-snap-01
-
-aws rds describe-db-snapshots \
-  --db-snapshot-identifier lab35-manual-snap-01 \
-  --query 'DBSnapshots[0].{ID:DBSnapshotIdentifier,Estado:Status,GB:AllocatedStorage,Fecha:SnapshotCreateTime}'
-
-# Paso 3: Restaura en una instancia nueva
-DB_SUBNET_GROUP=$(aws rds describe-db-instances \
-  --db-instance-identifier lab35-main \
-  --query 'DBInstances[0].DBSubnetGroup.DBSubnetGroupName' --output text)
-
-aws rds restore-db-instance-from-db-snapshot \
-  --db-instance-identifier lab35-restored \
-  --db-snapshot-identifier lab35-manual-snap-01 \
-  --db-instance-class db.t4g.small \
-  --db-subnet-group-name "$DB_SUBNET_GROUP" \
-  --no-publicly-accessible
-
-# Paso 4: Espera a que esté disponible
-aws rds wait db-instance-available \
-  --db-instance-identifier lab35-restored
-
-aws rds describe-db-instances \
-  --db-instance-identifier lab35-restored \
-  --query 'DBInstances[0].{ID:DBInstanceIdentifier,Estado:DBInstanceStatus,Motor:EngineVersion}'
-
-# Limpieza
-aws rds delete-db-instance \
-  --db-instance-identifier lab35-restored \
-  --skip-final-snapshot
+# Lista todos los Access Points del EFS
+aws efs describe-access-points \
+  --file-system-id "$(terraform output -raw efs_file_system_id)" \
+  --query 'AccessPoints[*].{ID:AccessPointId,Path:RootDirectory.Path,UID:PosixUser.Uid,GID:PosixUser.Gid}'
+# Debe mostrar dos entradas: /app/data (1001) y /analytics/data (1002)
 ```
+
+El aislamiento entre Access Points es real a nivel de sistema de archivos POSIX: los ficheros creados por UID 1001 tienen `owner=1001` en los metadatos del EFS. Un proceso con UID 1002 que acceda al directorio `/app/data` recibirá `EACCES` porque los permisos `750` solo conceden acceso al propietario y su grupo — el kernel del cliente NFS aplica las reglas POSIX estándar.
 
 </details>
 
@@ -530,67 +540,56 @@ aws rds delete-db-instance \
 terraform destroy
 ```
 
-> `terraform destroy` puede tardar 15-20 minutos. RDS espera a que la primaria, la réplica y el Multi-AZ standby estén completamente detenidos antes de eliminarlos.
+> Si has montado el EFS en la instancia, desmóntalo antes de destruir:
+> `sudo umount /mnt/efs`
 
 ---
 
-## Gestión de Secretos: configurar la rotación automática
-
-La rotación automática requiere una Lambda de rotación. Para desplegarla desde Serverless Application Repository:
-
-> **Requisito previo — conectividad de la Lambda a la VPC**: la Lambda de rotación necesita acceso de red a la instancia RDS (puerto 5432) y a la API de Secrets Manager. Para ello debe desplegarse dentro de la VPC del laboratorio, en las subnets privadas, con un Security Group que permita el tráfico saliente a RDS y a Secrets Manager (ya sea a través del NAT Gateway o mediante VPC Endpoints). Sin esta configuración la rotación fallará con un error de timeout al intentar conectar con la base de datos.
+## LocalStack
 
 ```bash
-# Paso 1: Crea el change set desde Serverless Application Repository
-CHANGE_SET_ID=$(aws serverlessrepo create-cloud-formation-change-set \
-  --application-id arn:aws:serverlessrepo:us-east-1:297356227824:applications/SecretsManagerRDSPostgreSQLRotationSingleUser \
-  --stack-name secrets-rotation-pg \
-  --parameter-overrides \
-    '[{"Name":"endpoint","Value":"https://secretsmanager.us-east-1.amazonaws.com"},
-      {"Name":"functionName","Value":"SecretsManagerRDSPostgreSQLRotation"}]' \
-  --capabilities CAPABILITY_IAM CAPABILITY_RESOURCE_POLICY \
-  --query ChangeSetId --output text)
+localstack start -d
 
-# Paso 2: Ejecuta el change set
-aws cloudformation execute-change-set --change-set-name "$CHANGE_SET_ID"
-
-# Paso 3: Espera a que el stack esté desplegado (~2 minutos)
-aws cloudformation wait stack-create-complete \
-  --stack-name secrets-rotation-pg
-
-# Paso 4: Obtén el ARN de la Lambda desplegada
-ROTATION_LAMBDA_ARN=$(aws lambda get-function \
-  --function-name SecretsManagerRDSPostgreSQLRotation \
-  --query 'Configuration.FunctionArn' --output text)
-
-echo "Lambda ARN: $ROTATION_LAMBDA_ARN"
-
-# Paso 5: Aplica con rotación habilitada
-terraform apply -var="rotation_lambda_arn=$ROTATION_LAMBDA_ARN"
+# Desde labs/lab-35/localstack/
+terraform fmt
+terraform init
+terraform apply
 ```
+
+Consulta [localstack/README.md](localstack/README.md) para las instrucciones completas de verificación y la tabla de limitaciones.
+
+---
+
+## Comparativa AWS Real vs LocalStack
+
+| Aspecto | AWS Real | LocalStack |
+|---|---|---|
+| EBS gp3 iops/throughput | Rendimiento real desacoplado del tamaño | Parámetros aceptados; sin efecto real |
+| DLM snapshots automáticos | Snapshots reales creados y rotados diariamente | No disponible en Community |
+| EFS cifrado en reposo | Cifrado real con clave KMS gestionada | Configuración aceptada; sin cifrado real |
+| EFS Elastic Throughput | Throughput escala hasta 3 GB/s lectura | Configuración aceptada; sin efecto real |
+| EFS mount targets | Puntos NFS reales accesibles desde EC2 | Recurso creado; sin NFS real |
+| EFS Access Point (POSIX) | Enforcement real en el kernel del cliente NFS | Configuración verificable; sin enforcement real |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- Nunca uses `publicly_accessible = true` en instancias de producción. RDS debe ser accesible solo desde dentro de la VPC a través de subnets privadas.
-- Activa `deletion_protection = true` en producción para evitar borrados accidentales con `terraform destroy`.
-- Usa `skip_final_snapshot = false` con `final_snapshot_identifier` en producción — el snapshot final es la última línea de defensa ante una eliminación accidental.
-- Prefiere IAM Database Authentication sobre contraseñas estáticas en EC2, ECS o Lambda — los tokens son efímeros y no necesitan rotación explícita.
-- Monitoriza `ReplicaLag` en CloudWatch. Un lag creciente indica que la primaria escribe más rápido de lo que la réplica puede procesar.
-- El standby Multi-AZ **no sirve lecturas** — solo existe para failover. Para escalar lecturas usa exclusivamente la Read Replica.
-- Cifra los secretos con una CMK propia en lugar de la clave gestionada por AWS. Esto permite auditar cada operación de descifrado en CloudTrail y revocar el acceso deshabilitando la clave.
-- Expón el botón de failover **solo en entornos de laboratorio**. En producción, el failover manual debe requerir autenticación adicional o ejecutarse desde herramientas de runbook.
+- Etiqueta los volúmenes EBS con `Backup = "true"` desde el primer despliegue para que la política DLM los capture desde el inicio.
+- Despliega siempre un mount target por AZ. Si la AZ de un mount target falla, las instancias en otras AZs siguen accediendo al EFS sin interrupción.
+- Usa `encrypted = true` en EFS aunque los datos no sean sensibles — el coste es cero y simplifica los requisitos de auditoría.
+- Prefiere Access Points sobre montajes directos del root del EFS. El aislamiento POSIX previene errores de configuración que exponen datos entre aplicaciones.
+- Para cargas de trabajo que requieren baja latencia (bases de datos, logs de alta frecuencia), usa EBS. EFS añade latencia de red NFS — es adecuado para ficheros de configuración, assets compartidos y datos de acceso concurrente.
 
 ---
 
 ## Recursos
 
-- [RDS Multi-AZ — AWS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html)
-- [RDS IAM Database Authentication — AWS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)
-- [Secrets Manager Rotation — AWS](https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html)
-- [RDS Storage Autoscaling — AWS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIOPS.StorageTypes.html#USER_PIOPS.Autoscaling)
-- [EC2 Auto Scaling Target Tracking — AWS](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
-- [Terraform: aws_db_instance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/db_instance)
-- [Terraform: aws_autoscaling_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_group)
-- [Terraform: aws_secretsmanager_secret_rotation](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/secretsmanager_secret_rotation)
+- [EBS Volume Types — AWS](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volume-types.html)
+- [AWS DLM — Automate EBS Snapshots](https://docs.aws.amazon.com/ebs/latest/userguide/snapshot-lifecycle.html)
+- [EFS Performance — Throughput Modes](https://docs.aws.amazon.com/efs/latest/ug/performance.html)
+- [EFS Access Points](https://docs.aws.amazon.com/efs/latest/ug/efs-access-points.html)
+- [Terraform: aws_ebs_volume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ebs_volume)
+- [Terraform: aws_dlm_lifecycle_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dlm_lifecycle_policy)
+- [Terraform: aws_efs_file_system](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/efs_file_system)
+- [Terraform: aws_efs_access_point](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/efs_access_point)

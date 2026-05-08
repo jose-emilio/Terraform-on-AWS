@@ -34,7 +34,7 @@ organizado en tres capas de defensa complementarias:
 El resultado es un flujo de trabajo real de GitFlow simplificado donde cada
 cambio a producción tiene al menos dos pares de ojos sobre él.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Aprovisionar un repositorio CodeCommit con estructura inicial de ramas
   (`main` y `develop`) usando Terraform y la CLI de AWS desde `local-exec`.

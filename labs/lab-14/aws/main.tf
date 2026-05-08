@@ -1,162 +1,273 @@
-# ── Locals ──────────────────────────────────────────────────────────────────
+# ── Data Sources ──────────────────────────────────────────────────────────────
+
+data "aws_caller_identity" "current" {}
+
+# ── Locales ───────────────────────────────────────────────────────────────────
+
 locals {
-  common_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "terraform"
+  account_id = data.aws_caller_identity.current.account_id
+  caller_arn = data.aws_caller_identity.current.arn
+
+  tags = {
+    Project   = var.project
+    ManagedBy = "terraform"
   }
 
-  # AZs explícitas para garantizar que las dos subredes privadas caen en
-  # zonas distintas. RDS exige al menos 2 AZs distintas en el subnet group.
-  azs = ["${var.region}a", "${var.region}b"]
+  # Si no se proporcionan administradores explícitos, se usa el caller actual.
+  # Esto garantiza que siempre haya al menos un administrador y evita el error
+  # "The new key policy will not allow you to update the key policy in the future"
+  # que AWS lanza cuando ningún principal tiene kms:PutKeyPolicy.
+  admin_arns = length(var.admin_principal_arns) > 0 ? var.admin_principal_arns : [local.caller_arn]
 }
 
-# ── KMS: Clave maestra para cifrar secretos y almacenamiento ─────────────────
-# Esta clave cifra tres capas: Secrets Manager, el almacenamiento RDS y,
-# una vez exportada su ARN, el backend S3 con el .tfstate.
-resource "aws_kms_key" "secrets" {
-  description             = "CMK para ${var.project_name}: cifra Secrets Manager, RDS y el backend de Terraform"
-  deletion_window_in_days = 7
+# ── Key Policy segregada ──────────────────────────────────────────────────────
+#
+# Una Key Policy en KMS tiene tres roles diferenciados:
+#
+#   1. Root account (Sid "EnableRootAccess"):
+#      La cuenta raíz siempre debe tener acceso total para recuperar el control
+#      ante cambios de policy incorrectos. Sin este statement, si se borran todos
+#      los administradores, la llave queda irrecuperable.
+#
+#   2. Administradores (Sid "AllowKeyAdministration"):
+#      Pueden gestionar el ciclo de vida de la llave (rotación, desactivación,
+#      borrado programado, cambio de policy) pero NO pueden usarla para
+#      cifrar/descifrar datos. La segregación impide que un administrador
+#      de infraestructura pueda leer datos cifrados de producción.
+#
+#   3. Usuarios finales/aplicaciones (Sid "AllowKeyUsage"):
+#      Pueden cifrar y descifrar datos pero NO pueden modificar la policy,
+#      deshabilitar la llave ni programar su borrado. Es el único conjunto
+#      de permisos que debe tener el rol de una aplicación.
+
+data "aws_iam_policy_document" "cmk_policy" {
+  # Statement 1 — Acceso total desde la cuenta raíz
+  statement {
+    sid    = "EnableRootAccess"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${local.account_id}:root"]
+    }
+
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  # Statement 2 — Administradores: gestión del ciclo de vida, sin uso de datos
+  statement {
+    sid    = "AllowKeyAdministration"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = local.admin_arns
+    }
+
+    actions = [
+      "kms:Create*",
+      "kms:Describe*",
+      "kms:Enable*",
+      "kms:List*",
+      "kms:Put*",
+      "kms:Update*",
+      "kms:Revoke*",
+      "kms:Disable*",
+      "kms:Get*",
+      "kms:Delete*",
+      "kms:TagResource",
+      "kms:UntagResource",
+      "kms:ScheduleKeyDeletion",
+      "kms:CancelKeyDeletion",
+    ]
+
+    resources = ["*"]
+  }
+
+  # Statement 3 — Usuarios finales: solo cifrado/descifrado
+  # Se omite si app_principal_arns está vacío (condition evita policy inválida).
+  dynamic "statement" {
+    for_each = length(var.app_principal_arns) > 0 ? [1] : []
+    content {
+      sid    = "AllowKeyUsage"
+      effect = "Allow"
+
+      principals {
+        type        = "AWS"
+        identifiers = var.app_principal_arns
+      }
+
+      actions = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey",
+      ]
+
+      resources = ["*"]
+    }
+  }
+
+  # Statement 4 — Permite que los servicios AWS (S3, EBS) usen la CMK
+  # cuando el acceso viene de una solicitud de esos servicios en la misma cuenta.
+  statement {
+    sid    = "AllowAWSServicesViaGrants"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${local.account_id}:root"]
+    }
+
+    actions = [
+      "kms:CreateGrant",
+      "kms:ListGrants",
+      "kms:RevokeGrant",
+    ]
+
+    resources = ["*"]
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+  }
+}
+
+# ── Customer Managed Key (CMK) ────────────────────────────────────────────────
+#
+# enable_key_rotation = true: KMS rota automáticamente el material criptográfico
+# cada año. El alias y el Key ID permanecen igual — no hay cambios en el código.
+# Los datos cifrados con material antiguo siguen siendo descifrables porque KMS
+# mantiene todos los materiales históricos.
+#
+# deletion_window_in_days = 7: el mínimo que permite AWS (default = 30).
+# Durante esta ventana la llave está deshabilitada pero no eliminada, lo que
+# permite cancelar un borrado accidental con kms:CancelKeyDeletion.
+#
+# multi_region = false: llave regional. Para replicar datos cifrados entre
+# regiones se necesitaría multi_region = true + aws_kms_replica_key.
+
+resource "aws_kms_key" "main" {
+  description             = "CMK del Lab13 — cifrado de EBS y S3"
   enable_key_rotation     = true
+  deletion_window_in_days = 7
+  multi_region            = false
+  policy                  = data.aws_iam_policy_document.cmk_policy.json
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_name}-secrets-cmk"
-  })
+  tags = merge(local.tags, { Name = "${var.project}-cmk" })
 }
 
-resource "aws_kms_alias" "secrets" {
-  name          = "alias/${var.project_name}-secrets"
-  target_key_id = aws_kms_key.secrets.key_id
+# ── Alias ─────────────────────────────────────────────────────────────────────
+#
+# El alias es un nombre amigable que apunta al Key ID.
+# Cuando se rota el material criptográfico o se sustituye la CMK por otra
+# (por ejemplo tras un incidente), basta con apuntar el alias a la nueva llave.
+# Todo el código que referencia "alias/lab14-main" sigue funcionando sin cambios.
+#
+# Convención de nombres: alias/<proyecto>-<propósito>
+# Prefijo "alias/" es obligatorio y gestionado automáticamente por Terraform.
+
+resource "aws_kms_alias" "main" {
+  name          = "alias/${var.project}-main"
+  target_key_id = aws_kms_key.main.key_id
 }
 
-# ── Contraseña criptográficamente segura ────────────────────────────────────
-# random_password genera entropía real del sistema operativo subyacente.
-# El resultado se almacena cifrado en el estado de Terraform; nunca aparece
-# en variables del operador ni en la salida del plan.
-resource "random_password" "db" {
-  length  = 32
-  special = true
-  # Excluimos caracteres que rompen cadenas de conexión MySQL/JDBC:
-  # @, ', ", /, \, `, ^, ~, |, espacio
-  override_special = "!#$%&*()-_=+[]{}<>:?"
+# ── Volumen EBS cifrado con la CMK ────────────────────────────────────────────
+#
+# encrypted = true + kms_key_id = alias ARN fuerzan el cifrado con la CMK.
+# Si se omite kms_key_id pero se pone encrypted = true, AWS usa la llave
+# gestionada por el servicio (aws/ebs) en lugar de la CMK personalizada.
+#
+# Diferencias CMK vs llave gestionada por servicio:
+#   - CMK: control total de la policy, rotación configurable, auditable en CloudTrail.
+#   - aws/ebs: sin control de policy, rotación automática por AWS, menor visibilidad.
+
+resource "aws_ebs_volume" "main" {
+  availability_zone = var.availability_zone
+  size              = var.ebs_volume_size_gb
+  type              = "gp3"
+  encrypted         = true
+  kms_key_id        = aws_kms_alias.main.arn
+
+  tags = merge(local.tags, { Name = "${var.project}-ebs" })
 }
 
-# ── Secrets Manager: contenedor del secreto ─────────────────────────────────
-resource "aws_secretsmanager_secret" "db" {
-  name        = "${var.project_name}/rds/master-credentials"
-  description = "Credenciales maestras de RDS para ${var.project_name} - gestionadas por Terraform"
-  kms_key_id  = aws_kms_key.secrets.key_id
+# ── Bucket S3 cifrado con la CMK ──────────────────────────────────────────────
+#
+# apply_server_side_encryption_by_default: cifra todos los objetos nuevos con
+# la CMK especificada (SSE-KMS). Los objetos ya existentes no se re-cifran.
+#
+# bucket_key_enabled = true: activa S3 Bucket Key, que reduce las llamadas a
+# la API de KMS generando una llave de datos temporal a nivel de bucket.
+# Reduce el coste de KMS hasta un 99% en buckets con alta densidad de objetos.
 
-  # En entorno de lab se elimina sin período de recuperación para facilitar
-  # redeployments. En producción usa recovery_window_in_days = 30.
-  recovery_window_in_days = 0
+resource "aws_s3_bucket" "main" {
+  bucket        = "${var.project}-data-${local.account_id}"
+  force_destroy = true
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_name}-db-credentials"
-  })
+  tags = merge(local.tags, { Name = "${var.project}-data" })
 }
 
-# ── Secrets Manager: versión con credenciales en formato JSON ────────────────
-# El secreto incluye todos los datos necesarios para conectar a la base de
-# datos. Las aplicaciones recuperan este JSON sin conocer la contraseña en
-# tiempo de despliegue.
-resource "aws_secretsmanager_secret_version" "db" {
-  secret_id = aws_secretsmanager_secret.db.id
+resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
+  bucket = aws_s3_bucket.main.id
 
-  secret_string = jsonencode({
-    username = var.db_username
-    password = random_password.db.result
-    engine   = "mysql"
-    host     = aws_db_instance.main.address
-    port     = 3306
-    dbname   = var.db_name
-  })
-}
-
-# ── Red mínima para RDS ─────────────────────────────────────────────────────
-
-resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-
-  tags = merge(local.common_tags, { Name = "${var.project_name}-vpc" })
-}
-
-resource "aws_subnet" "private" {
-  count = 2
-
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 8, count.index)
-  availability_zone = local.azs[count.index]
-
-  tags = merge(local.common_tags, {
-    Name = "${var.project_name}-private-${local.azs[count.index]}"
-    Tier = "private"
-  })
-}
-
-resource "aws_db_subnet_group" "main" {
-  name       = "${var.project_name}-db-subnet-group"
-  subnet_ids = aws_subnet.private[*].id
-
-  tags = merge(local.common_tags, {
-    Name = "${var.project_name}-db-subnet-group"
-  })
-}
-
-resource "aws_security_group" "rds" {
-  name        = "${var.project_name}-rds-sg"
-  description = "Acceso a RDS restringido al CIDR interno de la VPC"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    from_port   = 3306
-    to_port     = 3306
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-    description = "MySQL desde la VPC"
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_alias.main.arn
+    }
+    bucket_key_enabled = true
   }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Salida sin restricciones"
-  }
-
-  tags = merge(local.common_tags, { Name = "${var.project_name}-rds-sg" })
 }
 
-# ── RDS: inyección directa de la contraseña desde random_password ────────────
-# La contraseña nunca aparece como variable de entrada del operador.
-# Terraform la genera, la cifra en el estado (via KMS si el backend está
-# configurado correctamente) y la inyecta directamente en RDS y en el secreto.
-resource "aws_db_instance" "main" {
-  identifier = "${var.project_name}-db"
+# Bloqueo de acceso público: el bucket es privado por defecto.
+resource "aws_s3_bucket_public_access_block" "main" {
+  bucket                  = aws_s3_bucket.main.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
 
-  engine         = "mysql"
-  engine_version = "8.0"
-  instance_class = "db.t3.micro"
+# Política de bucket: deniega explícitamente cualquier carga de objeto que
+# no use SSE-KMS. Esto impide que un cliente suba objetos sin cifrado o
+# con una llave diferente, garantizando el cifrado forzoso.
+resource "aws_s3_bucket_policy" "enforce_kms" {
+  bucket = aws_s3_bucket.main.id
 
-  allocated_storage     = 20
-  max_allocated_storage = 100
-  storage_encrypted     = true
-  kms_key_id            = aws_kms_key.secrets.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyNonKMSUploads"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.main.arn}/*"
+        Condition = {
+          StringNotEqualsIfExists = {
+            "s3:x-amz-server-side-encryption" = "aws:kms"
+          }
+        }
+      },
+      {
+        Sid       = "DenyWrongKMSKey"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.main.arn}/*"
+        Condition = {
+          StringNotEqualsIfExists = {
+            "s3:x-amz-server-side-encryption-aws-kms-key-id" = aws_kms_key.main.arn
+          }
+        }
+      }
+    ]
+  })
 
-  db_name  = var.db_name
-  username = var.db_username
-  password = random_password.db.result # <- Zero-Touch: inyeccion directa
-
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-
-  # Configuración simplificada para entorno de lab
-  skip_final_snapshot     = true
-  deletion_protection     = false
-  backup_retention_period = 0
-  multi_az                = false
-
-  tags = merge(local.common_tags, { Name = "${var.project_name}-db" })
+  depends_on = [aws_s3_bucket_public_access_block.main]
 }

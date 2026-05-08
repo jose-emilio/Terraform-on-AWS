@@ -1,4 +1,4 @@
-# Laboratorio 39 — Despliegue Global y Adopción de Infraestructura Existente
+# Laboratorio 39 — Ingeniería de Datos y Resiliencia con Lifecycle
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,48 +8,67 @@
 
 ## Visión general
 
-En proyectos reales, Terraform rara vez opera sobre una única región ni
-parte de cero. Este laboratorio aborda dos situaciones que aparecen juntas
-con frecuencia al madurar un proyecto de infraestructura:
+Las configuraciones de red reales no son listas planas de recursos: son
+estructuras jerarquicas (entornos → VPCs → subredes) con etiquetas que
+combinan políticas corporativas y especificaciones de departamento. Gestionar
+esta complejidad con `count` o con múltiples bloques `resource` duplicados
+produce codigo fragil y dificil de mantener.
 
-1. **Despliegue global**: usar múltiples alias de proveedor para crear recursos
-   simultaneamente en `us-east-1` y `eu-west-3` desde un único `terraform apply`.
+Este laboratorio introduce siete herramientas de Terraform que, combinadas,
+permiten gestionar esa complejidad de forma declarativa y robusta:
 
-2. **Drift y sincronizacion**: alguien modifica un tag directamente en la consola
-   de AWS sin pasar por Terraform. El estado queda desincronizado con la realidad
-   (*drift*). `terraform plan -refresh-only` detecta la discrepancia y
-   `terraform apply -refresh-only` la resuelve sin tocar la infraestructura real.
+1. **Flatten Pattern**: transforma un mapa anidado (VPCs con subredes) en
+   una lista plana apta para `for_each`, eliminando la necesidad de bloques
+   resource duplicados por VPC.
 
-3. **Adopción de recursos existentes**: un bucket S3 fue creado manualmente antes
-   de que el equipo adoptara Terraform. El nuevo bloque `import` (Terraform 1.5+)
-   junto con la opción `-generate-config-out` permiten incorporarlo al estado
-   y generar automáticamente el código HCL necesario, sin borrar ni recrear nada.
+2. **`merge()`**: fusiona etiquetas corporativas globales con etiquetas
+   especificas de departamento en cada recurso, sin repetir codigo.
 
-## Objetivos
+3. **`optional()`**: permite definir variables con atributos opcionales y
+   valores por defecto, haciendo las configuraciones flexibles sin sacrificar
+   el tipado estricto.
 
-- Configurar dos bloques `provider "aws"` con alias distintos para desplegar
-  recursos simultaneamente en `us-east-1` (`aws.primary`) y `eu-west-3`
-  (`aws.secondary`).
-- Entender por que todos los recursos deben declarar `provider` explicito cuando
-  no hay proveedor sin alias.
-- Simular drift modificando un tag manualmente en la consola de S3 y detectarlo
-  con `terraform plan -refresh-only`.
-- Aplicar `terraform apply -refresh-only` para sincronizar el estado con la
-  realidad sin generar cambios en la infraestructura.
-- Usar el bloque `import {}` de Terraform 1.5+ para declarar la intencion de
-  adoptar un recurso existente.
-- Ejecutar `terraform plan -generate-config-out=generated.tf` para que Terraform
-  escriba automáticamente el bloque `resource` completo del recurso importado.
-- Revisar, ajustar e integrar el HCL generado al codigo del proyecto.
-- Completar el flujo de adopción con `terraform apply` y verificar que el recurso
-  queda gestionado sin haber sido recreado.
+4. **`precondition` / `postcondition`**: validan invariantes en tiempo de
+   ejecución — la precondición aborta el plan si la AZ elegida no está
+   autorizada; la postcondición verifica que la instancia tiene IP pública
+   tras el apply.
+
+5. **`try()` / `can()`**: acceso seguro a valores que pueden ser nulos o
+   estructuras que pueden no existir, sin abortar el plan con errores de
+   tipo o atributo nulo.
+
+6. **`check {}`**: healthcheck post-apply que verifica que las subredes
+   publicas tienen ruta a Internet, emitiendo advertencia sin bloquear
+   el despliegue.
+
+7. **`lifecycle { ignore_changes }`**: protege las tags de VPCs y subredes
+   frente a modificaciones automaticas de AWS Organizations, EKS y otras
+   herramientas de gobernanza.
+
+## Objetivos de aprendizaje
+
+- Implementar el Flatten Pattern con `flatten()` y expresiones `for` anidadas
+  para transformar `map(map(object))` en `map(object)` apto para `for_each`.
+- Usar `merge()` para combinar etiquetas corporativas y de departamento sin
+  duplicar codigo.
+- Definir una variable con atributos `optional()` con valores por defecto.
+- Escribir una `precondition` que valide la zona de disponibilidad antes del
+  plan y produzca un mensaje de error descriptivo.
+- Escribir una `postcondition` que verifique la asignacion de IP publica
+  tras el apply usando `self`.
+- Usar `try()` para acceso defensivo a valores opcionales y `can()` para
+  centralizar logica condicional en locals.
+- Implementar un bloque `check {}` con data source interno para verificar
+  la conectividad de red post-apply.
+- Configurar `lifecycle { ignore_changes }` para proteger tags gestionadas
+  por herramientas externas a Terraform.
+- Entender cuando usar cada mecanismo de validación y por qué son complementarios.
 
 ## Requisitos previos
 
-- **Terraform >= 1.10** instalado (`import {}` + `-generate-config-out`: 1.5, `use_lockfile` en backend S3: 1.10).
+- **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3).
 - AWS CLI configurado con perfil `default`.
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Permisos IAM sobre S3 y SSM Parameter Store en **ambas regiones**.
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -58,178 +77,261 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 
 ## Arquitectura
 
-![Multi-región con dos provider aliases (primary us-east-1 + secondary eu-west-3) + adopción de bucket legacy con bloque import {}](arch/diagrama.svg)
+![Flatten pattern (var.vpc_config jerárquico → maps planos) + ignore_changes en tags + EC2 monitoring con precondition/postcondition + check block final](arch/diagrama.svg)
 
-Un solo proyecto Terraform gestiona dos regiones simultáneamente con `provider "aws"` declarado dos veces con `alias = "primary"` y `alias = "secondary"`. Cada recurso de `main.tf` declara explícitamente `provider = aws.primary | aws.secondary` (no hay default — sin ambigüedad). En cada región se replica el mismo patrón: bucket S3 (sufijo `-use1` / `-euw3`) con versionado y `public_access_block` + un parámetro SSM con la región activa para descubrirse en runtime. Por separado, un **bucket legacy** creado fuera de Terraform con AWS CLI se adopta al state mediante `import { provider = aws.primary, to = ..., id = ... }` + `terraform plan -generate-config-out=generated.tf`, que escribe el bloque `resource` derivado para revisar y mover a `main.tf`. El recurso queda gestionado sin destruirse ni recrearse.
+`var.vpc_config` es una estructura jerárquica (entornos → VPCs → subredes); `locals.tf` la transforma con un **flatten pattern** en mapas planos (`vpcs_map` y `subnets_map` con clave compuesta `vpc_key/subnet_key`) para que un único bloque `aws_vpc.this` y un único `aws_subnet.this` con `for_each` generen todos los recursos. Cada VPC y subred lleva `lifecycle.ignore_changes` sobre tags concretas (`CreatedBy`, `aws:cloudformation:*`, `kubernetes.io/role/elb` …) — sin eso, el siguiente apply borraría tags añadidas por AWS Organizations / EKS. Una EC2 de monitoreo opcional combina **precondition** (AZ en lista autorizada, antes del plan), **postcondition** (`public_ip` no nula, tras crear) y un bloque **check** al final del apply que valida la ruta a Internet de la subred pública sin bloquear si falla — solo emite warning.
 
 ## Conceptos clave
 
-### Alias de proveedor
+### Flatten Pattern
 
-Cuando necesitas recursos en varias regiones dentro de la misma configuración,
-declaras varios bloques `provider` del mismo tipo con aliases distintos:
-
-```hcl
-provider "aws" {
-  alias  = "primary"
-  region = "us-east-1"
-}
-
-provider "aws" {
-  alias  = "secondary"
-  region = "eu-west-3"
-}
-```
-
-Cada recurso declara a cual de los dos proveedores pertenece:
+El problema de iterar sobre estructuras anidadas:
 
 ```hcl
-resource "aws_s3_bucket" "mi_bucket" {
-  provider = aws.primary   # aws.<alias>
-  bucket   = "mi-bucket"
+variable "vpc_config" {
+  type = map(object({
+    cidr_block = string
+    subnets    = map(object({ ... }))  # mapa dentro de mapa
+  }))
+}
+
+# INCORRECTO: for_each sobre el mapa externo crea VPCs, no subredes
+resource "aws_subnet" "this" {
+  for_each = var.vpc_config   # ← itera sobre VPCs, no sobre subredes
 }
 ```
 
-**Regla importante**: cuando todos los bloques `provider` tienen alias, no
-existe proveedor por defecto. Cualquier recurso que omita `provider` causara un
-error `No default provider configured`. Debes ser explicito en cada recurso.
-
-| Situación | Comportamiento |
-|---|---|
-| Un bloque sin alias | Es el proveedor por defecto; los recursos sin `provider` lo usan |
-| Todos con alias | No hay proveedor por defecto; todos los recursos deben declarar `provider` |
-| Mezcla | El bloque sin alias es el default; los bloques con alias son adicionales |
-
-### Data sources con alias de proveedor
-
-Los data sources tambien deben declarar `provider` cuando no hay proveedor por
-defecto. `aws_caller_identity` se usa en el proveedor primario porque el
-Account ID es el mismo en todas las regiones:
+La solución es aplanar la estructura antes de iterar:
 
 ```hcl
-data "aws_caller_identity" "current" {
-  provider = aws.primary
+locals {
+  # Paso 1: flatten de lista de listas → lista plana
+  subnets_flat = flatten([
+    for vpc_key, vpc in var.vpc_config : [      # for externo: VPCs
+      for subnet_key, subnet in vpc.subnets : { # for interno: subredes
+        key      = "${vpc_key}/${subnet_key}"   # clave compuesta unica
+        vpc_key  = vpc_key
+        cidr     = subnet.cidr_block
+        # ... resto de atributos
+      }
+    ]
+  ])
+
+  # Paso 2: lista → mapa (for_each requiere mapa, no lista)
+  subnets_map = {
+    for s in local.subnets_flat : s.key => s
+  }
+}
+
+# CORRECTO: for_each sobre el mapa plano crea una subred por entrada
+resource "aws_subnet" "this" {
+  for_each = local.subnets_map
+  cidr_block = each.value.cidr
+  vpc_id     = aws_vpc.this[each.value.vpc_key].id
 }
 ```
 
-### Drift y `terraform plan -refresh-only`
+**Por que clave compuesta**: usar `"vpc_key/subnet_key"` como clave garantiza
+unicidad global (dos VPCs pueden tener una subred llamada `"public-a"`) y
+produce direcciones de estado semanticas y estables:
+`aws_subnet.this["networking/public-a"]`.
 
-**Drift** es la discrepancia entre lo que Terraform registra en el estado
-(`.tfstate`) y el estado real de la infraestructura en el proveedor.
-
-Se produce cuando alguien modifica un recurso directamente en la consola,
-con AWS CLI, o mediante otra herramienta fuera del flujo de Terraform.
-
-```
-Estado Terraform            Realidad en AWS
-────────────────────────    ──────────────────────────────
-Owner = "platform-team"     Owner = "devops-team"   ← drift
-```
-
-`terraform plan` normal detecta drift pero mezcla los cambios de drift con
-los cambios de codigo, lo que puede generar confusión. La opción `-refresh-only`
-separa ambas preocupaciones:
-
-```bash
-# Solo muestra lo que ha cambiado en AWS respecto al estado almacenado.
-# No propone cambios de codigo. No toca la infraestructura real.
-terraform plan -refresh-only
-
-# Aplica solo la actualizacion del estado para que refleje la realidad actual.
-# No modifica ningun recurso en AWS — solo reescribe el fichero .tfstate.
-terraform apply -refresh-only
-```
-
-**¿Cuándo usar cada opción?**:
-
-| Opción | Cuándo usarla |
-|---|---|
-| `terraform plan` | Proponer cambios de codigo a aplicar |
-| `terraform plan -refresh-only` | Auditar drift sin proponer cambios de codigo |
-| `terraform apply -refresh-only` | Aceptar el drift actual como estado correcto |
-| `terraform apply` (despues del -refresh-only) | Revertir el drift aplicando el codigo como fuente de verdad |
-
-Si quieres **revertir** el drift (volver al estado declarado en el codigo),
-no uses `-refresh-only`; simplemente ejecuta `terraform apply` normal. Terraform
-detectara la diferencia y restaurara el tag al valor del codigo.
-
-### Bloque `import` (Terraform 1.5+)
-
-El bloque `import` sustituye al comando `terraform import` (que sigue existiendo
-pero es mas limitado). La ventaja del bloque declarativo es que se puede revisar
-en pull request y forma parte del codigo fuente:
+### `merge()` para etiquetas por capas
 
 ```hcl
-import {
-  provider = aws.primary          # obligatorio cuando no hay proveedor default
-  to       = aws_s3_bucket.legacy_logs   # direccion del recurso en el estado
-  id       = "nombre-del-bucket"         # identificador unico en AWS
+tags = merge(
+  # Capa 1 — etiquetas de departamento (menor prioridad)
+  {
+    Department  = subnet.department_tags.department
+    BillingCode = subnet.department_tags.billing_code
+  },
+  # Capa 2 — etiquetas de identificacion (mayor prioridad)
+  # Si BillingCode aparece en ambas capas, gana la ultima
+  {
+    Name = "${var.project}-${each.key}"
+  }
+)
+```
+
+`merge()` acepta cualquier numero de mapas y da **prioridad al ultimo
+argumento** en caso de colision de claves. Las etiquetas corporativas
+(ManagedBy, Project, Environment) llegan automáticamente a todos los
+recursos via `default_tags` del provider, sin necesidad de incluirlas
+en cada `merge()`.
+
+### `optional()` en tipos de objeto
+
+Sin `optional()`, todos los atributos de un `object` son obligatorios:
+
+```hcl
+# SIN optional(): el operador debe especificar todos los campos
+variable "monitoring_config" {
+  type = object({
+    enabled       = bool
+    instance_type = string   # obligatorio — error si se omite
+    alarm_email   = string   # obligatorio — error si se omite
+  })
+}
+
+# CON optional(): solo 'enabled' es obligatorio
+variable "monitoring_config" {
+  type = object({
+    enabled       = bool
+    instance_type = optional(string, "t4g.micro")  # default si se omite
+    alarm_email   = optional(string, null)          # null si se omite
+  })
+}
+
+# Ahora el operador puede especificar solo lo que necesita:
+monitoring_config = {
+  enabled = true
+  # instance_type usa "t4g.micro" por defecto
+  # alarm_email es null — no se creara alarma
 }
 ```
 
-**El bloque `import` solo declara la intencion** — Terraform no adopta el recurso
-hasta que existe el bloque `resource` correspondiente en el codigo. Si ejecutas
-`plan` con el bloque `import` pero sin el `resource`, Terraform falla con
-`Configuration for import target does not exist`.
+### `precondition`: validación antes del plan
 
-### `-generate-config-out`: generación automática de HCL
-
-La opción `-generate-config-out` resuelve el problema de tener que escribir
-manualmente el bloque `resource` para un recurso existente (que puede tener
-decenas de atributos):
-
-```bash
-terraform plan -generate-config-out=generated.tf
+```hcl
+resource "aws_instance" "monitoring" {
+  lifecycle {
+    precondition {
+      condition     = contains(var.allowed_azs, var.chosen_az)
+      error_message = "La AZ '${var.chosen_az}' no esta autorizada."
+    }
+  }
+}
 ```
 
-Terraform inspecciona el recurso real en AWS, lee todos sus atributos y escribe
-un bloque `resource` completo en `generated.tf`. El fichero generado:
+- Se evalua durante `terraform plan`, antes de crear el recurso.
+- Si falla, **el plan se aborta** con el mensaje de error definido.
+- No tiene acceso a `self` — el recurso aun no existe.
+- Util para validar configuraciones que si fueran incorrectas causarian
+  un error críptico de AWS o un recurso mal configurado.
 
-- Incluye **todos** los atributos del recurso, incluidos los calculados por AWS.
-- Puede contener atributos que no son necesarios o que conviene reemplazar por
-  referencias a variables.
-- Es un punto de partida que debes **revisar y limpiar** antes de integrarlo
-  al codigo del proyecto.
+### `postcondition`: verificacion despues del apply
 
-**Flujo completo**:
-
-```
-1. Crear recurso fuera de Terraform (AWS CLI / consola)
-          │
-          ▼
-2. Escribir bloque import {} en main.tf
-   (SIN bloque resource todavia)
-          │
-          ▼
-3. terraform plan -generate-config-out=generated.tf
-   Terraform escribe el resource completo en generated.tf
-          │
-          ▼
-4. Revisar generated.tf:
-   - Eliminar atributos de solo lectura (id, arn, etc.) si causan errores
-   - Reemplazar valores hardcoded por variables o referencias
-   - Ajustar tags al estandar del proyecto
-          │
-          ▼
-5. Mover el bloque resource de generated.tf a main.tf
-   Eliminar (o comentar) el bloque import {}
-          │
-          ▼
-6. terraform plan  →  "1 to import, 0 to add, 0 to change, 0 to destroy"
-          │
-          ▼
-7. terraform apply  →  recurso adoptado en el estado sin recreacion
+```hcl
+resource "aws_instance" "monitoring" {
+  lifecycle {
+    postcondition {
+      condition     = self.public_ip != null && self.public_ip != ""
+      error_message = "La instancia ${self.id} no tiene IP publica."
+    }
+  }
+}
 ```
 
-### Diferencia entre `terraform import` (comando) y bloque `import`
+- Se evalua durante `terraform apply`, despues de crear o actualizar el recurso.
+- Si falla, **el apply se aborta** y el recurso queda marcado como tainted.
+- Tiene acceso completo a `self` — todos los atributos del recurso creado.
+- Útil para verificar invariantes que AWS debería garantizar pero que quieres
+  comprobar explicitamente (IP asignada, ARN no vacio, estado `available`...).
 
-| | Comando `terraform import` | Bloque `import {}` |
+### Diferencia entre `precondition`, `postcondition` y `variable validation`
+
+| Mecanismo | Cuando se evalua | Acceso a `self` | Si falla |
+|---|---|---|---|
+| `variable validation` | Al parsear la variable | No | Error antes del plan |
+| `precondition` | Durante `plan` | No | Plan abortado |
+| `postcondition` | Durante `apply` | Si | Apply abortado, recurso tainted |
+| `check {}` | Al final del apply | No (usa data source) | Advertencia, no aborta |
+
+### `try()` y `can()` — acceso defensivo a valores opcionales
+
+Cuando navegas estructuras anidadas con valores opcionales, un atributo `null`
+o un indice inexistente produce un error que aborta el plan. `try()` y `can()`
+permiten manejar esos casos sin codigo defensivo verboso:
+
+```hcl
+# SIN try(): si alarm_email es null, esto falla con "attempt to call null"
+count = var.monitoring_config.alarm_email != null ? 1 : 0
+
+# CON try(): si la expresion falla por cualquier razon, devuelve el fallback
+alarm_email = try(var.monitoring_config.alarm_email, null)
+
+# can(): devuelve true/false si la expresion es evaluable sin error
+# Util para centralizar logica condicional en locals
+monitoring_alarm_enabled = (
+  var.monitoring_config.enabled &&
+  can(var.monitoring_config.alarm_email) &&
+  var.monitoring_config.alarm_email != null
+)
+```
+
+**¿Cuándo usar cada uno?**:
+
+| Función | Devuelve | Caso de uso típico |
 |---|---|---|
-| Versión mínima | Terraform 0.13+ | Terraform 1.5+ |
-| Genera HCL | No (debes escribirlo tu) | Si, con `-generate-config-out` |
-| Forma parte del codigo | No (es un comando imperativo) | Si (declarativo, revisable en PR) |
-| Requiere resource previo | Si | No puede generarlo automáticamente) |
-| Reversible en plan | No | Si (se puede hacer plan sin aplicar) |
+| `try(expr, fallback)` | El valor o el fallback | Acceso a atributos opcionales o potencialmente nulos |
+| `can(expr)` | `true` / `false` | Condiciones en `count`, `for_each` o `if` dentro de `for` |
+
+> **Advertencia**: `try()` silencia **cualquier** error, no solo los de tipo
+> nulo. Usarlo con expresiones complejas puede ocultar errores reales de logica.
+> Prefiere `try()` en expresiones simples de acceso a atributos.
+
+### `check {}` — healthcheck post-apply no bloqueante
+
+A diferencia de `postcondition` (que falla el apply si la condición no se
+cumple), `check {}` emite una advertencia y deja que el apply termine.
+Es el mecanismo correcto para verificar invariantes que no debes considerar
+errores fatales pero si quieres monitorizar:
+
+```hcl
+check "public_subnet_has_internet_route" {
+  # Data source interno — se evalua al final del apply
+  data "aws_route_table" "check" {
+    subnet_id = aws_subnet.this["networking/public-a"].id
+  }
+
+  assert {
+    condition = anytrue([
+      for route in data.aws_route_table.check.routes :
+      route.cidr_block == "0.0.0.0/0" && route.gateway_id != null
+    ])
+    error_message = "La subred publica no tiene ruta a Internet."
+  }
+}
+```
+
+Cuando el assert falla, el apply produce:
+
+```
+╷
+│ Warning: Check block assertion failed
+│
+│   check.public_subnet_has_internet_route
+│
+│ La subred publica no tiene ruta a Internet.
+╵
+```
+
+### `lifecycle { ignore_changes }` — protección frente a drift externo
+
+Las herramientas de gobernanza de AWS (Organizations, Security Hub, EKS,
+CloudFormation StackSets) añaden tags automáticamente a los recursos. Sin
+`ignore_changes`, Terraform las detecta como drift en el siguiente plan y
+las elimina, rompiendo las políticas corporativas:
+
+```hcl
+resource "aws_subnet" "this" {
+  # ...
+  lifecycle {
+    # Ignorar tags individuales sin ignorar el bloque tags completo.
+    # Si ignoras tags["*"] o todo el bloque tags, Terraform dejaria de
+    # detectar cambios legitimos en las tags que tu gestionas.
+    ignore_changes = [
+      tags["CreatedBy"],                          # anadida por AWS Organizations
+      tags["aws:cloudformation:stack-name"],       # anadida por CloudFormation
+      tags["kubernetes.io/role/elb"],              # anadida por EKS
+    ]
+  }
+}
+```
+
+**Regla practica**: ignora solo las tags cuya clave conoces y que sabes que
+son gestionadas externamente. No uses `ignore_changes = [tags]` (bloque
+completo) porque ocultaria cualquier cambio en las tags que si gestionas.
 
 ## Estructura del proyecto
 
@@ -239,26 +341,20 @@ lab-39/
 ├── arch/
 │   └── diagrama.svg         # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf        # Terraform >= 1.10 + dos alias de proveedor AWS ~> 6.0
-│   ├── variables.tf        # primary_region, secondary_region, project, environment, legacy_bucket_name
-│   ├── main.tf             # Recursos multi-region + bloque import (comentado)
-│   ├── outputs.tf          # ARNs, nombres de bucket, comandos de verificacion
-│   └── aws.s3.tfbackend    # Configuracion parcial del backend S3
+│   ├── providers.tf        # Terraform >= 1.10 + default_tags corporativas
+│   ├── variables.tf        # vpc_config (mapa anidado), monitoring_config (optional)
+│   ├── locals.tf           # Flatten Pattern + merge() + try() + can()
+│   ├── main.tf             # VPCs, subredes, route tables, instancia, check {}
+│   ├── outputs.tf          # IDs, claves del flatten, tags fusionadas, billing codes
+│   └── aws.s3.tfbackend    # Backend S3
 └── README.md
 ```
 
-Durante el Paso 4 (importacion), Terraform generara un fichero adicional:
+---
 
-```
-lab-39/
-└── aws/
-    └── generated.tf        # Generado automaticamente por -generate-config-out
-                            # Revisar, limpiar e integrar en main.tf
-```
+## Despliegue en AWS
 
-## Despliegue en AWS real
-
-### Paso 1 — Inicializar y desplegar la infraestructura multi-región
+### Paso 1 — Inicializar y desplegar
 
 ```bash
 cd labs/lab-39/aws
@@ -274,820 +370,796 @@ terraform plan
 terraform apply
 ```
 
-Durante el apply, observa como Terraform lanza llamadas API a dos regiones
-distintas en paralelo:
+El apply crea **9 recursos**:
+- 2 VPCs (`networking`, `data`)
+- 5 subredes (3 en `networking`, 2 en `data`) — generadas por el Flatten Pattern
+- 1 Internet Gateway para el VPC `networking` (tiene subredes publicas)
+- 1 Security Group para la instancia de monitoreo
+- 1 Security Group Egress Rule
+- 1 instancia EC2 de monitoreo
 
-```
-aws_s3_bucket.artifacts_primary: Creating...   [us-east-1]
-aws_s3_bucket.artifacts_secondary: Creating... [eu-west-3]
-aws_ssm_parameter.config_primary: Creating...  [us-east-1]
-aws_ssm_parameter.config_secondary: Creating.. [eu-west-3]
-...
-Apply complete! Resources: 8 added, 0 changed, 0 destroyed.
-```
+---
 
-### Paso 2 — Verificar recursos en ambas regiones
+### Paso 2 — Inspeccionar el resultado del Flatten Pattern
 
 ```bash
-# Outputs con los nombres de bucket y los comandos de verificacion
-terraform output
+# Ver las claves compuestas generadas por el flatten
+terraform output flattened_subnets_keys
+# Esperado:
+# tolist([
+#   "data/db-a",
+#   "data/db-b",
+#   "networking/private-a",
+#   "networking/public-a",
+#   "networking/public-b",
+# ])
 
-# Verificar el bucket primario (us-east-1)
-PRIMARY_BUCKET=$(terraform output -raw primary_bucket_name)
-aws s3api get-bucket-location --bucket "${PRIMARY_BUCKET}"
-# Esperado: { "LocationConstraint": null }  <- null significa us-east-1
+# Ver el total de subredes creadas desde el mapa anidado
+terraform output flattened_subnets_count
+# Esperado: 5
 
-aws s3api get-bucket-tagging --bucket "${PRIMARY_BUCKET}"
-# Esperado: Tags con Owner = "platform-team"
+# Ver los IDs de subredes agrupados por VPC
+terraform output subnets_by_vpc
+```
 
-# Verificar el bucket secundario (eu-west-3)
-SECONDARY_BUCKET=$(terraform output -raw secondary_bucket_name)
-aws s3api get-bucket-location \
-  --bucket "${SECONDARY_BUCKET}" \
-  --region eu-west-3
-# Esperado: { "LocationConstraint": "eu-west-3" }
+---
 
-# Verificar parametros SSM en ambas regiones
-aws ssm get-parameter \
-  --name "/lab39/config/primary-region" \
-  --region us-east-1 \
-  --query "Parameter.Value" \
+### Paso 3 — Inspeccionar las etiquetas fusionadas con `merge()`
+
+```bash
+# Ver las etiquetas de una subred de muestra
+terraform output sample_subnet_tags
+# Esperado (sin las etiquetas corporativas que llegan via default_tags):
+# {
+#   "BillingCode" = "NET-001"
+#   "Department"  = "networking"
+#   "Name"        = "lab39-networking/public-a"
+#   "Team"        = "net-ops"
+#   "Tier"        = "public"
+# }
+
+# Verificar en AWS que las etiquetas corporativas (default_tags) tambien estan
+PRIMARY_SUBNET=$(terraform output -json subnet_ids | jq -r '.["networking/public-a"]')
+aws ec2 describe-subnets \
+  --subnet-ids "${PRIMARY_SUBNET}" \
+  --query "Subnets[0].Tags" \
+  --output table
+# Las columnas ManagedBy, Project, Environment, CostCenter, Owner
+# deben aparecer aunque no las hayas declarado en el bloque tags del recurso
+```
+
+---
+
+### Paso 4 — Verificar la postcondition: IP publica asignada
+
+```bash
+# Ver la IP publica verificada por la postcondition
+terraform output monitoring_public_ip
+# Si el valor es null o vacio, la postcondition habria abortado el apply
+
+# Verificar en AWS que la instancia tiene la IP
+INSTANCE_ID=$(terraform output -raw monitoring_instance_id)
+aws ec2 describe-instances \
+  --instance-ids "${INSTANCE_ID}" \
+  --query "Reservations[0].Instances[0].PublicIpAddress" \
   --output text
-# Esperado: us-east-1
-
-aws ssm get-parameter \
-  --name "/lab39/config/secondary-region" \
-  --region eu-west-3 \
-  --query "Parameter.Value" \
-  --output text
-# Esperado: eu-west-3
 ```
 
 ---
 
-### Paso 3 — Simular Drift: modificar un tag manualmente
+### Paso 5 — Disparar la precondition con una AZ no autorizada
 
-**Opción A — Consola de AWS** (recomendada para visualizar el flujo real):
-
-1. Abre la consola de S3 en `us-east-1`.
-2. Navega al bucket `lab39-artifacts-<ACCOUNT_ID>-use1`.
-3. En la pestana **Properties** → **Tags**, edita el tag `Owner`.
-4. Cambia el valor de `platform-team` a `devops-team` y guarda.
-
-**Opción B — AWS CLI**:
+Pasa un valor de `monitoring_config` con una AZ fuera de la lista autorizada
+directamente en la linea de comandos, sin modificar `variables.tf`:
 
 ```bash
-PRIMARY_BUCKET=$(terraform output -raw primary_bucket_name)
-
-aws s3api put-bucket-tagging \
-  --bucket "${PRIMARY_BUCKET}" \
-  --tagging '{
-    "TagSet": [
-      {"Key": "Name",        "Value": "lab39-artifacts-primary"},
-      {"Key": "Project",     "Value": "lab39"},
-      {"Key": "Environment", "Value": "production"},
-      {"Key": "Region",      "Value": "us-east-1"},
-      {"Key": "ManagedBy",   "Value": "terraform"},
-      {"Key": "Owner",       "Value": "devops-team"}
-    ]
-  }'
-
-# Verificar que el cambio se aplico en AWS
-aws s3api get-bucket-tagging --bucket "${PRIMARY_BUCKET}"
+terraform plan -var='monitoring_config={"enabled":true,"availability_zone":"us-east-1d"}'
 ```
 
-En este momento existe drift: el estado de Terraform dice `Owner = "platform-team"`
-pero la realidad en AWS es `Owner = "devops-team"`.
+Terraform debe fallar durante el plan con el mensaje descriptivo:
+
+```
+╷
+│ Error: Resource precondition failed
+│
+│   on main.tf line XX, in resource "aws_instance" "monitoring":
+│    XX:       condition = contains(var.monitoring_config.allowed_azs, ...)
+│
+│ La zona de disponibilidad 'us-east-1d' no esta en la lista de zonas
+│ autorizadas para este entorno: ["us-east-1a","us-east-1b","us-east-1c"].
+│ Actualiza monitoring_config.availability_zone con un valor permitido.
+╵
+```
+
+Observa que **ningun recurso se crea ni se destruye** — el plan se aborta
+antes de intentar cualquier cambio. Restaura el valor original antes de
+continuar.
 
 ---
 
-### Paso 4 — Detectar drift con `-refresh-only`
+### Paso 6 — Activar la alarma de CPU con `optional()` y verificar `can()`
+
+Demuestra el atributo `optional(string, null)`: añade un email para activar
+el SNS topic y la alarma de CloudWatch sin modificar ninguna otra parte del
+codigo:
 
 ```bash
-# Muestra solo las diferencias entre el estado almacenado y la realidad en AWS.
-# NO propone cambios de codigo. NO toca la infraestructura.
-terraform plan -refresh-only
+terraform plan -var='monitoring_config={"enabled":true,"alarm_email":"alertas@example.com"}'
+# Debe mostrar 3 recursos nuevos: sns_topic + sns_subscription + cw_alarm
+
+terraform apply -var='monitoring_config={"enabled":true,"alarm_email":"alertas@example.com"}'
 ```
 
-La salida mostrara algo similar a:
+Verifica que `local.monitoring_alarm_enabled` (calculado con `can()`) refleja
+correctamente el estado:
 
-```
-Note: Objects have changed outside of Terraform
-
-Terraform detected the following changes made outside of Terraform since the
-last "terraform apply" which may have changed the result of "terraform plan":
-
-  # aws_s3_bucket.artifacts_primary has changed
-  ~ resource "aws_s3_bucket" "artifacts_primary" {
-        id = "lab39-artifacts-123456789012-use1"
-      ~ tags = {
-          ~ "Owner" = "platform-team" -> "devops-team"
-            # (5 unchanged elements hidden)
-        }
-      ~ tags_all = {
-          ~ "Owner" = "platform-team" -> "devops-team"
-            # (5 unchanged elements hidden)
-        }
-      ~ versioning {
-          ~ enabled = false -> true
-            # (1 unchanged attribute hidden)
-        }
-        # (7 unchanged attributes hidden)
-    }
-
-  # aws_s3_bucket.artifacts_secondary has changed
-  ~ resource "aws_s3_bucket" "artifacts_secondary" {
-      ~ versioning {
-          ~ enabled = false -> true
-            # (1 unchanged attribute hidden)
-        }
-        # (15 unchanged attributes hidden)
-    }
-
-This is a refresh-only plan, so Terraform will not take any actions to undo
-these changes. If you were expecting these changes then you can apply this plan
-to update the Terraform state to match the current configuration of the real
-infrastructure.
+```bash
+terraform output monitoring_alarm_enabled
+# Esperado: true
 ```
 
-Terraform ha detectado el drift pero aun no ha tomado ninguna accion.
+Limpia los 3 recursos de alerta antes de los retos volviendo al valor por
+defecto (sin `alarm_email`):
 
-> **Nota — drift "fantasma" en `versioning`**: es normal ver `versioning { enabled = false -> true }`
-> en **ambos** buckets aunque solo hayas modificado el tag del primario.
-> Esto es un artefacto del provider AWS: cuando `aws_s3_bucket` se crea,
-> el estado registra `enabled = false`; despues, `aws_s3_bucket_versioning`
-> activa el versionado en AWS, pero el estado del recurso `aws_s3_bucket`
-> no se actualiza hasta el siguiente refresh. No indica un problema real —
-> la infraestructura es correcta. `terraform apply -refresh-only` sincronizara
-> ambos atributos (el tag y el versionado) en el estado sin tocar nada en AWS.
+```bash
+terraform apply
+# Esperado: 3 recursos destruidos (sns_topic, sns_subscription, cw_alarm)
+
+terraform output monitoring_alarm_enabled
+# Esperado: false
+```
 
 ---
 
-### Paso 5 — Decidir como gestionar el drift
+### Paso 7 — Verificar `try()` con los codigos de facturacion
 
-Tienes dos opciones:
-
-### Opción A: Aceptar el drift (sincronizar el estado con la realidad)
-
-Usa `-refresh-only` cuando la modificacion manual fue intencionada y quieres
-que Terraform la reconozca como el nuevo estado correcto. **El codigo HCL
-no cambia**, pero el `.tfstate` se actualiza.
+`try()` extrae el `billing_code` de cada subred de forma defensiva. Inspecciona
+el output para confirmar que todos tienen valor (en este lab siempre lo tienen,
+pero el `try()` garantiza que el plan no fallaria si alguna subred heredada
+no tuviera ese campo):
 
 ```bash
-terraform apply -refresh-only
+terraform output subnet_billing_codes
+# Esperado:
+# {
+#   "data/db-a"            = "DAT-001"
+#   "data/db-b"            = "DAT-001"
+#   "networking/private-a" = "NET-002"
+#   "networking/public-a"  = "NET-001"
+#   "networking/public-b"  = "NET-001"
+# }
 ```
 
+Para ver `try()` en accion con un valor ausente, abre la consola de Terraform
+(`terraform console`) y evalua una expresion que fallaria sin `try()`:
+
+```bash
+terraform console
 ```
-Do you want to update the Terraform state to reflect these detected changes?
-  Only the Terraform state will be updated; the configuration and managed
-  infrastructure will remain unchanged.
-
-  Enter a value: yes
-
-Apply complete! Resources: 0 added, 0 changed, 0 destroyed.
-```
-
-Tras el apply, el estado ya contiene `Owner = "devops-team"`. Sin embargo,
-el codigo HCL sigue declarando `"platform-team"`, por lo que **el trabajo no
-termina aqui**. Para que la situación sea estable debes actualizar el HCL
-a continuacion:
 
 ```hcl
-# main.tf — actualizar el tag para que concilie con la realidad aceptada
-tags = {
-  ...
-  Owner = "devops-team"   # actualizado tras aceptar el drift
-  ...
-}
+# Dentro del console:
+
+# SIN try() — falla si el atributo no existe:
+null.foo
+# Error: Attempt to get attribute from null value
+
+# CON try() — devuelve el fallback:
+try(null.foo, "UNTAGGED")
+# "UNTAGGED"
+
+# can() — booleano de evaluabilidad:
+can(null.foo)
+# false
+
+can("valor-real")
+# true
+```
+
+---
+
+### Paso 8 — Observar el bloque `check {}` en accion
+
+El bloque `check "public_subnet_has_internet_route"` se evalua al final de
+cada apply. En condiciones normales debería pasar:
+
+```bash
+terraform apply
+# Al final del apply, si la ruta existe:
+# Apply complete! Resources: X added, 0 changed, 0 destroyed.
+# (sin advertencias de check)
+```
+
+El escenario idoneo para `check {}` es detectar **drift externo**: alguien
+elimina una ruta manualmente en AWS sin pasar por Terraform. En ese caso el
+data source del check lee el estado real de AWS tal como esta, y el `assert`
+se evalua contra esa realidad.
+
+Simula el drift eliminando la ruta directamente desde AWS CLI:
+
+```bash
+# Obtener el ID de la route table publica del VPC networking
+RT_ID=$(terraform output -json public_route_table_ids | jq -r '.networking')
+
+# Eliminar la ruta 0.0.0.0/0 manualmente (simula accion de un operador)
+aws ec2 delete-route \
+  --route-table-id "$RT_ID" \
+  --destination-cidr-block "0.0.0.0/0"
+```
+
+Ejecuta `terraform plan` — el data source del check consulta el estado real
+de AWS (ruta eliminada) y el `assert` dispara el mensaje personalizado:
+
+```bash
+terraform plan
+# Esperado:
+# Plan: 0 to add, 1 to change, 0 to destroy.
+# ╷
+# │ Warning: Check block assertion failed
+# │
+# │   on main.tf line 320, in check "public_subnet_has_internet_route":
+# │  320:     condition = anytrue([
+# │  321:       for route in data.aws_route_table.networking_public_a.routes :
+# │  322:       route.cidr_block == "0.0.0.0/0" && route.gateway_id != null && route.gateway_id != ""
+# │  323:     ])
+# │     ├────────────────
+# │     │ data.aws_route_table.networking_public_a.routes is empty list of object
+# │
+# │ La subred 'networking/public-a' no tiene ruta por defecto (0.0.0.0/0)
+# │ hacia un Internet Gateway. Las instancias en esta subred no podran
+# │ alcanzar Internet. Verifica aws_route_table.public["networking"] y
+# │ aws_route_table_association.public["networking/public-a"].
+# ╵
+# (el plan NO se aborta — el check es solo una advertencia)
+```
+
+> Terraform muestra tanto la condición evaluada como el valor que la causa
+> (`routes is empty list of object`) y el `error_message` personalizado.
+> La route table existe y el data source la encuentra, pero al haber
+> eliminado la única ruta gestionada, `routes` queda vacio y `anytrue([])`
+> devuelve `false`.
+
+Aplica para restaurar la ruta y verifica que el check vuelve a pasar:
+
+```bash
+terraform apply --auto-approve
+# Apply complete! Resources: 0 added, 1 changed, 0 destroyed.
+# (sin advertencias de check — la ruta esta restaurada)
+```
+
+---
+
+### Paso 9 — Simular drift de tags con `ignore_changes`
+
+`ignore_changes` protege los tags que herramientas externas puedan añadir.
+Simula que AWS Organizations añade un tag `CreatedBy` a uno de los VPCs:
+
+```bash
+VPC_ID=$(terraform output -json vpc_ids | jq -r '.networking')
+
+# Anadir una tag externamente (simula AWS Organizations o Security Hub)
+aws ec2 create-tags \
+  --resources "${VPC_ID}" \
+  --tags Key=CreatedBy,Value=aws-organizations
+
+# Verificar que la tag existe en AWS
+aws ec2 describe-tags \
+  --filters "Name=resource-id,Values=${VPC_ID}" "Name=key,Values=CreatedBy" \
+  --query "Tags[0].Value" \
+  --output text
+# Esperado: aws-organizations
 ```
 
 ```bash
-# Confirmar que codigo y estado coinciden
+# Sin ignore_changes, esto devolveria:
+# ~ tags = { - "CreatedBy" = "aws-organizations" }  ← Terraform la eliminaria
+
+# CON ignore_changes: Terraform no la ve como drift
 terraform plan
 # Esperado: No changes. Your infrastructure matches the configuration.
 ```
 
-> **Resumen del flujo completo al aceptar drift**:
-> 1. `terraform apply -refresh-only` → sincroniza el **estado** con AWS
-> 2. Editar el **HCL** para reflejar el nuevo valor aceptado
-> 3. `terraform plan` → confirma que no hay mas diferencias
->
-> Omitir el paso 2 deja el codigo desincronizado con el estado. El proximo
-> `terraform apply` normal revertira el cambio porque el HCL sigue siendo
-> la fuente de verdad.
-
-### Opción B: Revertir el drift (restaurar lo que declara el codigo)
-
-Si la modificacion manual fue un error y quieres restaurar el valor original:
-
-```bash
-# NO uses -refresh-only. Ejecuta un apply normal.
-# Terraform ve la diferencia (estado vs AWS real) y propone corregirla.
-terraform plan    # muestra: ~ Owner = "devops-team" -> "platform-team"
-terraform apply   # restaura el tag al valor del codigo HCL
-```
-
----
-
-### Paso 6 — Crear el bucket "legacy" fuera de Terraform
-
-Simula un bucket que existia antes de que el equipo adoptara Terraform.
-Lo creamos con AWS CLI para imitar la situación real:
-
-```bash
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export LEGACY_BUCKET="lab39-legacy-logs-${ACCOUNT_ID}"
-
-# Crear el bucket en us-east-1
-aws s3api create-bucket \
-  --bucket "${LEGACY_BUCKET}" \
-  --region us-east-1
-
-# Anadir algunos tags para simular que ya tiene configuracion
-aws s3api put-bucket-tagging \
-  --bucket "${LEGACY_BUCKET}" \
-  --tagging '{
-    "TagSet": [
-      {"Key": "Name",    "Value": "lab39-legacy-logs"},
-      {"Key": "Purpose", "Value": "application-logs"},
-      {"Key": "Created", "Value": "manually"}
-    ]
-  }'
-
-# Bloquear acceso publico (buena practica que Terraform debera reflejar)
-aws s3api put-public-access-block \
-  --bucket "${LEGACY_BUCKET}" \
-  --public-access-block-configuration \
-    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-
-echo "Bucket legacy creado: ${LEGACY_BUCKET}"
-```
-
----
-
-### Paso 7 — Declarar la intencion de adoptar el bucket con `import {}`
-
-Abre [aws/main.tf](aws/main.tf) y localiza el bloque `import` comentado al
-final del fichero. Descomenta las cinco lineas eliminando los `#`:
-
-```hcl
-# ANTES (comentado):
-# import {
-#   provider = aws.primary
-#   to       = aws_s3_bucket.legacy_logs
-#   id       = var.legacy_bucket_name
-# }
-
-# DESPUES (activo):
-import {
-  provider = aws.primary
-  to       = aws_s3_bucket.legacy_logs
-  id       = var.legacy_bucket_name
-}
-```
-
-Los tres atributos del bloque significan:
-
-| Atributo | Valor | Para que sirve |
-|---|---|---|
-| `provider` | `aws.primary` | Indica a Terraform en qué región buscar el bucket. Obligatorio porque no hay proveedor por defecto en este proyecto. |
-| `to` | `aws_s3_bucket.legacy_logs` | Direccion que tendra el recurso dentro del estado de Terraform una vez adoptado. |
-| `id` | `var.legacy_bucket_name` | Identificador del recurso en AWS — para un bucket S3 es simplemente su nombre. |
-
-Guarda el fichero. En este momento el bloque `import` existe pero **no hay
-ningun bloque `resource "aws_s3_bucket" "legacy_logs"`** en el codigo. Si
-ejecutaras `terraform plan` a secas, Terraform fallaria con:
-
-```
-Error: Cannot generate a resource configuration for an import target
-
-  on main.tf: import block
-    import.to is aws_s3_bucket.legacy_logs
-
-  Configuration for import target does not exist. If you wish to generate
-  configuration for this resource, use the -generate-config-out option.
-```
-
-Es exactamente lo que esperamos — en el Paso 8 usaremos `-generate-config-out`
-para que Terraform genere ese bloque `resource` automáticamente.
-
----
-
-### Paso 8 — Generar el HCL automáticamente con `-generate-config-out`
-
-```bash
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-terraform plan \
-  -var="legacy_bucket_name=lab39-legacy-logs-${ACCOUNT_ID}" \
-  -generate-config-out=generated.tf
-```
-
-Terraform inspeccionara el bucket en AWS, leera todos sus atributos y
-escribira el bloque `resource` completo en `generated.tf`. La salida será
-similar a:
-
-```
-aws_s3_bucket.legacy_logs: Preparing import... [id=lab39-legacy-logs-123456789012]
-aws_s3_bucket.legacy_logs: Refreshing state... [id=lab39-legacy-logs-123456789012]
-
-Terraform will perform the following actions:
-
-  # aws_s3_bucket.legacy_logs will be imported
-    resource "aws_s3_bucket" "legacy_logs" {
-        arn                         = "arn:aws:s3:::lab39-legacy-logs-123456789012"
-        bucket                      = "lab39-legacy-logs-123456789012"
-        bucket_domain_name          = "lab39-legacy-logs-123456789012.s3.amazonaws.com"
-        ...
-    }
-
-Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.
-```
-
----
-
-### Paso 9 — Revisar y limpiar el HCL generado
-
-Abre `generated.tf`. Terraform incluye una cabecera de advertencia seguida
-del bloque `resource` con los atributos que leyo del bucket real en AWS:
-
-```hcl
-# __generated__ by Terraform
-# Please review these resources and move them into your main configuration files.
-
-# __generated__ by Terraform from "lab39-legacy-logs-123456789012"
-resource "aws_s3_bucket" "legacy_logs" {
-  provider            = aws.primary
-  bucket              = "lab39-legacy-logs-123456789012"
-  bucket_namespace    = "global"
-  force_destroy       = false
-  object_lock_enabled = false
-  region              = "us-east-1"
-  tags = {
-    Created = "manually"
-    Name    = "lab39-legacy-logs"
-    Purpose = "application-logs"
-  }
-  tags_all = {
-    Created = "manually"
-    Name    = "lab39-legacy-logs"
-    Purpose = "application-logs"
-  }
-}
-```
-
-Antes de moverlo a `main.tf`, limpia los atributos que no deben declararse
-en el codigo:
-
-```hcl
-# ANTES (tal como lo genera Terraform):
-resource "aws_s3_bucket" "legacy_logs" {
-  provider            = aws.primary
-  bucket              = "lab39-legacy-logs-123456789012"  # sustituir por var.legacy_bucket_name
-  bucket_namespace    = "global"                          # ELIMINAR: atributo interno, no modificable
-  force_destroy       = false                             # opcional, puedes dejarlo
-  object_lock_enabled = false                             # opcional, puedes dejarlo
-  region              = "us-east-1"                       # ELIMINAR: inferida del proveedor
-  tags = {
-    Created = "manually"
-    Name    = "lab39-legacy-logs"
-    Purpose = "application-logs"
-  }
-  tags_all = {                                            # ELIMINAR: calculado por Terraform
-    Created = "manually"
-    Name    = "lab39-legacy-logs"
-    Purpose = "application-logs"
-  }
-}
-
-# DESPUES (limpiado y adaptado al estandar del proyecto):
-resource "aws_s3_bucket" "legacy_logs" {
-  provider = aws.primary
-  bucket   = var.legacy_bucket_name
-
-  tags = {
-    Name      = "lab39-legacy-logs"
-    Project   = var.project
-    ManagedBy = "terraform"   # Actualizado: ahora si esta gestionado
-    Purpose   = "application-logs"
-  }
-}
-```
-
-**Atributos a eliminar del HCL generado**:
-
-| Atributo | Razon para eliminar |
-|---|---|
-| `bucket_namespace` | Atributo interno del provider, no se puede gestionar |
-| `region` | Inferida del alias de proveedor, declararlo es redundante |
-| `tags_all` | Calculado por Terraform (union de `tags` + `default_tags` del provider) |
-
----
-
-### Paso 10 — Mover el resource a `main.tf` y aplicar
-
-> **Error frecuente**: NO elimines el bloque `import {}` todavia. Debe
-> permanecer en `main.tf` durante el `terraform apply` de este paso. Es
-> el que le indica a Terraform que el bucket ya existe y debe adoptarlo,
-> no crearlo. Si lo eliminas antes del apply, Terraform intentara crear
-> el bucket y fallara con `BucketAlreadyExists`.
-
-**Orden correcto**:
-
-1. Copia el bloque `resource "aws_s3_bucket" "legacy_logs"` limpio de
-   `generated.tf` a `main.tf`. El bloque `import {}` sigue activo.
-
-2. Borra `generated.tf` (el contenido util ya esta en `main.tf`):
-
-```bash
-rm generated.tf
-```
-
-3. Verifica que `main.tf` tiene **ambos** bloques al mismo tiempo:
-
-```hcl
-# bloque import — todavia activo
-import {
-  provider = aws.primary
-  to       = aws_s3_bucket.legacy_logs
-  id       = var.legacy_bucket_name
-}
-
-# bloque resource — recien anadido desde generated.tf
-resource "aws_s3_bucket" "legacy_logs" {
-  provider = aws.primary
-  bucket   = var.legacy_bucket_name
-  tags     = { ... }
-}
-```
-
-4. Ejecuta plan para confirmar que Terraform ve el import, no una creacion:
-
-```bash
-terraform plan \
-  -var="legacy_bucket_name=lab39-legacy-logs-${ACCOUNT_ID}"
-```
-
-La linea clave del resumen debe decir **import**, no **add**:
-
-```
-Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.
-```
-
-Si ves `1 to change`, revisa los atributos del resource y ajustalos para
-que coincidan con el estado real del bucket antes de continuar.
-
-5. Aplica para adoptar el bucket en el estado de Terraform:
-
-```bash
-terraform apply \
-  -var="legacy_bucket_name=lab39-legacy-logs-${ACCOUNT_ID}"
-```
-
-```
-aws_s3_bucket.legacy_logs: Importing... [id=lab39-legacy-logs-123456789012]
-aws_s3_bucket.legacy_logs: Import complete [id=lab39-legacy-logs-123456789012]
-
-Apply complete! Resources: 1 imported, 0 added, 0 changed, 0 destroyed.
-```
-
-6. **Ahora si** elimina o comenta el bloque `import {}` de `main.tf`. Ya
-   no es necesario: el recurso esta registrado en el estado y Terraform lo
-   gestionara como cualquier otro recurso a partir de este momento.
-
-7. Opcionalmente, elimina la variable `legacy_bucket_name` de `variables.tf`
-   y sustituye su uso en el bloque `resource` por el nombre literal del bucket.
-   La variable solo fue necesaria durante el flujo de importacion; una vez
-   completado, el nombre del bucket es un valor fijo que no cambiara:
-
-```hcl
-# Antes (con variable):
-resource "aws_s3_bucket" "legacy_logs" {
-  provider = aws.primary
-  bucket   = var.legacy_bucket_name
-  ...
-}
-
-# Despues (nombre literal — ya no necesitas pasar -var en cada comando):
-resource "aws_s3_bucket" "legacy_logs" {
-  provider = aws.primary
-  bucket   = "lab39-legacy-logs-123456789012"
-  ...
-}
-```
-
-**El bucket existe exactamente igual que antes en AWS** — Terraform solo ha
-registrado su existencia en el estado. A partir de ahora cualquier cambio
-en el bloque `resource` se gestionara mediante `terraform apply`.
-
----
-
-## Verificación final
-
-```bash
-# El bucket legacy aparece ahora en el estado de Terraform
-terraform state list | grep legacy
-# Esperado: aws_s3_bucket.legacy_logs
-
-# Ver todos los atributos que Terraform conoce del bucket
-terraform state show aws_s3_bucket.legacy_logs
-
-# Un plan sin cambios de codigo confirma que la adopción fue limpia
-terraform plan -var="legacy_bucket_name=lab39-legacy-logs-${ACCOUNT_ID}"
-# Esperado: No changes. Your infrastructure matches the configuration.
-```
+La tag `CreatedBy` permanece en AWS intacta aunque no este declarada en el
+codigo HCL — exactamente el comportamiento que necesitas cuando convives con
+herramientas de gobernanza.
 
 ---
 
 ## Retos
 
-### Reto 1 — Revertir drift en la región secundaria
+### Reto 1 — Añadir una nueva VPC con subredes sin modificar el código
 
-El ejercicio principal de drift se realizo sobre el bucket de `us-east-1`.
-En este reto lo reproduciras sobre `eu-west-3` y exploraras la diferencia
-entre los dos enfoques de resolucion.
+El Flatten Pattern debe permitir añadir nuevas VPCs y subredes simplemente
+extendiendo la variable `vpc_config`, sin tocar ningun bloque `resource`.
 
-**Objetivo**:
+**Objetivo**: añade un tercer VPC `"app"` con dos subredes
+(`"app-a"` en `us-east-1a` y `"app-b"` en `us-east-1b`, ambas publicas)
+al valor por defecto de `var.vpc_config`.
 
-1. Modifica manualmente el tag `Owner` del bucket `lab39-artifacts-<ACCOUNT_ID>-euw3`
-   en la región `eu-west-3` (consola o AWS CLI).
+1. Modifica `variables.tf` para añadir el VPC `"app"` con sus dos subredes.
+2. Ejecuta `terraform plan`.
+3. Confirma que el plan muestra exactamente los recursos nuevos para `"app"`
+   y cero cambios en los recursos existentes de `"networking"` y `"data"`.
+4. Aplica y verifica con `terraform output subnets_by_vpc`.
 
-2. Ejecuta `terraform plan -refresh-only` y confirma que Terraform detecta
-   el drift solo en el recurso secundario.
-
-3. Esta vez elige **revertir** el drift en lugar de aceptarlo: ejecuta
-   `terraform apply` (sin `-refresh-only`) y verifica que el tag vuelve al
-   valor declarado en el codigo.
-
-4. Explica en un comentario en `main.tf` en que situaciones elegiras
-   "aceptar el drift" (`-refresh-only`) frente a "revertir el drift"
-   (`apply` normal).
-
-**Pista**: para modificar el tag via CLI en `eu-west-3` necesitas pasar
-`--region eu-west-3` a todos los comandos `s3api`.
+**Lo que debes ver**: `app/app-a` y `app/app-b` en los outputs, junto con
+un nuevo Internet Gateway para el VPC `"app"` (tiene subredes publicas).
 
 ---
 
-### Reto 2 — Adoptar un parametro SSM existente
+### Reto 2 — Implementar una precondition de solapamiento de CIDR
 
-El bloque `import` no se limita a buckets S3. Cualquier recurso de Terraform
-soportado puede adoptarse con la misma tecnica.
+Las VPCs no pueden tener bloques CIDR solapados si se van a conectar
+mediante VPC Peering o Transit Gateway. Actualmente Terraform no valida esto.
 
-**Objetivo**:
+**Objetivo**: añade una `precondition` en `aws_vpc.this` que verifique que
+ninguno de los CIDRs de `var.vpc_config` se solapa con los demas.
 
-1. Crea manualmente un parametro SSM en `us-east-1` con AWS CLI:
+**Pistas**:
+- La función `cidrnetmask()` permite inspeccionar un CIDR.
+- Para detectar solapamiento entre dos CIDRs puedes comparar si la primera
+  IP de uno cae dentro del rango del otro con `cidrhost()`.
+- Alternativamente, una validación pragmática es verificar que todos los
+  CIDRs son distintos: `length(distinct(values(...))) == length(values(...))`.
+  Implementa primero esta versión simple y luego, si quieres, la versión
+  con solapamiento real.
 
-```bash
-aws ssm put-parameter \
-  --name "/lab39/legacy/db-endpoint" \
-  --value "legacy-db.internal.example.com" \
-  --type "String" \
-  --description "Endpoint de base de datos legada — creado antes de IaC" \
-  --region us-east-1
-```
+---
 
-2. Escribe un bloque `import {}` en `main.tf` para el recurso
-   `aws_ssm_parameter.legacy_db`:
+### Reto 3 — Configuración de monitoreo por entorno con `optional()`
+
+Actualmente `monitoring_config` tiene un único conjunto de valores por
+defecto. En un proyecto real, los valores por defecto varian por entorno:
+`production` usa `t4g.small` y requiere alarma; `dev` usa `t4g.micro` y
+no necesita alarma.
+
+**Objetivo**: define una variable `monitoring_defaults_by_env` de tipo
+`map(object({ instance_type, alarm_email }))` y usa `lookup()` y `merge()`
+para construir la configuración efectiva de monitoreo fusionando los defaults
+del entorno con los valores que el operador haya especificado explicitamente.
 
 ```hcl
-import {
-  provider = aws.primary
-  to       = aws_ssm_parameter.legacy_db
-  id       = "/lab39/legacy/db-endpoint"
+variable "monitoring_defaults_by_env" {
+  type = map(object({
+    instance_type = string
+    alarm_email   = optional(string, null)
+  }))
+  default = {
+    production = { instance_type = "t4g.small",  alarm_email = "prod-alerts@example.com" }
+    staging    = { instance_type = "t4g.micro",  alarm_email = null }
+    dev        = { instance_type = "t4g.micro",  alarm_email = null }
+  }
 }
 ```
 
-3. Ejecuta `terraform plan -generate-config-out=generated_ssm.tf`. Observaras
-   que el plan falla con un error de validación: Terraform genera `value = null`
-   porque no vuelca el valor real del parametro en el fichero (podría ser un
-   secreto). Deberas añadir el valor manualmente en el paso de limpieza.
-
-4. Limpia el HCL generado, muevelo a `main.tf` y completa el flujo de
-   adopcion con `terraform apply`.
-
-5. Verifica con `terraform state show aws_ssm_parameter.legacy_db` que
-   el parametro esta ahora gestionado por Terraform.
-
-**Por que es interesante**: el identificador de un parametro SSM en el
-bloque `import` es el **nombre completo** del parametro (con el slash
-inicial), no su ARN. Cada tipo de recurso tiene su propio formato de ID
-para el import — siempre puedes consultarlo en la sección "Import" de la
-documentacion del recurso en el Terraform Registry.
+La logica de fusion en `locals.tf`:
+```hcl
+locals {
+  effective_monitoring = merge(
+    lookup(var.monitoring_defaults_by_env, var.environment, {}),
+    { for k, v in var.monitoring_config : k => v if v != null }
+  )
+}
+```
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Revertir drift en la región secundaria</strong></summary>
+<summary><strong>Solución al Reto 1 — Añadir una nueva VPC con subredes</strong></summary>
 
-### Solución al Reto 1 — Revertir drift en la región secundaria
+### Solución al Reto 1 — Añadir una nueva VPC con subredes
 
-**Simular drift en eu-west-3 con CLI**:
-
-```bash
-SECONDARY_BUCKET=$(terraform output -raw secondary_bucket_name)
-
-aws s3api put-bucket-tagging \
-  --bucket "${SECONDARY_BUCKET}" \
-  --region eu-west-3 \
-  --tagging '{
-    "TagSet": [
-      {"Key": "Name",        "Value": "lab39-artifacts-secondary"},
-      {"Key": "Project",     "Value": "lab39"},
-      {"Key": "Environment", "Value": "production"},
-      {"Key": "Region",      "Value": "eu-west-3"},
-      {"Key": "ManagedBy",   "Value": "terraform"},
-      {"Key": "Owner",       "Value": "devops-team"}
-    ]
-  }'
-```
-
-**Detectar drift con -refresh-only**:
-
-```bash
-terraform plan -refresh-only
-```
-
-Terraform mostrara el drift en `aws_s3_bucket.artifacts_secondary` sin
-proponer ningun otro cambio.
-
-**Revertir el drift con apply normal**:
-
-```bash
-# Sin -refresh-only: Terraform usa el codigo como fuente de verdad
-terraform plan   # muestra: ~ Owner = "devops-team" -> "platform-team"
-terraform apply  # restaura el tag
-```
-
-**Verificar**:
-
-```bash
-aws s3api get-bucket-tagging \
-  --bucket "${SECONDARY_BUCKET}" \
-  --region eu-west-3 \
-  --query "TagSet[?Key=='Owner'].Value" \
-  --output text
-# Esperado: platform-team  (valor del codigo HCL)
-```
-
-**Cuando aceptar vs revertir drift**:
+Añade en `variables.tf` dentro del `default` de `vpc_config`:
 
 ```hcl
-# Pautas para decidir (añadir como comentario en main.tf):
+"app" = {
+  cidr_block = "10.41.0.0/16"
+  subnets = {
+    "app-a" = {
+      cidr_block        = "10.41.1.0/24"
+      availability_zone = "us-east-1a"
+      public            = true
+      department_tags = {
+        department   = "application"
+        team         = "app-team"
+        billing_code = "APP-001"
+      }
+    }
+    "app-b" = {
+      cidr_block        = "10.41.2.0/24"
+      availability_zone = "us-east-1b"
+      public            = true
+      department_tags = {
+        department   = "application"
+        team         = "app-team"
+        billing_code = "APP-001"
+      }
+    }
+  }
+}
+```
+
+```bash
+terraform plan
+# Esperado: 4 recursos nuevos
+#   aws_vpc.this["app"]
+#   aws_subnet.this["app/app-a"]
+#   aws_subnet.this["app/app-b"]
+#   aws_internet_gateway.this["app"]   ← tiene subredes publicas
 #
-# Acepta el drift (-refresh-only apply) cuando:
-#   - El cambio manual fue intencional y acordado por el equipo.
-#   - No tienes tiempo de actualizar el codigo ahora pero lo haras pronto.
-#   - El cambio refleja una realidad operacional que el codigo aun no captura.
+# 0 cambios en networking y data
+
+terraform apply
+terraform output subnets_by_vpc
+# "app" = {
+#   "app/app-a" = "subnet-0abc..."
+#   "app/app-b" = "subnet-0xyz..."
+# }
+```
+
+El Flatten Pattern no requirio ningun cambio en el codigo de recursos —
+solo en la variable de entrada.
+
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — Precondition de solapamiento de CIDR</strong></summary>
+
+### Solución al Reto 2 — Precondition de solapamiento de CIDR
+
+#### Donde añadir la precondition
+
+`aws_vpc.this` ya tiene un bloque `lifecycle` con `ignore_changes`. Añade
+la `precondition` dentro de ese mismo bloque, antes de `ignore_changes`:
+
+```hcl
+# ANTES — lifecycle solo con ignore_changes
+resource "aws_vpc" "this" {
+  for_each = local.vpcs_map
+  # ...
+  lifecycle {
+    ignore_changes = [
+      tags["CreatedBy"],
+      tags["aws:cloudformation:stack-name"],
+      tags["aws:organizations:delegated-administrator"],
+    ]
+  }
+}
+
+# DESPUES — precondition añadida dentro del mismo bloque lifecycle
+resource "aws_vpc" "this" {
+  for_each = local.vpcs_map
+  # ...
+  lifecycle {
+    precondition {
+      condition = length(distinct([
+        for vpc in var.vpc_config : vpc.cidr_block
+      ])) == length(var.vpc_config)
+      error_message = <<-EOT
+        Dos o mas VPCs tienen el mismo bloque CIDR. Los CIDRs deben ser
+        unicos para permitir conectividad futura via VPC Peering o
+        Transit Gateway. CIDRs actuales: ${jsonencode([
+          for k, v in var.vpc_config : "${k}: ${v.cidr_block}"
+        ])}
+      EOT
+    }
+
+    ignore_changes = [
+      tags["CreatedBy"],
+      tags["aws:cloudformation:stack-name"],
+      tags["aws:organizations:delegated-administrator"],
+    ]
+  }
+}
+```
+
+#### Cómo funciona la condición
+
+```hcl
+length(distinct([
+  for vpc in var.vpc_config : vpc.cidr_block
+])) == length(var.vpc_config)
+```
+
+Paso a paso con los valores del laboratorio:
+
+| Expresion | Resultado |
+|-----------|-----------|
+| `[for vpc in var.vpc_config : vpc.cidr_block]` | `["10.39.0.0/16", "10.40.0.0/16"]` |
+| `distinct([...])` | `["10.39.0.0/16", "10.40.0.0/16"]` (sin cambios, todos distintos) |
+| `length(distinct([...]))` | `2` |
+| `length(var.vpc_config)` | `2` |
+| `2 == 2` | `true` → precondition pasa |
+
+Si dos VPCs tuviesen el mismo CIDR (`10.39.0.0/16`, `10.39.0.0/16`):
+
+| Expresion | Resultado |
+|-----------|-----------|
+| `[for vpc in var.vpc_config : vpc.cidr_block]` | `["10.39.0.0/16", "10.39.0.0/16"]` |
+| `distinct([...])` | `["10.39.0.0/16"]` (elimina duplicados) |
+| `length(distinct([...]))` | `1` |
+| `length(var.vpc_config)` | `2` |
+| `1 == 2` | `false` → precondition falla |
+
+#### Como probar que funciona
+
+Añade temporalmente una tercera VPC en el `default` de `vpc_config` en
+[variables.tf](aws/variables.tf) con el mismo CIDR que `networking`:
+
+```hcl
+# Anadir al final del default de vpc_config, dentro del mapa:
+"duplicado" = {
+  cidr_block = "10.39.0.0/16"   # mismo CIDR que "networking" → debe fallar
+  subnets = {
+    "test-a" = {
+      cidr_block        = "10.39.50.0/24"
+      availability_zone = "us-east-1a"
+      public            = false
+      department_tags = {
+        department   = "test"
+        team         = "test-team"
+        billing_code = "TST-001"
+      }
+    }
+  }
+}
+```
+
+```bash
+terraform plan
+# Esperado — el mismo error aparece UNA VEZ POR VPC en el mapa.
+# Con networking + data + duplicado (3 VPCs), el error se repite 3 veces.
+# Si tambien tienes la VPC "app" del Reto 1, se repite 4 veces:
 #
-# Revierte el drift (apply normal) cuando:
-#   - El cambio manual fue un error o no autorizado.
-#   - El codigo HCL es la fuente de verdad y el estado actual viola esa definicion.
-#   - Quieres mantener la trazabilidad completa: todo cambio pasa por git.
+# ╷
+# │ Error: Resource precondition failed
+# │
+# │   on main.tf line 40, in resource "aws_vpc" "this":
+# │   40:       condition = length(distinct([
+# │   41:         for vpc in var.vpc_config : vpc.cidr_block
+# │   42:       ])) == length(var.vpc_config)
+# │     ├────────────────
+# │     │ var.vpc_config is map of object with 4 elements
+# │
+# │ Dos o mas VPCs tienen el mismo bloque CIDR. Los CIDRs deben ser
+# │ unicos para permitir conectividad futura via VPC Peering o
+# │ Transit Gateway. CIDRs actuales: ["app: 10.41.0.0/16","data: 10.40.0.0/16",
+# │ "duplicado: 10.39.0.0/16","networking: 10.39.0.0/16"]
+# ╵
+# ╷
+# │ Error: Resource precondition failed
+# │   ... (mismo mensaje, instancia diferente del for_each)
+# ╵
+# ... (repetido una vez por cada VPC en el mapa)
+```
+
+> **Por que se repite el error**: `lifecycle { precondition }` pertenece al
+> recurso `aws_vpc.this`, que usa `for_each`. Terraform evalua el bloque
+> `lifecycle` independientemente para cada instancia del `for_each`
+> (`networking`, `data`, `app`, `duplicado`), produciendo un error por cada
+> una. La condición es idéntica en todos los casos porque evalúa
+> `var.vpc_config` completo — no el VPC actual — por lo que el mensaje se
+> repite con el mismo contenido. Es el comportamiento esperado y correcto.
+
+Elimina la VPC `"duplicado"` de `variables.tf` y verifica que el plan
+vuelve a pasar sin errores:
+
+```bash
+terraform plan
+# Esperado: No changes. Your infrastructure matches the configuration.
 ```
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Adoptar un parámetro SSM existente</strong></summary>
+<summary><strong>Solución al Reto 3 — Configuración de monitoreo por entorno</strong></summary>
 
-### Solución al Reto 2 — Adoptar un parámetro SSM existente
+### Solución al Reto 3 — Configuración de monitoreo por entorno
 
-**1. Crear el parámetro SSM con AWS CLI**:
-
-```bash
-aws ssm put-parameter \
-  --name "/lab39/legacy/db-endpoint" \
-  --value "legacy-db.internal.example.com" \
-  --type "String" \
-  --description "Endpoint de base de datos legada — creado antes de IaC" \
-  --region us-east-1
-
-# Verificar que existe
-aws ssm get-parameter \
-  --name "/lab39/legacy/db-endpoint" \
-  --region us-east-1
-```
-
-**2. Bloque import en `main.tf`**:
+Añade en `variables.tf`:
 
 ```hcl
-import {
-  provider = aws.primary
-  to       = aws_ssm_parameter.legacy_db
-  id       = "/lab39/legacy/db-endpoint"
-}
-```
-
-**3. Generar HCL**:
-
-```bash
-terraform plan -generate-config-out=generated_ssm.tf
-cat generated_ssm.tf
-```
-
-El HCL generado tendra un aspecto similar a:
-
-```hcl
-resource "aws_ssm_parameter" "legacy_db" {
-  provider         = aws.primary
-  allowed_pattern  = null
-  arn              = "arn:aws:ssm:us-east-1:123456789012:parameter/lab39/legacy/db-endpoint"
-  data_type        = "text"
-  description      = "Endpoint de base de datos legada — creado antes de IaC"
-  name             = "/lab39/legacy/db-endpoint"
-  overwrite        = null
-  region           = "us-east-1"
-  tags             = {}
-  tags_all         = {}
-  tier             = "Standard"
-  type             = "String"
-  value            = null # sensitive
-  value_wo         = null # sensitive
-  value_wo_version = null
-}
-```
-
-> **Limitacion de `-generate-config-out` con SSM**: Terraform marca `value`
-> y `value_wo` como `null # sensitive` porque no vuelca valores sensibles en
-> ficheros de texto plano. Si intentas ejecutar `terraform plan` con el fichero
-> tal cual, el provider falla con `one of insecure_value,value,value_wo must
-> be specified`. Deberás añadir el valor manualmente en el paso de limpieza.
-
-**4. HCL limpio para `main.tf`**:
-
-Elimina los atributos que no deben declararse y añade el valor manualmente:
-
-| Atributo | Accion |
-|---|---|
-| `arn` | Eliminar — calculado por AWS |
-| `allowed_pattern = null` | Eliminar — null es el valor por defecto |
-| `overwrite = null` | Eliminar — null es el valor por defecto |
-| `region` | Eliminar — inferida del proveedor |
-| `tags_all` | Eliminar — calculado por Terraform |
-| `value_wo = null` | Eliminar — no aplica para parametros de tipo String |
-| `value_wo_version = null` | Eliminar — asociado a value_wo |
-| `value = null` | Sustituir por el valor real del parametro (`legacy-db.internal.example.com`) |
-
-```hcl
-resource "aws_ssm_parameter" "legacy_db" {
-  provider    = aws.primary
-  name        = "/lab39/legacy/db-endpoint"
-  type        = "String"
-  tier        = "Standard"
-  description = "Endpoint de base de datos legada — adoptado via import"
-  value       = "legacy-db.internal.example.com"   # anadir manualmente
-
-  tags = {
-    Project   = var.project
-    ManagedBy = "terraform"
+variable "monitoring_defaults_by_env" {
+  type = map(object({
+    instance_type = string
+    alarm_email   = optional(string, null)
+  }))
+  default = {
+    production = { instance_type = "t4g.small",  alarm_email = "prod-alerts@example.com" }
+    staging    = { instance_type = "t4g.micro",  alarm_email = null }
+    dev        = { instance_type = "t4g.micro",  alarm_email = null }
   }
 }
 ```
 
-**5. Completar la adopción**:
+Añade en `locals.tf`:
 
-```bash
-# Eliminar el fichero generado (el contenido ya esta en main.tf)
-rm generated_ssm.tf
-
-# Verificar plan (1 to import, 0 to change, 0 to destroy)
-terraform plan
-
-# Adoptar el recurso
-terraform apply
+```hcl
+locals {
+  # Los valores del operador sobreescriben los defaults del entorno.
+  # Se filtran los null para que no sobreescriban un default valido.
+  effective_monitoring = merge(
+    lookup(var.monitoring_defaults_by_env, var.environment, {
+      instance_type = "t4g.micro"
+      alarm_email   = null
+    }),
+    { for k, v in var.monitoring_config : k => v if v != null }
+  )
+}
 ```
 
-Una vez completado el apply, elimina el bloque `import {}` de `main.tf`.
-A partir de este momento el parametro esta registrado en el estado y el
-bloque `import` ya no tiene efecto:
+Hay dos archivos donde sustituir referencias. El motivo es siempre el mismo:
+`var.monitoring_config` contiene solo lo que el operador especificó
+explicitamente; `local.effective_monitoring` es el resultado de fusionar
+los defaults del entorno con esos valores. Si leemos directamente la
+variable, ignoramos los defaults del entorno y el reto no tiene efecto.
 
-```bash
-# Confirmar que no hay cambios pendientes tras eliminar el bloque import
-terraform plan
-# Esperado: No changes. Your infrastructure matches the configuration.
+---
 
-# Confirmar que el parametro esta en el estado
-terraform state show aws_ssm_parameter.legacy_db
+**[main.tf](aws/main.tf)** — `aws_instance.monitoring`, atributo `instance_type`:
+
+```hcl
+# ANTES — lee directamente la variable; si el operador no especifica
+# instance_type, usa el default del tipo ("t4g.micro") sin tener en
+# cuenta que production deberia arrancar con "t4g.small"
+instance_type = var.monitoring_config.instance_type
+
+# DESPUES — lee el local fusionado; para production obtiene "t4g.small"
+# del mapa de defaults aunque el operador no haya escrito nada
+instance_type = local.effective_monitoring.instance_type
 ```
 
-**El formato de ID para distintos recursos**:
+---
 
-| Recurso | Formato del ID en import |
-|---|---|
-| `aws_s3_bucket` | Nombre del bucket |
-| `aws_ssm_parameter` | Nombre completo del parametro (con `/` inicial) |
-| `aws_instance` | ID de la instancia (`i-0abc1234...`) |
-| `aws_iam_role` | Nombre del rol |
-| `aws_security_group` | ID del security group (`sg-0abc1234...`) |
-| `aws_vpc` | ID del VPC (`vpc-0abc1234...`) |
+**[locals.tf](aws/locals.tf)** — dos locales que acceden a `alarm_email`:
 
-Siempre consulta la sección **Import** al final de la documentacion del
-recurso en `registry.terraform.io/providers/hashicorp/aws` para el formato
-exacto.
+```hcl
+# ANTES — monitoring_alarm_email extrae el email directamente de la
+# variable; si el operador no puso alarm_email, devuelve null aunque
+# el entorno production tenga "prod-alerts@example.com" como default
+monitoring_alarm_email = try(var.monitoring_config.alarm_email, null)
+
+# DESPUES — extrae el email del local fusionado; para production
+# obtiene "prod-alerts@example.com" aunque el operador no lo haya puesto
+monitoring_alarm_email = try(local.effective_monitoring.alarm_email, null)
+```
+
+```hcl
+# ANTES — can() evalua si var.monitoring_config.alarm_email es accesible;
+# si el operador no especifico alarm_email, can() devuelve false y no
+# se crea la alarma aunque production deberia tenerla por defecto
+monitoring_alarm_enabled = (
+  var.monitoring_config.enabled &&
+  can(var.monitoring_config.alarm_email) &&
+  local.monitoring_alarm_email != null
+)
+
+# DESPUES — can() evalua el local fusionado; para production,
+# local.effective_monitoring.alarm_email existe y no es null,
+# por lo que la alarma se crea automaticamente sin que el operador
+# tenga que recordar especificar el email
+monitoring_alarm_enabled = (
+  var.monitoring_config.enabled &&
+  can(local.effective_monitoring.alarm_email) &&
+  local.monitoring_alarm_email != null
+)
+```
+
+---
+
+**[variables.tf](aws/variables.tf)** — `instance_type` en `monitoring_config` debe usar `null` como default, no `"t4g.micro"`:
+
+```hcl
+# ANTES — optional(string, "t4g.micro") rellena instance_type con "t4g.micro"
+# cuando el operador no lo especifica. Ese valor NO es null, por lo que el
+# filtro "if v != null" en effective_monitoring lo incluye en el merge() y
+# sobreescribe el default del entorno (t4g.small en production). El entorno
+# nunca puede ganar porque la variable siempre aporta un valor no-null.
+instance_type = optional(string, "t4g.micro")
+
+# DESPUES — optional(string, null) deja instance_type como null cuando el
+# operador no lo especifica. El filtro "if v != null" lo excluye del merge()
+# y el default del entorno (t4g.small en production) puede aplicarse.
+# Si el operador SI especifica un valor, ese valor no es null y prevalece.
+instance_type = optional(string, null)
+```
+
+---
+
+**[outputs.tf](aws/outputs.tf)** — `monitoring_instance_type` debe leer el local fusionado, no la variable:
+
+```hcl
+# ANTES — muestra el valor de la variable (null ahora, o "t4g.micro" antes);
+# no refleja el tipo efectivo con el que se creo la instancia
+output "monitoring_instance_type" {
+  value = var.monitoring_config.instance_type
+}
+
+# DESPUES — muestra el valor efectivo tras fusionar defaults del entorno
+# con los valores del operador; refleja lo que realmente se despliega
+output "monitoring_instance_type" {
+  value = local.effective_monitoring.instance_type
+}
+```
+
+---
+
+Prueba:
+
+```bash
+# Aplica los cambios — la instancia se recrea con el nuevo instance_type
+# y se crean SNS topic + alarma porque production tiene alarm_email por defecto
+terraform apply --auto-approve
+# Esperado en el plan previo al apply:
+#   ~ aws_instance.monitoring[0]              (instance_type: t4g.micro -> t4g.small)
+#   + aws_sns_topic.monitoring_alerts[0]
+#   + aws_sns_topic_subscription.monitoring_email[0]
+#   + aws_cloudwatch_metric_alarm.monitoring_cpu[0]
+
+# Verifica el tipo efectivo y que la alarma se activo
+terraform output monitoring_instance_type
+# Esperado: "t4g.small" (default de produccion)
+
+terraform output monitoring_alarm_enabled
+# Esperado: true (production tiene alarm_email = "prod-alerts@example.com")
+
+# Sobreescribir el default del entorno con -var:
+terraform apply \
+  -var='monitoring_config={"enabled":true,"instance_type":"t4g.medium"}' \
+  --auto-approve
+terraform output monitoring_instance_type
+# Esperado: "t4g.medium" (el operador sobreescribio el default)
+
+terraform output monitoring_alarm_enabled
+# Esperado: true (alarm_email sigue siendo "prod-alerts@example.com"
+# del default del entorno — el operador no lo sobreescribio)
+
+# Cambiar al entorno dev — distintos defaults sin tocar monitoring_config
+terraform apply \
+  -var='environment=dev' \
+  --auto-approve
+# Esperado en el plan previo al apply:
+#   ~ aws_instance.monitoring[0]              (instance_type: t4g.medium -> t4g.micro)
+#   - aws_sns_topic.monitoring_alerts[0]                         (destruido)
+#   - aws_sns_topic_subscription.monitoring_email[0]             (destruido)
+#   - aws_cloudwatch_metric_alarm.monitoring_cpu[0]              (destruido)
+
+terraform output monitoring_instance_type
+# Esperado: "t4g.micro" (default de dev)
+
+terraform output monitoring_alarm_enabled
+# Esperado: false (dev no tiene alarm_email en sus defaults)
+```
 
 </details>
+
+---
+
+## Verificación final
+
+```bash
+cd labs/lab-39/aws
+
+# Verificar que la instancia EC2 está running
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=lab39" \
+  --query 'Reservations[*].Instances[*].{ID:InstanceId,State:State.Name,IP:PublicIpAddress}' \
+  --output table
+
+# Verificar que la alarma de CPU está configurada
+aws cloudwatch describe-alarms \
+  --query 'MetricAlarms[?contains(AlarmName,`lab39`)].{Name:AlarmName,State:StateValue}' \
+  --output table
+
+# Verificar los outputs del modulo (tags fusionados, codigos de facturacion)
+terraform output -json
+
+# Confirmar que el bloque check {} no lanza UNKNOWN en el plan
+terraform plan -detailed-exitcode
+echo "Exit code: $? (0=no changes, 1=error, 2=changes pending)"
+```
 
 ---
 
@@ -1096,64 +1168,42 @@ exacto.
 ```bash
 cd labs/lab-39/aws
 
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-# Si adoptaste el bucket legacy, terraform destroy lo incluira en la destruccion.
-# Para preservarlo (si fuera un recurso real de produccion), eliminalo
-# del estado antes de destruir:
-#   terraform state rm aws_s3_bucket.legacy_logs
-
 terraform destroy
-
-# Si el bucket legacy no fue adoptado por Terraform, eliminalo manualmente:
-aws s3 rm "s3://lab39-legacy-logs-${ACCOUNT_ID}" --recursive
-aws s3api delete-bucket \
-  --bucket "lab39-legacy-logs-${ACCOUNT_ID}" \
-  --region us-east-1
-
-# Eliminar el parametro SSM legacy si lo creaste en el Reto 2
-aws ssm delete-parameter \
-  --name "/lab39/legacy/db-endpoint" \
-  --region us-east-1
-
-# Limpiar ficheros temporales generados durante el laboratorio
-rm -f generated.tf generated_ssm.tf
 ```
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Todos los recursos declaran `provider` explicito**: al no haber proveedor
-  sin alias, omitir `provider` causaría un error. La declaración explícita
-  tambien hace que la intencion regional sea evidente en el codigo.
-- **Sufijos de región en los nombres de bucket**: `-use1` y `-euw3` evitan
-  colisiones accidentales y hacen inmediatamente visible la región de cada
-  recurso en listados y logs.
-- **`-refresh-only` antes de decidir**: ejecutar `plan -refresh-only` como
-  primer paso ante cualquier sospecha de drift proporciona visibilidad sin
-  riesgo. Nunca apliques drift sin haberlo revisado primero.
-- **Revision del HCL generado**: `-generate-config-out` es un punto de
-  partida, no código de producción. Revisa siempre el fichero generado antes
-  de integrarlo: elimina atributos de solo lectura, reemplaza valores
-  hardcoded por variables y actualiza los tags al estandar del proyecto.
-- **El bloque `import` como codigo revisable**: a diferencia del comando
-  `terraform import`, el bloque declarativo forma parte del historial de git
-  y puede revisarse en pull request, documentando la decision de adoptar cada
-  recurso.
-- **`terraform state rm` antes de destruir recursos adoptados**: si decides
-  destruir la infraestructura del laboratorio pero quieres preservar un recurso
-  adoptado (por ejemplo, el bucket legacy es de producción), elimínalo del
-  estado con `terraform state rm` antes de ejecutar `destroy`. Esto le dice
-  a Terraform que deje de gestionar ese recurso sin borrarlo de AWS.
+- **Flatten Pattern en `locals.tf`**: separar la transformacion de datos de
+  la declaración de recursos hace el código más legible y testeable. Los
+  locals son el lugar correcto para la logica de transformacion.
+- **Claves compuestas semanticas**: `"networking/public-a"` es mas legible
+  y estable que un indice numerico. Ante un `terraform plan`, el operador
+  sabe exactamente que subred se va a modificar.
+- **`merge()` en capas con precedencia explicita**: organizar las capas de
+  menor a mayor prioridad (departamento → identificacion) hace que el codigo
+  sea autodocumentado sobre que prevalece en caso de colision.
+- **`optional()` con defaults razonables**: los valores por defecto deben
+  funcionar correctamente en el caso de uso mas comun. `alarm_email = null`
+  es un default correcto porque no crear una alarma es la opción segura;
+  en cambio, un `instance_type = null` sería un default incorrecto porque
+  causaría un error en el apply.
+- **`precondition` para errores de configuración**: una precondición con un
+  mensaje descriptivo ahorra al operador la frustración de esperar un apply
+  fallido con un error críptico de AWS. La AZ no autorizada es el ejemplo
+  tipico: AWS devuelve `InvalidParameterValue` sin contexto; la precondicion
+  explica exactamente que esta mal y como corregirlo.
+- **`postcondition` para invariantes de AWS**: no todo lo que AWS debe
+  garantizar queda capturado en el plan. La postcondicion actua como un test
+  de integración mínimo que se ejecuta en cada apply.
 
 ---
 
 ## Recursos
 
-- [Multiple Provider Configurations — Terraform Docs](https://developer.hashicorp.com/terraform/language/providers/configuration#alias-multiple-provider-configurations)
-- [Import block — Terraform 1.5+](https://developer.hashicorp.com/terraform/language/import)
-- [Generating Configuration — `-generate-config-out`](https://developer.hashicorp.com/terraform/language/import/generating-configuration)
-- [Refresh-Only Plans — Terraform Docs](https://developer.hashicorp.com/terraform/cli/commands/plan#planning-modes)
-- [Resource: aws_s3_bucket — Import](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket#import)
-- [Resource: aws_ssm_parameter — Import](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ssm_parameter#import)
+- [Flatten Pattern — Terraform Docs](https://developer.hashicorp.com/terraform/language/functions/flatten)
+- [merge() — Terraform Docs](https://developer.hashicorp.com/terraform/language/functions/merge)
+- [optional() en tipos de objeto](https://developer.hashicorp.com/terraform/language/expressions/type-constraints#optional-object-type-attributes)
+- [precondition y postcondition](https://developer.hashicorp.com/terraform/language/validate)
+- [default_tags en el provider AWS](https://registry.terraform.io/providers/hashicorp/aws/latest/docs#default_tags-configuration-block)

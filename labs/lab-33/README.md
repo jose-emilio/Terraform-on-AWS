@@ -1,149 +1,156 @@
-# Laboratorio 33 — El Data Lake Blindado: S3 con Seguridad y Ciclo de Vida
+# Laboratorio 33 — FinOps y Rendimiento: Optimización de Cómputo
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
 
-[← Módulo 8 — Almacenamiento y Bases de Datos con Terraform](../../modulos/modulo-08/README.md)
+[← Módulo 7 — Cómputo en AWS con Terraform](../../modulos/modulo-07/README.md)
 
 
 ## Visión general
 
-En este laboratorio implementarás un bucket S3 de nivel empresarial que cubre privacidad, cifrado, resiliencia y ahorro automático de costes. Aprenderás a bloquear el acceso público con los cuatro controles de `aws_s3_bucket_public_access_block`, a cifrar con una **CMK propia** activando el **Bucket Key** para reducir un 99% las llamadas a KMS, a habilitar el **versionado** como escudo contra ransomware y errores humanos, a configurar un **ciclo de vida** que mueve datos a Glacier a los 90 días y los elimina al año, y a restringir el acceso mediante un **VPC Gateway Endpoint** con una bucket policy que deniega todo tráfico que no provenga del endpoint.
+En este laboratorio aplicarás técnicas avanzadas para reducir la factura de AWS y mejorar la latencia de tus servicios. Aprenderás a configurar una **estrategia de Fargate Spot** con ratio 3:1 frente a On-Demand para ahorrar hasta un 70% en el coste de cómputo de tus contenedores, a eliminar los **cold starts de Lambda** con Provisioned Concurrency sobre un alias versionado, a desplegar Lambda dentro de una **VPC privada** con `vpc_config` para acceder a bases de datos internas sin exponer esos recursos a internet, y a habilitar **observabilidad de costes** con Container Insights, CloudWatch Alarms y notificaciones SNS.
 
-Toda la configuración del bucket se encapsula en un **módulo local reutilizable** (`modules/secure-bucket`), de forma que puede aplicarse a cualquier bucket del proyecto con un único bloque `module`.
-
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Crear un módulo local Terraform con variables, recursos y outputs propios, e invocarlo desde el módulo raíz
-- Aplicar `aws_s3_bucket_public_access_block` con los cuatro controles activos y entender qué bloquea cada uno
-- Configurar cifrado SSE-KMS con `aws_kms_key` (CMK propia) y activar `bucket_key_enabled = true` para reducir el coste de llamadas a KMS
-- Habilitar `aws_s3_bucket_versioning` y entender por qué las versiones protegen contra ransomware y borrados accidentales
-- Definir una `aws_s3_bucket_lifecycle_configuration` con transición a Glacier y expiración para versiones actuales y no actuales
-- Crear un `aws_vpc_endpoint` de tipo Gateway para S3 y asociar una bucket policy con la condición `aws:sourceVpce` que restringe el acceso al endpoint
+- Configurar `aws_ecs_cluster_capacity_providers` con `FARGATE` y `FARGATE_SPOT` usando una estrategia de peso 3:1 para distribuir tareas entre capacidad Spot (barata) y On-Demand (estable)
+- Publicar versiones numeradas de Lambda con `publish = true` y crear un `aws_lambda_alias` que actúe como punto de entrada estable mientras el código evoluciona
+- Configurar `aws_lambda_provisioned_concurrency_config` sobre un alias para mantener instancias pre-calentadas y verificar la ausencia de cold start con la variable `AWS_LAMBDA_INITIALIZATION_TYPE`
+- Desplegar Lambda en subredes privadas mediante `vpc_config` y adjuntar `AWSLambdaVPCAccessExecutionRole` para que el servicio Lambda pueda crear las ENIs necesarias
+- Activar Container Insights en el cluster ECS con el bloque `setting { name = "containerInsights", value = "enabled" }`
+- Crear un `aws_cloudwatch_metric_alarm` sobre `CPUUtilization` con `evaluation_periods = 2` para evitar falsas alarmas por picos momentáneos, y enrutar notificaciones a un `aws_sns_topic`
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre S3, KMS, EC2 (VPC) e IAM
-- LocalStack en ejecución (para la sección de LocalStack)
+- Perfil AWS con permisos sobre Lambda, ECS, EC2 (VPC), IAM, CloudWatch y SNS
 
 ---
 
-## Arquitectura
+## Conceptos clave
 
-![Data Lake S3 con KMS CMK, SSE-KMS Bucket Key, versionado, lifecycle a Glacier y bucket policy que exige VPC Gateway Endpoint](arch/diagrama.svg)
+### Estrategia Spot: Capacity Providers en ECS Fargate
 
-El módulo `secure-bucket` encapsula todas las capas de defensa: una **CMK** dedicada con rotación anual cifra los objetos vía **SSE-KMS con Bucket Key** (1 sola llamada a KMS por bucket en lugar de por objeto). El bloqueo público con los 4 controles, el **versionado** anti-ransomware y la **lifecycle rule** que transiciona a Glacier y luego expira completan la fortificación. La **bucket policy** deniega `s3:*` cuando `aws:sourceVpce ≠ endpoint` **Y** `aws:PrincipalAccount ≠ cuenta` (AND lógico): así los principales de la propia cuenta acceden con normalidad y los accesos externos solo funcionan a través del **VPC Gateway Endpoint** desde la subred privada.
-
----
-
-## Conceptos Clave
-
-### Módulo local: encapsulación de controles de seguridad
-
-Un módulo local agrupa recursos relacionados bajo una interfaz clara (variables + outputs). En este laboratorio, `modules/secure-bucket` encapsula los seis recursos de seguridad del bucket. El módulo raíz (`main.tf`) lo invoca con un bloque `module`, pasando únicamente los parámetros que varían:
+`aws_ecs_cluster_capacity_providers` define qué tipos de capacidad puede usar el cluster y cuál es la estrategia por defecto. La estrategia de peso 3:1 indica que por cada 4 tareas nuevas, 3 se solicitan en FARGATE_SPOT y 1 en FARGATE On-Demand:
 
 ```hcl
-module "datalake" {
-  source = "./modules/secure-bucket"
+resource "aws_ecs_cluster_capacity_providers" "main" {
+  cluster_name       = aws_ecs_cluster.main.name
+  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
 
-  bucket_name     = local.bucket_name
-  project         = var.project
-  tags            = local.tags
-  vpc_endpoint_id = aws_vpc_endpoint.s3.id
-  transition_days = var.transition_days
-  expiration_days = var.expiration_days
-}
-```
+  default_capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 3
+    base              = 0
+  }
 
-El módulo puede reutilizarse para crear un segundo bucket (por ejemplo, `logs`) añadiendo otro bloque `module` con distintos valores, sin duplicar código.
-
-### Bloqueo de acceso público: cuatro controles
-
-`aws_s3_bucket_public_access_block` aplica cuatro controles independientes:
-
-| Control | Qué bloquea |
-|---|---|
-| `block_public_acls` | Rechaza `PutBucketAcl` y `PutObjectAcl` que otorguen acceso público |
-| `ignore_public_acls` | Ignora ACLs públicas ya existentes en el bucket |
-| `block_public_policy` | Rechaza `PutBucketPolicy` si la política concede acceso público |
-| `restrict_public_buckets` | Bloquea el acceso anónimo aunque la política lo permita |
-
-Los cuatro activos en conjunto garantizan que ningún objeto sea accesible públicamente, incluso si se aplica una ACL o política errónea.
-
-### SSE-KMS con Customer Managed Key y Bucket Key
-
-Con `sse_algorithm = "aws:kms"` y una CMK propia, cada objeto se cifra con una **Data Encryption Key** (DEK) generada por KMS. La CMK cifra la DEK — nunca el objeto directamente.
-
-**Bucket Key** (`bucket_key_enabled = true`) cambia este modelo: S3 genera una Bucket Key derivada de la CMK y la almacena en el bucket. Las llamadas a KMS se hacen solo para obtener o renovar la Bucket Key, no por objeto. Resultado: hasta un 99% menos de llamadas a KMS, con el consiguiente ahorro en costes y reducción de latencia.
-
-```hcl
-rule {
-  bucket_key_enabled = true
-  apply_server_side_encryption_by_default {
-    sse_algorithm     = "aws:kms"
-    kms_master_key_id = aws_kms_key.s3.arn
+  default_capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 1
+    base              = 1  # garantiza al menos 1 tarea On-Demand siempre activa
   }
 }
 ```
 
-### Versionado: protección contra ransomware y errores humanos
+`base = 1` en FARGATE es crítico: asegura que al menos 1 tarea On-Demand esté activa antes de distribuir el resto según los pesos. Esto protege el servicio de una interrupción total si AWS reclama toda la capacidad Spot disponible.
 
-Con versionado habilitado, S3 preserva todas las versiones de cada objeto. Un ataque de ransomware (que cifra y sobreescribe los objetos) crea nuevas versiones con el contenido cifrado, pero las versiones originales permanecen intactas y recuperables. Un borrado accidental crea un "delete marker" — la versión anterior se restaura eliminando el marker.
+AWS puede interrumpir las tareas FARGATE_SPOT con 2 minutos de aviso cuando necesita recuperar capacidad. Por eso, las aplicaciones que usen Spot deben ser **stateless** y capaces de terminar limpiamente en ese tiempo.
+
+### Alias de Lambda y Versiones Publicadas
+
+Con `publish = true`, cada `terraform apply` que cambie el código ZIP genera una versión numerada e inmutable. `aws_lambda_alias` crea un nombre estable que apunta a una versión concreta:
 
 ```hcl
-resource "aws_s3_bucket_versioning" "main" {
-  bucket = aws_s3_bucket.main.id
-  versioning_configuration {
-    status = "Enabled"
+resource "aws_lambda_function" "main" {
+  publish = true
+  # ...
+}
+
+resource "aws_lambda_alias" "live" {
+  name             = "live"
+  function_name    = aws_lambda_function.main.function_name
+  function_version = aws_lambda_function.main.version  # versión más reciente publicada
+}
+```
+
+Los clientes que invocan el alias `live` siempre reciben la misma versión hasta que el alias se actualice explícitamente. Esto permite hacer rollback cambiando `function_version` sin afectar la integración del cliente.
+
+### Provisioned Concurrency: Eliminación de Cold Starts
+
+`aws_lambda_provisioned_concurrency_config` mantiene un número fijo de contenedores Lambda inicializados y listos para responder. Las invocaciones al alias reciben una instancia pre-calentada sin pasar por el proceso de inicialización:
+
+```hcl
+resource "aws_lambda_provisioned_concurrency_config" "live" {
+  function_name                      = aws_lambda_function.main.function_name
+  qualifier                          = aws_lambda_alias.live.name
+  provisioned_concurrent_executions  = 5
+}
+```
+
+La variable de entorno `AWS_LAMBDA_INITIALIZATION_TYPE` es la forma oficial de verificar si una invocación usó un contenedor pre-calentado:
+
+```python
+init_type = os.environ.get("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand")
+# "provisioned-concurrency" → sin cold start
+# "on-demand"               → cold start normal
+```
+
+> **Coste de Provisioned Concurrency**: se factura por GB-segundo de capacidad reservada, independientemente de si hay invocaciones. 5 instancias de 128 MB durante 1 hora ≈ 0,013 USD. Desactiva la configuración (`terraform destroy` o `provisioned_concurrent_executions = 0`) cuando no la necesites.
+
+### Lambda en VPC: vpc_config y Subredes Privadas
+
+`vpc_config` conecta Lambda a tu VPC creando ENIs (Elastic Network Interfaces) en las subredes especificadas. Lambda usa esas ENIs para alcanzar recursos privados como RDS, ElastiCache o servicios internos:
+
+```hcl
+resource "aws_lambda_function" "main" {
+  vpc_config {
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
   }
 }
 ```
 
-### Ciclo de vida: FinOps automático
-
-`aws_s3_bucket_lifecycle_configuration` define reglas que AWS aplica automáticamente. La regla de este laboratorio actúa sobre todos los objetos (`filter {}`) y sobre sus versiones no actuales:
+Sin `AWSLambdaVPCAccessExecutionRole`, el despliegue falla con un error de permisos porque el servicio Lambda no puede crear ni eliminar las ENIs:
 
 ```hcl
-transition {
-  days          = 90    # versión actual → Glacier tras 90 días
-  storage_class = "GLACIER"
-}
-
-expiration {
-  days = 365            # versión actual → eliminada tras 365 días
-}
-
-noncurrent_version_transition {
-  noncurrent_days = 90  # versiones antiguas → Glacier
-  storage_class   = "GLACIER"
-}
-
-noncurrent_version_expiration {
-  noncurrent_days = 365 # versiones antiguas → eliminadas
+resource "aws_iam_role_policy_attachment" "lambda_vpc" {
+  role       = aws_iam_role.lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 ```
 
-Glacier Flexible Retrieval cuesta ~$0.004/GB/mes frente a ~$0.023/GB/mes de S3 Standard — un ahorro del 83% para datos de acceso infrecuente.
+Lambda en subredes **privadas** (sin ruta a internet) puede acceder a recursos VPC internos pero no a internet. Para que Lambda también pueda llamar a APIs externas, necesita un NAT Gateway o VPC Endpoints para los servicios AWS que use.
 
-### VPC Gateway Endpoint y bucket policy con sourceVpce
+### Observabilidad: Container Insights, CloudWatch Alarm y SNS
 
-Un Gateway Endpoint de S3 es **gratuito** (a diferencia del Interface Endpoint). Inyecta una ruta en la route table de la subred para que el tráfico S3 no salga a internet. Su ID puede usarse en la bucket policy como condición:
+Container Insights activa métricas por contenedor (CPU, memoria, red, disco) adicionales a las métricas estándar de servicio:
 
 ```hcl
-Condition = {
-  StringNotEquals = {
-    "aws:sourceVpce" = "vpce-xxxxxxxxxxxxxxxxx"
+resource "aws_ecs_cluster" "main" {
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
   }
 }
 ```
 
-Con `Effect = "Deny"` y esta condición, cualquier petición que no provenga del endpoint es denegada, incluso si el principal tiene permisos IAM suficientes. Es la forma más efectiva de garantizar que solo el tráfico interno de la VPC pueda acceder a los datos.
+La alarma usa `evaluation_periods = 2` para requerir que la condición se cumpla durante 2 periodos consecutivos antes de activarse. Esto evita falsas alarmas por picos momentáneos durante el arranque de contenedores:
 
-> **Nota**: la bucket policy de este laboratorio incluye una excepción para cualquier principal de la propia cuenta (condición `aws:PrincipalAccount = ACCOUNT_ID` evaluada con `StringNotEquals` junto a `aws:sourceVpce`). El `Deny` sólo se activa cuando el principal **no** pertenece a la cuenta **y** el tráfico **no** viene del endpoint, lo que permite a Terraform gestionar el bucket desde fuera de la VPC. En producción, sustituye `aws:PrincipalAccount` por `aws:PrincipalArn` con el ARN específico del rol de despliegue para reducir el alcance al mínimo.
+```hcl
+resource "aws_cloudwatch_metric_alarm" "ecs_cpu" {
+  namespace           = "AWS/ECS"
+  metric_name         = "CPUUtilization"
+  dimensions          = { ClusterName = "...", ServiceName = "..." }
+  period              = 60
+  evaluation_periods  = 2   # 2 minutos sostenidos > 80% para activar
+  statistic           = "Average"
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 80
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+}
+```
 
 ---
 
@@ -152,77 +159,85 @@ Con `Effect = "Deny"` y esta condición, cualquier petición que no provenga del
 ```
 lab-33/
 ├── arch/
-│   └── diagrama.svg              # Diagrama de arquitectura (referenciado en este README)
-├── aws/
-│   ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
-│   ├── providers.tf          # Backend S3, Terraform >= 1.10, provider AWS
-│   ├── variables.tf          # region, project, transition_days, expiration_days
-│   ├── main.tf               # VPC, subred, route table, VPC endpoint, módulo
-│   ├── outputs.tf            # bucket_name, kms_key_arn, vpc_endpoint_id...
-│   └── modules/
-│       └── secure-bucket/
-│           ├── variables.tf  # bucket_name, vpc_endpoint_id, transition/expiration_days
-│           ├── main.tf       # KMS, bucket, public access block, SSE, versioning,
-│           │                 # lifecycle, bucket policy
-│           └── outputs.tf    # bucket_id, bucket_arn, kms_key_arn, kms_alias
-└── localstack/
-    ├── providers.tf          # Endpoints LocalStack (s3, kms, ec2, iam, sts)
-    ├── variables.tf          # project = "lab33-local"
-    ├── main.tf               # VPC, VPC endpoint, módulo
-    ├── outputs.tf
-    ├── README.md             # Limitaciones + comandos awslocal
-    └── modules/
-        └── secure-bucket/    # Misma interfaz; anotaciones de limitaciones LocalStack
+│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
+└── aws/
+    ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
+    ├── providers.tf          # Backend S3, Terraform >= 1.10, providers AWS y archive
+    ├── variables.tf          # region, project, runtime, provisioned_concurrency,
+    │                         # ecs_desired_count, alert_email
+    ├── main.tf               # VPC+subredes+SGs, IAM (Lambda+ECS), CloudWatch,
+    │                         # Lambda+Alias+Provisioned Concurrency, ECS cluster+
+    │                         # capacity providers+task def+service, SNS, CW Alarm
+    ├── outputs.tf            # function_name, function_version, alias_arn,
+    │                         # cluster_name, alarm_name, invoke_alias_example
+    └── src/
+        └── function/
+            └── handler.py    # Muestra init_type y vpc_hostname en la respuesta
 ```
+
+> **Nota**: `function.zip` es un artefacto generado por `archive_file` durante `terraform plan/apply`. No se versiona en Git — añádelo a `.gitignore`.
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
-### Módulo secure-bucket
+### Arquitectura
 
-El módulo recibe el ID del endpoint como variable y lo inyecta en la bucket policy:
+![Lambda en VPC con Provisioned Concurrency sobre alias live + ECS Fargate Spot 3:1 con base=1 On-Demand + alarma CPU → SNS](arch/diagrama.svg)
+
+Dos optimizaciones complementarias sobre la misma VPC. **Lambda** vive en subredes privadas (`vpc_config` con ENIs), publica versión por apply (`publish = true`) y un alias `live` apunta a la última. La **Provisioned Concurrency** se aplica al alias — cualquier invocación a `live` golpea contenedores pre-calentados (sin cold start). **ECS Fargate** corre nginx en subredes públicas con la estrategia `capacity_provider_strategy` 3:1 entre `FARGATE_SPOT` y `FARGATE`: `base = 1` en On-Demand garantiza al menos 1 tarea sobreviviente si AWS reclama instancias Spot. Una `aws_cloudwatch_metric_alarm` sobre CPU del servicio dispara `SNS` (con suscripción email opcional) tanto en `alarm` como en `ok`.
+
+### Código Terraform
+
+**`aws/main.tf`** — Fragmentos clave:
+
+Lambda se despliega con `publish = true` y `vpc_config`. Ambos son independientes entre sí — cualquier función puede tener uno, ambos o ninguno:
 
 ```hcl
-# modules/secure-bucket/main.tf (fragmento)
-resource "aws_s3_bucket_policy" "main" {
-  bucket     = aws_s3_bucket.main.id
-  depends_on = [aws_s3_bucket_public_access_block.main]
+resource "aws_lambda_function" "main" {
+  function_name    = "${var.project}-function"
+  filename         = data.archive_file.function.output_path
+  source_code_hash = data.archive_file.function.output_base64sha256
+  runtime          = var.runtime
+  handler          = "handler.lambda_handler"
+  role             = aws_iam_role.lambda.arn
+  publish          = true  # genera versión numerada en cada cambio de código
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "DenyExternalNonVPCEndpoint"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "s3:*"
-      Resource  = [aws_s3_bucket.main.arn, "${aws_s3_bucket.main.arn}/*"]
-      Condition = {
-        StringNotEquals = {
-          "aws:sourceVpce"       = var.vpc_endpoint_id
-          "aws:PrincipalAccount" = local.account_id
-        }
-      }
-    }]
-  })
+  vpc_config {
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
 ```
 
-El módulo raíz crea el endpoint y se lo pasa al módulo:
+Provisioned Concurrency requiere que el `qualifier` sea un alias o un número de versión — nunca `$LATEST`:
 
 ```hcl
-# main.tf
-resource "aws_vpc_endpoint" "s3" {
-  vpc_id            = aws_vpc.main.id
-  service_name      = "com.amazonaws.${var.region}.s3"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = [aws_route_table.private.id]
+resource "aws_lambda_provisioned_concurrency_config" "live" {
+  function_name                      = aws_lambda_function.main.function_name
+  qualifier                          = aws_lambda_alias.live.name  # alias "live", no $LATEST
+  provisioned_concurrent_executions  = var.provisioned_concurrency
 }
+```
 
-module "datalake" {
-  source          = "./modules/secure-bucket"
-  vpc_endpoint_id = aws_vpc_endpoint.s3.id
-  # ...
+La estrategia Spot se define en `aws_ecs_cluster_capacity_providers`, separado del recurso de cluster. Esto permite modificar la estrategia sin recrear el cluster:
+
+```hcl
+resource "aws_ecs_cluster_capacity_providers" "main" {
+  cluster_name       = aws_ecs_cluster.main.name
+  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
+
+  default_capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 3
+    base              = 0
+  }
+
+  default_capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 1
+    base              = 1
+  }
 }
 ```
 
@@ -241,132 +256,186 @@ terraform plan
 terraform apply
 ```
 
+> **Nota sobre Provisioned Concurrency**: `terraform apply` puede tardar 2–5 minutos adicionales mientras AWS aprovisiona los 5 contenedores Lambda. Es normal — el recurso `aws_lambda_provisioned_concurrency_config` espera a que el estado sea `READY`.
+
 Al finalizar, los outputs mostrarán:
 
 ```
-bucket_arn           = "arn:aws:s3:::lab33-datalake-123456789012"
-bucket_name          = "lab33-datalake-123456789012"
-kms_alias            = "alias/lab33-datalake"
-kms_key_arn          = "arn:aws:kms:us-east-1:123456789012:key/..."
-vpc_endpoint_id      = "vpce-0abc123..."
+alarm_name           = "lab33-ecs-cpu-high"
+alias_arn            = "arn:aws:lambda:us-east-1:123456789:function:lab33-function:live"
+alias_invoke_arn     = "arn:aws:apigateway:us-east-1:lambda:path/..."
+cluster_name         = "lab33-cluster"
+function_name        = "lab33-function"
+function_version     = "1"
+invoke_alias_example = "aws lambda invoke --function-name lab33-function --qualifier live ..."
+invoke_latest_example= "aws lambda invoke --function-name lab33-function ..."
+lambda_sg_id         = "sg-0abc123..."
+log_group_ecs        = "/ecs/lab33"
+log_group_lambda     = "/aws/lambda/lab33-function"
+private_subnet_ids   = ["subnet-0abc...", "subnet-0def..."]
+service_name         = "lab33-service"
+sns_topic_arn        = "arn:aws:sns:us-east-1:123456789:lab33-alerts"
 vpc_id               = "vpc-0abc123..."
 ```
 
 ### Verificar el sistema
 
-**Paso 1** — Verifica los cuatro controles de acceso público:
+**Paso 1** — Verifica Provisioned Concurrency y el alias:
 
 ```bash
-BUCKET=$(terraform output -raw bucket_name)
+FUNCTION=$(terraform output -raw function_name)
 
-aws s3api get-public-access-block --bucket "$BUCKET" \
-  --query 'PublicAccessBlockConfiguration'
+# Estado de la Provisioned Concurrency sobre el alias "live"
+aws lambda get-provisioned-concurrency-config \
+  --function-name "$FUNCTION" \
+  --qualifier live \
+  --query '{Solicitada:RequestedProvisionedConcurrentExecutions,Asignada:AllocatedProvisionedConcurrentExecutions,Estado:Status}'
 ```
 
-Los cuatro valores deben ser `true`.
+El estado debe ser `READY`. Si muestra `IN_PROGRESS`, espera un minuto y repite.
 
-**Paso 2** — Verifica el cifrado SSE-KMS y Bucket Key:
+**Paso 2** — Invoca a través del alias y verifica que no hay cold start:
 
 ```bash
-aws s3api get-bucket-encryption --bucket "$BUCKET" \
-  --query 'ServerSideEncryptionConfiguration.Rules[0]'
+# Invocación vía alias "live" → init_type debe ser "provisioned-concurrency"
+terraform output -raw invoke_alias_example | bash
 ```
 
-Busca `"SSEAlgorithm": "aws:kms"` y `"BucketKeyEnabled": true`.
+Respuesta esperada:
+```json
+{
+  "statusCode": 200,
+  "body": {
+    "function_name": "lab33-function",
+    "function_version": "1",
+    "init_type": "provisioned-concurrency",
+    "vpc_hostname": "169.254.x.x",
+    "env": "production",
+    ...
+  }
+}
+```
 
-**Paso 3** — Verifica el versionado:
+**Paso 3** — Contrasta con una invocación a `$LATEST` (sin Provisioned Concurrency):
 
 ```bash
-aws s3api get-bucket-versioning --bucket "$BUCKET"
+# Invocación a $LATEST → init_type puede ser "on-demand" (cold start)
+terraform output -raw invoke_latest_example | bash
 ```
 
-Debe mostrar `"Status": "Enabled"`.
+Si es la primera invocación a `$LATEST`, verás `"init_type": "on-demand"` y un tiempo de respuesta mayor.
 
-**Paso 4** — Verifica la lifecycle configuration:
+**Paso 4** — Verifica la configuración VPC de Lambda:
 
 ```bash
-aws s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" \
-  --query 'Rules[0].{ID:ID,Estado:Status,Transicion:Transitions[0],Expiracion:Expiration}'
+aws lambda get-function-configuration \
+  --function-name "$FUNCTION" \
+  --query 'VpcConfig.{Subredes:SubnetIds,SG:SecurityGroupIds,VPC:VpcId}'
 ```
 
-**Paso 5** — Verifica la CMK y su rotación:
+**Paso 5** — Verifica la estrategia Spot del cluster ECS:
+
+> **Nota**: en la consola de ECS la columna *Launch type* muestra `Fargate` para **todas** las tareas, tanto FARGATE como FARGATE_SPOT. Eso es correcto — ambas usan la misma infraestructura Fargate. La distinción está en la columna *Capacity provider*, no en el launch type.
 
 ```bash
-KMS_ARN=$(terraform output -raw kms_key_arn)
+CLUSTER=$(terraform output -raw cluster_name)
+SERVICE=$(terraform output -raw service_name)
 
-aws kms describe-key --key-id "$KMS_ARN" \
-  --query 'KeyMetadata.{KeyId:KeyId,Estado:KeyState,Rotacion:KeyRotationStatus}'
+# Estrategia configurada en el servicio
+aws ecs describe-services \
+  --cluster "$CLUSTER" \
+  --services "$SERVICE" \
+  --query 'services[0].{Deseadas:desiredCount,Corriendo:runningCount,Estrategia:capacityProviderStrategy}'
 
-# La rotación debe estar habilitada
-aws kms get-key-rotation-status --key-id "$KMS_ARN"
+# Capacity provider real de cada tarea en ejecución
+TASK_ARNS=$(aws ecs list-tasks --cluster "$CLUSTER" --query 'taskArns[]' --output text)
+
+aws ecs describe-tasks \
+  --cluster "$CLUSTER" \
+  --tasks $TASK_ARNS \
+  --query 'tasks[*].{ID:taskArn,LaunchType:launchType,CapacityProvider:capacityProviderName}'
 ```
 
-**Paso 6** — Verifica el VPC Endpoint y su ruta inyectada:
+La salida mostrará `"LaunchType": "Fargate"` en todas las tareas y `"CapacityProvider": "FARGATE_SPOT"` o `"FARGATE"` según la distribución 3:1. Con `desired_count = 2` y `base = 1`, una tarea irá a FARGATE (el base) y la otra a FARGATE_SPOT.
+
+**Paso 6** — Verifica la alarma CloudWatch:
 
 ```bash
-aws ec2 describe-vpc-endpoints \
-  --vpc-endpoint-ids "$(terraform output -raw vpc_endpoint_id)" \
-  --query 'VpcEndpoints[0].{ID:VpcEndpointId,Estado:State,Tipo:VpcEndpointType,RouteTables:RouteTableIds}'
+aws cloudwatch describe-alarms \
+  --alarm-names "$(terraform output -raw alarm_name)" \
+  --query 'MetricAlarms[0].{Estado:StateValue,Umbral:Threshold,Periodos:EvaluationPeriods}'
 ```
 
-**Paso 7** — Sube un objeto y verifica el cifrado aplicado:
+La alarma comenzará en `INSUFFICIENT_DATA` y pasará a `OK` tras el primer ciclo de 60 segundos si el cluster tiene tareas corriendo con CPU < 80%.
+
+**Paso 7** — Verifica la suscripción SNS (si configuraste `alert_email`):
 
 ```bash
-echo "datos de prueba" > /tmp/test.txt
-aws s3 cp /tmp/test.txt s3://"$BUCKET"/test.txt
-
-# Verifica que el objeto está cifrado con la CMK
-aws s3api head-object --bucket "$BUCKET" --key test.txt \
-  --query '{ServerSideEncryption:ServerSideEncryption,KMSKeyId:SSEKMSKeyId}'
+aws sns list-subscriptions-by-topic \
+  --topic-arn "$(terraform output -raw sns_topic_arn)" \
+  --query 'Subscriptions[*].{Protocolo:Protocol,Endpoint:Endpoint,Estado:SubscriptionArn}'
 ```
 
-**Paso 8** — Verifica el versionado subiendo el mismo objeto dos veces:
+Si la suscripción está en `PendingConfirmation`, revisa tu bandeja de entrada y confirma el email de AWS.
+
+### Publicar una nueva versión y ver cómo avanza el alias
+
+Cuando modificas el código y aplicas, Terraform publica una nueva versión y actualiza el alias automáticamente:
 
 ```bash
-echo "version 2" > /tmp/test.txt
-aws s3 cp /tmp/test.txt s3://"$BUCKET"/test.txt
+# Añade un comentario al handler para cambiar el hash del ZIP
+echo "# v1.1" >> src/function/handler.py
 
-# Lista las versiones — deben aparecer 2 versiones de test.txt
-aws s3api list-object-versions --bucket "$BUCKET" \
-  --query 'Versions[*].{Key:Key,VersionId:VersionId,Latest:IsLatest}' --output table
+terraform plan
+# ~ source_code_hash = "aBcDe..." -> "XyZwV..."
+# + function_version: "1" -> "2" (nueva versión publicada)
+
+terraform apply
+
+# Verifica que el alias apunta ahora a la versión 2
+aws lambda get-alias \
+  --function-name "$(terraform output -raw function_name)" \
+  --name live \
+  --query '{Alias:Name,Version:FunctionVersion}'
+
+# Invoca vía el alias "live" — ahora apunta a la versión 2
+# El campo "function_version" en la respuesta debe mostrar "2"
+terraform output -raw invoke_alias_example | bash
 ```
 
-**Paso 9** — Verifica la bucket policy:
-
-```bash
-aws s3api get-bucket-policy --bucket "$BUCKET" \
-  --query Policy --output text | python3 -m json.tool
-```
-
-Confirma que el `Statement` tiene `Effect: Deny` con un único bloque `StringNotEquals` que incluye `aws:sourceVpce` (ID del endpoint) y `aws:PrincipalAccount` (ID de la cuenta). Ambos como AND lógico — el Deny sólo dispara cuando el origen NO es el endpoint Y el principal NO pertenece a la cuenta.
+El alias `live` siempre usa `--qualifier live`, no el número de versión directamente. Eso es correcto: el alias actúa como punto de entrada estable. Lo que cambia en la respuesta es `"function_version": "2"` — el handler expone `context.function_version`, que refleja la versión real que ejecutó AWS.
 
 ---
 
-> **Antes de comenzar los retos**, verifica que `get-bucket-encryption` muestra `BucketKeyEnabled: true` y que `list-object-versions` devuelve dos versiones de `test.txt`.
+> **Antes de comenzar los retos**, verifica que la invocación al alias devuelve `"init_type": "provisioned-concurrency"` y que el servicio ECS tiene tareas en estado `RUNNING`.
 
 ## Verificación final
 
 ```bash
-# Confirmar que el acceso publico esta bloqueado
-aws s3api get-public-access-block \
-  --bucket $(terraform output -raw bucket_name) \
-  --query 'PublicAccessBlockConfiguration'
+# Verificar que la función Lambda usa Provisioned Concurrency
+aws lambda get-provisioned-concurrency-config \
+  --function-name "$(terraform output -raw function_name)" \
+  --qualifier live \
+  --query 'RequestedProvisionedConcurrentExecutions'
 
-# Verificar cifrado con CMK y Bucket Key
-aws s3api get-bucket-encryption \
-  --bucket $(terraform output -raw bucket_name) \
-  --query 'ServerSideEncryptionConfiguration.Rules[0]'
+# Invocar la función via alias y comprobar init_type
+aws lambda invoke \
+  --function-name "$(terraform output -raw function_name)" \
+  --qualifier live \
+  --payload '{}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
+# Esperado: "init_type": "provisioned-concurrency"
 
-# Comprobar que el versionado esta habilitado
-aws s3api get-bucket-versioning \
-  --bucket $(terraform output -raw bucket_name) \
-  --query 'Status'
-# Esperado: "Enabled"
+# Verificar tareas ECS en RUNNING
+aws ecs list-tasks \
+  --cluster "$(terraform output -raw cluster_name)" \
+  --query 'taskArns' --output table
 
-# Verificar el VPC Gateway Endpoint creado
-aws ec2 describe-vpc-endpoints \
-  --filters "Name=service-name,Values=com.amazonaws.us-east-1.s3" \
-  --query 'VpcEndpoints[*].{ID:VpcEndpointId,State:State}' \
+# Comprobar la alarma de CloudWatch
+aws cloudwatch describe-alarms \
+  --alarm-names "$(terraform output -raw alarm_name)" \
+  --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue}' \
   --output table
 ```
 
@@ -374,95 +443,79 @@ aws ec2 describe-vpc-endpoints \
 
 ## Retos
 
-### Reto 1 — S3 Access Logging
+### Reto 1 — Lambda Function URL para Invocación Directa
 
-El bucket de datos no registra quién accede a sus objetos. Añadir **S3 Access Logging** crea un log por cada petición HTTP recibida — imprescindible en entornos regulados (PCI-DSS, HIPAA) para detectar accesos no autorizados.
+La función Lambda está dentro de una VPC y actualmente solo se puede invocar con `aws lambda invoke`. Añadir una **Lambda Function URL** permite invocarla directamente mediante HTTPS sin necesidad de API Gateway, manteniendo el alias y la Provisioned Concurrency activos.
 
 **Requisitos**
 
-1. Crea un segundo bucket (`${var.project}-logs-<ACCOUNT_ID>`) para almacenar los logs. Este bucket debe tener:
-   - `aws_s3_bucket_public_access_block` con los cuatro controles activos.
-   - Cifrado SSE-S3 (`AES256`) — no es necesario KMS para el bucket de logs.
-2. Añade un `aws_s3_bucket_logging` al bucket principal que apunte al bucket de logs con `target_prefix = "access-logs/"`.
-3. Añade un output `log_bucket_name` con el nombre del bucket de logs.
+1. Crea `aws_lambda_function_url` apuntando al alias `"live"` (usa `qualifier = aws_lambda_alias.live.name`).
+   - `authorization_type = "NONE"` para permitir invocaciones sin autenticación (válido para laboratorio; en producción usa `"AWS_IAM"`).
+   - El provider AWS añade automáticamente los permisos necesarios (`lambda:InvokeFunctionUrl` y `lambda:InvokeFunction`) al crear el recurso.
+2. Añade un output `function_url` con la URL generada.
+3. Invoca la URL con `curl` y verifica que `init_type` es `"provisioned-concurrency"`.
 
 **Criterios de éxito**
 
-- `aws s3api get-bucket-logging --bucket "$BUCKET"` muestra el bucket de destino y el prefijo.
-- Tras subir un objeto al bucket principal, aparecen logs en `s3://LOGS_BUCKET/access-logs/` (puede tardar hasta 1 hora en AWS real).
-- Puedes explicar por qué el bucket de logs debe ser un bucket separado y no el mismo bucket principal.
+- `terraform output -raw function_url` devuelve una URL `https://` válida.
+- `curl -s "$(terraform output -raw function_url)" | python3 -m json.tool` devuelve la respuesta del handler con `"init_type": "provisioned-concurrency"`.
+- Puedes explicar por qué la Function URL debe apuntar al alias y no a `$LATEST` para beneficiarse de la Provisioned Concurrency.
 
-### Reto 2 — S3 Object Lock en modo GOVERNANCE
+### Reto 2 — ECS Auto Scaling con Target Tracking
 
-El versionado protege contra borrados accidentales, pero un administrador con permisos suficientes puede borrar versiones individuales. **Object Lock** añade protección WORM (Write Once Read Many): una vez bloqueado, ningún usuario — ni siquiera el root de la cuenta — puede borrar el objeto antes de que expire el periodo de retención.
+El servicio ECS tiene `desired_count` fijo. En producción, el número de tareas debe adaptarse a la carga real. El objetivo es añadir un **Auto Scaling** basado en CPU que escale entre 1 y 6 tareas manteniendo la CPU media por debajo del 60%.
 
 ### Requisitos
 
-1. Object Lock solo puede habilitarse al crear el bucket y no puede añadirse después. Por eso **no es posible reutilizar el bucket principal** creado por el módulo `secure-bucket` — debes crear un **nuevo bucket independiente** con `object_lock_enabled = true` en `aws_s3_bucket`.
-2. Configura `aws_s3_bucket_object_lock_configuration` con:
-   - `rule.default_retention.mode = "GOVERNANCE"` (permite que usuarios con permiso `s3:BypassGovernanceRetention` eliminen objetos bajo circunstancias especiales).
-   - `rule.default_retention.days = 7` (7 días de retención por defecto).
-3. Añade un output `object_lock_bucket_name` con el nombre del nuevo bucket.
+1. Registra el servicio ECS como objetivo escalable con `aws_appautoscaling_target`:
+   - `min_capacity = 1`, `max_capacity = 6`
+   - `resource_id = "service/${cluster_name}/${service_name}"`
+   - `scalable_dimension = "ecs:service:DesiredCount"`
+   - `service_namespace = "ecs"`
+2. Crea `aws_appautoscaling_policy` de tipo `TargetTrackingScaling`:
+   - `target_value = 60` (mantener CPU < 60%)
+   - `predefined_metric_type = "ECSServiceAverageCPUUtilization"`
+   - `scale_in_cooldown = 300`, `scale_out_cooldown = 60`
+3. Añade outputs `autoscaling_min`, `autoscaling_max` y `autoscaling_target_cpu`.
 
 **Criterios de éxito**
 
-- `aws s3api get-object-lock-configuration --bucket "$OBJECT_LOCK_BUCKET"` muestra `ObjectLockEnabled: Enabled` con `Mode: GOVERNANCE` y `Days: 7`.
-- Sube un objeto al bucket. Intenta borrarlo sin el permiso `BypassGovernanceRetention` — debe fallar con `AccessDenied`.
-- Puedes explicar la diferencia entre `GOVERNANCE` (bypasseable con permiso especial) y `COMPLIANCE` (nadie puede borrar, ni root).
+- `aws application-autoscaling describe-scalable-targets --service-namespace ecs` muestra el servicio registrado con `min = 1` y `max = 6`.
+- `aws application-autoscaling describe-scaling-policies --service-namespace ecs` muestra la política con `TargetValue: 60.0`.
+- Puedes explicar la diferencia entre `scale_in_cooldown` (300 s) y `scale_out_cooldown` (60 s) y por qué se recomienda un cooldown de scale-in más largo.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — S3 Access Logging</strong></summary>
+<summary><strong>Solución al Reto 1 — Lambda Function URL para Invocación Directa</strong></summary>
 
-### Solución al Reto 1 — S3 Access Logging
+### Solución al Reto 1 — Lambda Function URL para Invocación Directa
 
-El bucket de logs y el recurso `aws_s3_bucket_logging` se añaden en el **módulo raíz** (`aws/main.tf`), no dentro de `modules/secure-bucket`. El módulo `secure-bucket` encapsula los controles de un único bucket; el bucket de logs es un recurso independiente que coexiste con él. La referencia al bucket principal se obtiene a través del output `module.datalake.bucket_id`.
-
-Añade en `aws/main.tf`:
+Añade en `main.tf`:
 
 ```hcl
-locals {
-  log_bucket_name = "${var.project}-logs-${data.aws_caller_identity.current.account_id}"
-}
-
-resource "aws_s3_bucket" "logs" {
-  bucket = local.log_bucket_name
-  tags   = local.tags
-}
-
-resource "aws_s3_bucket_public_access_block" "logs" {
-  bucket                  = aws_s3_bucket.logs.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
-  bucket = aws_s3_bucket.logs.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-resource "aws_s3_bucket_logging" "main" {
-  bucket        = module.datalake.bucket_id
-  target_bucket = aws_s3_bucket.logs.id
-  target_prefix = "access-logs/"
+resource "aws_lambda_function_url" "live" {
+  function_name      = aws_lambda_function.main.function_name
+  qualifier          = aws_lambda_alias.live.name
+  authorization_type = "NONE"
 }
 ```
 
-Añade en `aws/outputs.tf`:
+El provider AWS añade automáticamente dos statements en la resource-based policy al crear este recurso con `authorization_type = "NONE"`:
+
+- `lambda:InvokeFunctionUrl` con condición `FunctionUrlAuthType: NONE`
+- `lambda:InvokeFunction` con condición `InvokedViaFunctionUrl: true`
+
+Ambos son necesarios para que la URL funcione. AWS no los elimina al hacer `terraform destroy` — deben borrarse manualmente si se destruye y recrea la función con otro nombre.
+
+Añade en `outputs.tf`:
 
 ```hcl
-output "log_bucket_name" {
-  description = "Nombre del bucket de logs de acceso S3"
-  value       = aws_s3_bucket.logs.id
+output "function_url" {
+  description = "URL HTTPS para invocar Lambda directamente (alias 'live')"
+  value       = aws_lambda_function_url.live.function_url
 }
 ```
 
@@ -471,100 +524,64 @@ Verifica:
 ```bash
 terraform apply
 
-# 1. Confirma que el logging está configurado en el bucket principal
-BUCKET=$(terraform output -raw bucket_name)
-LOGS=$(terraform output -raw log_bucket_name)
+FURL=$(terraform output -raw function_url)
+echo "Function URL: $FURL"
 
-aws s3api get-bucket-logging \
-  --bucket "$BUCKET" \
-  --query 'LoggingEnabled'
-# Debe mostrar: {"TargetBucket": "...-logs-...", "TargetPrefix": "access-logs/"}
-
-# 2. Genera actividad en el bucket principal para producir logs
-aws s3 cp /etc/hostname s3://"$BUCKET"/test-logging.txt
-aws s3 ls s3://"$BUCKET"/
-aws s3api get-object --bucket "$BUCKET" --key test-logging.txt /tmp/downloaded.txt
-
-# 3. Espera unos minutos (S3 Access Logging puede tardar entre 1 y 60 minutos
-#    en entregar los primeros registros; no es en tiempo real).
-sleep 120
-
-# 4. Lista los logs entregados en el bucket de destino
-aws s3 ls s3://"$LOGS"/access-logs/ --recursive
-# Deben aparecer objetos con nombres del tipo:
-#   access-logs/2024-01-15-12-34-56-ABCDEF1234567890
-
-# 5. Descarga y examina un log
-LOG_KEY=$(aws s3 ls s3://"$LOGS"/access-logs/ --recursive \
-  | sort | tail -1 | awk '{print $4}')
-
-aws s3 cp s3://"$LOGS"/"$LOG_KEY" /tmp/access.log
-cat /tmp/access.log
-# Cada línea contiene: fecha, bucket, IP, solicitante, operación, clave, código HTTP, etc.
-# Ejemplo de línea:
-#   510547572113 lab33-datalake-... [15/Jan/2024:12:34:56 +0000] 1.2.3.4
-#   arn:aws:iam::...:user/joseemilio REST.PUT.OBJECT test-logging.txt
-#   "PUT /test-logging.txt HTTP/1.1" 200 - 8 8 12 11 ...
+curl -s "$FURL" | python3 -m json.tool
 ```
 
-> **Nota**: En AWS real los logs pueden tardar hasta una hora. Si tras 15 minutos no aparece nada, verifica que el bucket de logs existe y que `get-bucket-logging` muestra la configuración correcta.
+La respuesta debe incluir `"init_type": "provisioned-concurrency"` porque la URL está vinculada al alias, que tiene los 5 contenedores pre-calentados.
 
-El bucket de logs debe ser **separado** del bucket principal porque si ambos fueran el mismo, cada log generaría a su vez un evento de escritura que generaría otro log — un bucle infinito que crearía millones de objetos y facturas elevadas.
+Si usaras `qualifier = "$LATEST"` o no especificaras qualifier, la URL apuntaría a `$LATEST` y la Provisioned Concurrency no se aplicaría — las primeras invocaciones sufrirían cold start.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — S3 Object Lock en modo GOVERNANCE</strong></summary>
+<summary><strong>Solución al Reto 2 — ECS Auto Scaling con Target Tracking</strong></summary>
 
-### Solución al Reto 2 — S3 Object Lock en modo GOVERNANCE
+### Solución al Reto 2 — ECS Auto Scaling con Target Tracking
 
-El bucket WORM y sus recursos asociados van en el **módulo raíz** (`aws/main.tf`), no dentro de `modules/secure-bucket`. Hay dos razones:
-
-1. `object_lock_enabled = true` debe estar presente **en el momento de crear el bucket** — no es una configuración que se pueda añadir después. Añadirlo al módulo `secure-bucket` obligaría a recrear el bucket principal existente, destruyendo todos sus datos.
-2. El bucket WORM tiene un propósito distinto al data lake principal. Meterlo en el mismo módulo mezclaría responsabilidades y añadiría parámetros opcionales que complican la interfaz del módulo sin beneficio real.
-
-Añade en `aws/main.tf`:
+Añade en `main.tf`:
 
 ```hcl
-resource "aws_s3_bucket" "worm" {
-  bucket              = "${var.project}-worm-${data.aws_caller_identity.current.account_id}"
-  object_lock_enabled = true
-  tags                = local.tags
+resource "aws_appautoscaling_target" "ecs" {
+  min_capacity       = 1
+  max_capacity       = 6
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.app.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
 }
 
-resource "aws_s3_bucket_public_access_block" "worm" {
-  bucket                  = aws_s3_bucket.worm.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
+resource "aws_appautoscaling_policy" "ecs_cpu" {
+  name               = "${var.project}-ecs-cpu-tracking"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
 
-resource "aws_s3_bucket_versioning" "worm" {
-  bucket = aws_s3_bucket.worm.id
-  versioning_configuration {
-    status = "Enabled"  # Object Lock requiere versionado
-  }
-}
+  target_tracking_scaling_policy_configuration {
+    target_value       = 60
+    scale_in_cooldown  = 300  # espera 5 min antes de reducir tareas (evita thrashing)
+    scale_out_cooldown = 60   # escala rápido hacia arriba ante picos de carga
 
-resource "aws_s3_bucket_object_lock_configuration" "worm" {
-  bucket = aws_s3_bucket.worm.id
-
-  rule {
-    default_retention {
-      mode = "GOVERNANCE"
-      days = 7
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
   }
 }
 ```
 
-Añade en `aws/outputs.tf`:
+Añade en `outputs.tf`:
 
 ```hcl
-output "object_lock_bucket_name" {
-  description = "Nombre del bucket con Object Lock en modo GOVERNANCE"
-  value       = aws_s3_bucket.worm.id
+output "autoscaling_min" {
+  value = aws_appautoscaling_target.ecs.min_capacity
+}
+output "autoscaling_max" {
+  value = aws_appautoscaling_target.ecs.max_capacity
+}
+output "autoscaling_target_cpu" {
+  value = 60
 }
 ```
 
@@ -573,48 +590,18 @@ Verifica:
 ```bash
 terraform apply
 
-WORM_BUCKET=$(terraform output -raw object_lock_bucket_name)
+# Objetivo escalable registrado
+aws application-autoscaling describe-scalable-targets \
+  --service-namespace ecs \
+  --query 'ScalableTargets[?ResourceId!=`null`].{ID:ResourceId,Min:MinCapacity,Max:MaxCapacity}'
 
-aws s3api get-object-lock-configuration --bucket "$WORM_BUCKET"
-
-# Sube un objeto e intenta borrarlo inmediatamente
-echo "dato protegido" | aws s3 cp - s3://"$WORM_BUCKET"/locked.txt
-
-VERSION_ID=$(aws s3api list-object-versions \
-  --bucket "$WORM_BUCKET" --prefix locked.txt \
-  --query 'Versions[0].VersionId' --output text)
-
-# Intento de borrado — falla con AccessDenied en modo GOVERNANCE
-aws s3api delete-object \
-  --bucket "$WORM_BUCKET" \
-  --key locked.txt \
-  --version-id "$VERSION_ID"
-
-# Para borrar el objeto en modo GOVERNANCE es necesario:
-#   1. Tener el permiso s3:BypassGovernanceRetention en la política IAM del usuario.
-#   2. Enviar el header x-amz-bypass-governance-retention: true.
-# La AWS CLI lo hace con el flag --bypass-governance-retention.
-
-# Borrar la versión actual con bypass
-aws s3api delete-object \
-  --bucket "$WORM_BUCKET" \
-  --key locked.txt \
-  --version-id "$VERSION_ID" \
-  --bypass-governance-retention
-
-# Si hay delete markers u otras versiones, listarlas y borrarlas todas
-aws s3api list-object-versions \
-  --bucket "$WORM_BUCKET" \
-  --prefix locked.txt \
-  --query '{Versions: Versions[*].{Key:Key,VersionId:VersionId}, DeleteMarkers: DeleteMarkers[*].{Key:Key,VersionId:VersionId}}'
-
-# Para borrar todas las versiones y delete markers con bypass, itera
-# sobre cada VersionId con delete-object (singular) en lugar de usar
-# delete-objects (plural), que puede causar MalformedXML al convertir
-# el payload JSON a XML internamente.
+# Política de tracking
+aws application-autoscaling describe-scaling-policies \
+  --service-namespace ecs \
+  --query 'ScalingPolicies[*].{Nombre:PolicyName,Tipo:PolicyType,Target:TargetTrackingScalingPolicyConfiguration.TargetValue}'
 ```
 
-**GOVERNANCE vs COMPLIANCE**: en modo `GOVERNANCE`, un usuario con el permiso `s3:BypassGovernanceRetention` puede borrar el objeto enviando el header `x-amz-bypass-governance-retention: true`. En modo `COMPLIANCE`, nadie puede borrar el objeto antes de que expire la retención — ni el root de la cuenta. Para datos con requisitos regulatorios estrictos (registros financieros, historiales médicos) se usa `COMPLIANCE`.
+`scale_in_cooldown = 300` evita que el Auto Scaling reduzca tareas inmediatamente después de un pico, lo que provocaría ciclos continuos de scale-out/scale-in ("thrashing"). `scale_out_cooldown = 60` permite reaccionar rápido ante picos de carga sin esperar.
 
 </details>
 
@@ -623,68 +610,36 @@ aws s3api list-object-versions \
 ## Limpieza
 
 ```bash
-# Vaciar el bucket antes de destruir (requiere borrar las versiones)
-BUCKET=$(terraform output -raw bucket_name)
-
-aws s3api delete-objects \
-  --bucket "$BUCKET" \
-  --delete "$(aws s3api list-object-versions \
-    --bucket "$BUCKET" \
-    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
-    --output json)"
-
-# Destruir la infraestructura
 # Desde lab33/aws/
 terraform destroy
+
+# Eliminar el ZIP generado localmente
+rm -f function.zip
 ```
 
-> **Importante**: la CMK tiene un `deletion_window_in_days = 7`. Tras el `terraform destroy`, la clave quedará en estado `PendingDeletion` durante 7 días antes de ser eliminada definitivamente. Durante ese periodo no se puede usar para cifrar ni descifrar.
+`terraform destroy` elimina en orden correcto: primero la Provisioned Concurrency, luego el alias, luego la función (esto libera las ENIs de la VPC). Las ENIs pueden tardar hasta 15 minutos en eliminarse antes de que la VPC pueda borrarse.
 
----
-
-## LocalStack
-
-Los recursos S3 (bucket, public access block, versionado, lifecycle) y KMS se crean correctamente en LocalStack Community. La condición `aws:sourceVpce` de la bucket policy no se evalúa realmente — el bucket es accesible sin restricción de endpoint.
-
-Consulta [localstack/README.md](localstack/README.md) para instrucciones detalladas y tabla de limitaciones.
-
----
-
-## Comparativa AWS Real vs LocalStack
-
-| Aspecto | AWS Real | LocalStack |
-|---|---|---|
-| `aws_s3_bucket_public_access_block` | Bloqueo real de ACLs y políticas públicas | Configuración aceptada y verificable |
-| SSE-KMS + Bucket Key | Cifrado real; Bucket Key reduce llamadas KMS ~99% | Configuración aceptada; sin cifrado real |
-| Versionado | Versiones inmutables preservadas en S3 | Versiones creadas correctamente |
-| Lifecycle (→Glacier, →Delete) | AWS mueve automáticamente las clases de almacenamiento | Reglas aceptadas; sin transición real |
-| VPC Gateway Endpoint | Ruta inyectada en route table; tráfico S3 nunca sale a internet | Recurso creado; sin enrutamiento real |
-| Bucket policy (`aws:sourceVpce`) | Deniega efectivamente el acceso fuera del endpoint | Política aceptada; condición no evaluada |
-| CMK + rotación anual | Rotación real del material criptográfico | Clave creada; sin rotación real |
-| Módulo `secure-bucket` | Todos los recursos funcionan | Todos los recursos se crean sin error |
+> Si `terraform destroy` se queda esperando en las ENIs de Lambda, es el comportamiento normal. AWS las elimina automáticamente una vez que confirma que Lambda ya no las usa.
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Un módulo por conjunto de controles de seguridad**: encapsular todos los recursos de seguridad del bucket en un módulo evita olvidar aplicar alguno (por ejemplo, el `public_access_block`) al crear un nuevo bucket. El módulo actúa como lista de comprobación en código.
-- **`enable_key_rotation = true` siempre en CMKs**: la rotación automática anual del material criptográfico es gratuita, no cambia el ARN de la clave y es una buena práctica de seguridad requerida por la mayoría de frameworks de cumplimiento.
-- **`depends_on` en el lifecycle hacia el versionado**: S3 puede devolver un error si la lifecycle rule se aplica antes de que el versionado esté activo. El `depends_on` garantiza el orden correcto.
-- **`depends_on` en la bucket policy hacia el public access block**: `block_public_policy = true` rechaza políticas que concedan acceso público; si la policy se aplica antes del block, puede fallar con un error inesperado.
-- **Bucket de logs separado**: el bucket de destino de S3 Access Logging nunca debe ser el mismo que el bucket origen — generaría un bucle infinito de logs.
-- **Gateway Endpoint es gratuito**: a diferencia del Interface Endpoint (que cobra por hora de ENI y por GB procesado), el Gateway Endpoint de S3 y DynamoDB no tiene coste. Úsalo siempre que haya tráfico S3 desde una VPC.
-- **Excepción de la bucket policy en producción**: la excepción para la cuenta raíz que incluye este laboratorio es solo para facilitar la gestión desde Terraform. En producción, reemplázala por el ARN específico del rol de despliegue de CI/CD y ejecuta Terraform desde un runner dentro de la VPC o con acceso vía VPC endpoint.
+- **`base = 1` en FARGATE On-Demand**: garantiza que siempre haya al menos una tarea estable. Sin este mínimo, si AWS reclama toda la capacidad Spot, el servicio puede quedar sin tareas.
+- **Provisioned Concurrency solo sobre alias, nunca sobre `$LATEST`**: `$LATEST` es mutable y cambia con cada despliegue. Configurar Provisioned Concurrency sobre `$LATEST` produciría comportamiento impredecible y costes difíciles de controlar.
+- **Desactiva Provisioned Concurrency fuera de horario**: si tu tráfico tiene un patrón horario claro (pico diurno), usa `aws_lambda_provisioned_concurrency_config` con un scheduled scaling para reducirla por la noche.
+- **`AWSLambdaVPCAccessExecutionRole` es obligatoria**: Lambda necesita permisos para crear y limpiar las ENIs. Sin esta política, el despliegue fallará en la creación de la función o tardará mucho en destruirse.
+- **`evaluation_periods = 2` en alarmas de CPU**: un solo periodo basta para activar una alarma, pero dos periodos consecutivos filtran los picos de arranque de contenedores (que generan CPU momentáneamente alta) sin retrasar la notificación ante problemas reales.
+- **`scale_in_cooldown` largo**: reducir el número de tareas rápidamente ante bajadas de carga puede provocar que el sistema deba escalar de nuevo si la carga sube otro poco. Un cooldown de 300 s es un punto de partida razonable.
 
 ---
 
 ## Recursos
 
-- [AWS — S3 Block Public Access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
-- [AWS — SSE-KMS y Bucket Key](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html)
-- [AWS — S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
-- [AWS — S3 Lifecycle Configuration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html)
-- [AWS — VPC Gateway Endpoint para S3](https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints-s3.html)
-- [AWS — S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)
-- [Terraform — aws_s3_bucket_public_access_block](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_public_access_block)
-- [Terraform — aws_s3_bucket_lifecycle_configuration](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_lifecycle_configuration)
-- [Terraform — aws_vpc_endpoint](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint)
+- [AWS — Fargate Spot](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-capacity-providers.html)
+- [AWS — Lambda Provisioned Concurrency](https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html)
+- [AWS — Lambda en VPC](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html)
+- [AWS — Container Insights para ECS](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html)
+- [Terraform — aws_ecs_cluster_capacity_providers](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecs_cluster_capacity_providers)
+- [Terraform — aws_lambda_provisioned_concurrency_config](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_provisioned_concurrency_config)
+- [Terraform — aws_appautoscaling_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/appautoscaling_policy)

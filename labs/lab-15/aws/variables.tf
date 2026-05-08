@@ -1,30 +1,35 @@
 variable "region" {
-  type    = string
-  default = "us-east-1"
+  type        = string
+  description = "Región de AWS donde se despliega la infraestructura"
+  default     = "us-east-1"
 }
 
-variable "project" {
+variable "project_name" {
   type        = string
-  description = "Prefijo que identifica todos los recursos del laboratorio"
+  description = "Nombre del proyecto, usado en tags y nombres de recursos"
   default     = "lab15"
 }
 
-variable "github_org" {
+variable "environment" {
   type        = string
-  description = "Nombre de la organización o usuario de GitHub propietario del repositorio"
+  description = "Entorno de despliegue (lab, dev, staging, production)"
+  default     = "lab"
 }
 
-variable "github_repo" {
+variable "vpc_cidr" {
   type        = string
-  description = "Nombre del repositorio de GitHub (sin la parte de organización)"
+  description = "CIDR block de la VPC donde se desplegará la base de datos"
+  default     = "10.14.0.0/16"
 }
 
-variable "allowed_ref" {
+variable "db_name" {
   type        = string
-  description = <<-EOT
-    Rama o patrón de refs que puede asumir el rol vía OIDC.
-    Usa '*' para permitir cualquier rama/tag o especifica 'ref:refs/heads/main'
-    para restringir solo a la rama main.
-  EOT
-  default     = "*"
+  description = "Nombre de la base de datos inicial en la instancia RDS"
+  default     = "appdb"
+}
+
+variable "db_username" {
+  type        = string
+  description = "Nombre del usuario maestro de la base de datos"
+  default     = "dbadmin"
 }

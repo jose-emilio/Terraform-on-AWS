@@ -1,4 +1,4 @@
-# Laboratorio 14 — Automatización de Secretos "Zero-Touch"
+# Laboratorio 14 — Cifrado Transversal con KMS y Jerarquía de Llaves
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,71 +8,80 @@
 
 ## Visión general
 
-Las credenciales estáticas en variables de entorno, ficheros de configuración o
-parámetros de CI/CD son el vector de filtración más frecuente en sistemas cloud.
-Este laboratorio implementa un flujo **Zero-Touch** donde la contraseña de la
-base de datos se genera, se almacena cifrada y se inyecta directamente en RDS —
-todo en una única ejecución de Terraform, sin que el operador la vea ni la
-introduzca en ningún momento.
+Las llaves de cifrado son la raíz de confianza de cualquier arquitectura segura.
+Este laboratorio implementa una **Customer Managed Key (CMK)** en AWS KMS y la
+utiliza como llave maestra compartida para cifrar datos en reposo en dos servicios:
+un volumen EBS y un bucket S3. La Key Policy separa explícitamente a los
+administradores de la llave (que gestionan su ciclo de vida) de las aplicaciones
+(que solo pueden cifrar y descifrar datos).
 
-## Objetivos
+## Objetivos de aprendizaje
 
-- Generar contraseñas de alta entropía con `random_password` sin exponerlas en variables de entrada.
-- Almacenar credenciales en Secrets Manager en formato JSON con cifrado de una CMK KMS propia.
-- Inyectar la contraseña directamente en `aws_db_instance` mediante referencia a `random_password.result`.
-- Aplicar la misma CMK como raíz de confianza en tres capas: Secrets Manager, RDS y el backend S3.
-- Comprender por qué el estado de Terraform requiere hardening específico.
+- Crear una CMK con rotación automática anual.
+- Asignar un alias como capa de indirección para facilitar la sustitución de la llave.
+- Diseñar una Key Policy con tres roles segregados: root, administradores y usuarios.
+- Forzar el cifrado SSE-KMS en un bucket S3 mediante política de bucket.
+- Cifrar un volumen EBS con la CMK personalizada en lugar de la llave gestionada por el servicio.
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado.
 - AWS CLI configurado con perfil `default`.
+- Permisos IAM sobre KMS, S3 y EC2 (EBS).
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-
-```bash
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
-```
 
 ## Arquitectura
 
-![Zero-Touch secrets: random_password → inyección directa en RDS y JSON en Secrets Manager + KMS cifra Secrets, RDS y backend S3](arch/diagrama.svg)
+![KMS CMK con Key Policy segregada (root/admin/user) + alias + cifrado de EBS y S3 + bucket policy con deny explícitos](arch/diagrama.svg)
 
-Patrón Zero-Touch — ningún humano ve la contraseña. Terraform la genera con `random_password` (32 chars, entropía CSPRNG del SO), la inyecta directamente como `password` en `aws_db_instance` y como JSON estructurado (`jsonencode({user, pass, host, port, dbname})`) en `aws_secretsmanager_secret_version`. Una CMK (`alias/lab14-secrets`) con rotación anual cifra tres capas distintas: el `secret_string` de Secrets Manager, el almacenamiento on-disk de RDS y el `.tfstate` del backend S3 (hardening crítico — el password se almacena en texto plano en el state). Las aplicaciones consumen el JSON con una sola llamada a `aws secretsmanager get-secret-value`.
+Una Customer Managed Key (CMK) con `enable_key_rotation = true` y un alias `alias/lab14-main` (capa de indirección que permite rotar la CMK sin tocar a los consumidores). La Key Policy segrega tres roles: **root** (recuperación de emergencia), **administradores** (gestión del ciclo de vida sin Encrypt/Decrypt) y **usuarios finales** (Encrypt/Decrypt sin gestión). La CMK cifra dos servicios: un volumen EBS gp3 (envelope encryption con data keys por bloque) y un bucket S3 con SSE-KMS, `bucket_key_enabled = true` (-99% coste KMS) y bucket policy con dos `Deny` explícitos (`DenyNonKMSUploads` + `DenyWrongKMSKey`).
 
 ## Conceptos clave
 
-| Concepto | Descripción |
-|----------|-------------|
-| `random_password` | Genera contraseñas con entropía del CSPRNG del SO; el valor nunca aparece en `terraform plan` ni en logs |
-| AWS Secrets Manager | Almacena y rota secretos cifrados con KMS; registra cada acceso en CloudTrail |
-| `aws_secretsmanager_secret_version` | Almacena el valor del secreto; `secret_string` acepta JSON para empaquetar múltiples campos |
-| Inyección directa | `random_password.db.result` como `password` en `aws_db_instance` — sin variables intermedias |
-| CMK (Customer Managed Key) | A diferencia de `aws/service`, permite policy granular, rotación anual y auditoría independiente |
-| Hardening del backend | Configurar `kms_key_id` en el backend S3 protege el `.tfstate`, que contiene la contraseña en texto plano |
-| `recovery_window_in_days = 0` | Elimina el secreto inmediatamente al destruir; evita colisiones de nombre entre despliegues |
+### Customer Managed Key vs llave gestionada por servicio
 
-### Por qué no `var.db_password`
+| Característica | CMK | aws/ebs, aws/s3 |
+|----------------|-----|-----------------|
+| Control de Key Policy | Total | Ninguno |
+| Rotación configurable | Sí (`enable_key_rotation`) | AWS gestiona |
+| Auditoría en CloudTrail | Cada uso registrado | Limitada |
+| Compartir entre servicios | Sí | No (una por servicio) |
+| Coste | ~1 $/mes + uso | Sin cargo extra |
 
-Si la contraseña fuera una variable de entrada, aparecería en texto plano en los
-logs de CI/CD, en el historial de shell y potencialmente en pull requests. El
-modelo Zero-Touch elimina ese vector: la contraseña se genera internamente en
-Terraform y solo vive en el estado cifrado y en Secrets Manager.
+### Key Policy — tres roles segregados
 
-### El estado de Terraform y el riesgo oculto
+La segregación es el principio central de este laboratorio. Evita que un administrador de infraestructura pueda leer datos cifrados de producción:
 
-`random_password.db.result` se almacena en texto plano en el `.tfstate`. Esto
-hace que el hardening del backend con KMS sea imprescindible: sin él, cualquier
-persona con acceso de lectura al bucket S3 puede leer la contraseña directamente
-del fichero de estado.
+```
+Root account   → kms:* (recuperación de emergencia)
+Administradores → gestión del ciclo de vida (sin Encrypt/Decrypt)
+Usuarios finales → Encrypt, Decrypt, GenerateDataKey (sin gestión)
+```
 
-### Secreto en formato JSON
+Sin el statement de root, si se elimina accidentalmente al último administrador la llave queda **irrecuperable** — AWS no puede restaurar el acceso.
 
-Almacenar el secreto como JSON es la práctica estándar de AWS por tres razones:
+### Alias — capa de indirección
 
-1. Las aplicaciones consumen una sola llamada a `GetSecretValue` y obtienen todos los datos de conexión.
-2. Los SDKs de AWS incluyen utilidades para parsear este formato directamente.
-3. Los blueprints de rotación de Secrets Manager esperan el formato `{"username": "...", "password": "..."}`.
+```
+Código/Configuración
+       │
+       ▼
+alias/lab14-main  ──apunta──►  Key ID: abc123...
+                               (puede cambiar sin tocar el código)
+```
+
+Al rotar o sustituir la CMK, basta con actualizar el target del alias. Todo lo que referencie `alias/lab14-main` seguirá funcionando.
+
+### Bucket Key — reducción de coste KMS
+
+Con `bucket_key_enabled = true`, S3 genera una llave de datos temporal a nivel de bucket. Solo se llama a KMS una vez por llave de bucket (no por objeto), reduciendo el coste de KMS hasta un **99%** en buckets con muchos objetos.
+
+### Cifrado forzoso en S3 — Bucket Policy
+
+La configuración SSE por defecto no impide subir objetos sin cifrado si el cliente lo omite explícitamente. La Bucket Policy añade dos `Deny` explícitos:
+
+1. `DenyNonKMSUploads`: bloquea objetos subidos sin `x-amz-server-side-encryption: aws:kms`.
+2. `DenyWrongKMSKey`: bloquea objetos cifrados con una CMK diferente a la del laboratorio.
 
 ## Estructura del proyecto
 
@@ -80,67 +89,42 @@ Almacenar el secreto como JSON es la práctica estándar de AWS por tres razones
 lab-14/
 ├── README.md
 ├── arch/
-│   └── diagrama.svg           # Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg       # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf           # Provider AWS ~> 6.0 + random + backend S3
-│   ├── variables.tf           # region, project_name, environment, vpc_cidr, db_name, db_username
-│   ├── main.tf                # KMS, random_password, Secrets Manager, VPC, RDS
-│   ├── outputs.tf             # ARNs, endpoint RDS, alias KMS, secret name
-│   └── aws.s3.tfbackend       # key = "lab14/terraform.tfstate"
+│   ├── providers.tf       # Provider AWS ~> 6.0 + backend S3
+│   ├── variables.tf       # region, project, admin_principal_arns, app_principal_arns, ebs_volume_size_gb
+│   ├── main.tf            # CMK, alias, Key Policy, EBS, S3
+│   ├── outputs.tf         # ARNs, IDs y comandos de verificación
+│   └── aws.s3.tfbackend   # key = "lab14/terraform.tfstate"
 └── localstack/
-    ├── README.md              # Guía de despliegue en LocalStack
+    ├── README.md          # Guía de despliegue en LocalStack
     ├── providers.tf
     ├── variables.tf
-    ├── main.tf
-    ├── outputs.tf
-    └── localstack.s3.tfbackend
+    ├── main.tf            # CMK, alias, S3 (sin EBS ni bucket policy)
+    └── outputs.tf
 ```
 
-## Despliegue en AWS real
-
-### Paso 1 — Despliegue inicial (backend sin KMS)
-
-En el primer despliegue la CMK aún no existe, por lo que el backend usa SSE-S3:
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-14/aws
 
-# Si no tienes la variable inicializada de la sección de requisitos previos:
-export BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
-
 terraform init \
   -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=$BUCKET"
+  -backend-config="bucket=terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
 
+terraform plan
 terraform apply
 ```
 
-> La instancia RDS puede tardar 5-10 minutos en estar disponible.
-
-### Paso 2 — Hardening del backend con KMS
-
-Una vez desplegada la infraestructura, protege el estado de Terraform con la CMK:
-
-```bash
-KMS_ARN=$(terraform output -raw kms_key_arn)
-```
-
-Edita `aws.s3.tfbackend` y añade/descomenta:
-
-```hcl
-kms_key_id = "<pega aquí el valor de KMS_ARN>"
-```
-
-Migra el estado al nuevo cifrado:
-
-```bash
-terraform init \
-  -reconfigure \
-  -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=$BUCKET"
-```
-
-A partir de este momento el `.tfstate` solo puede leerse con permisos `kms:Decrypt` sobre la CMK.
+> Por defecto, `admin_principal_arns` está vacío y Terraform asigna el caller
+> actual como administrador. Para añadir más administradores o usuarios finales:
+>
+> ```bash
+> terraform apply \
+>   -var='admin_principal_arns=["arn:aws:iam::123456789012:user/alice"]' \
+>   -var='app_principal_arns=["arn:aws:iam::123456789012:role/my-app"]'
+> ```
 
 ## Despliegue en LocalStack
 
@@ -149,358 +133,336 @@ despliegue local con LocalStack y sus limitaciones respecto a AWS real.
 
 ## Verificación final
 
-### 1. Comprobar la CMK y su rotación
+### 1. Confirmar la CMK y su rotación
 
 ```bash
-aws kms describe-key --key-id alias/lab14-secrets \
-  --query 'KeyMetadata.{KeyId:KeyId,KeyState:KeyState,Description:Description}'
+KEY_ID=$(terraform output -raw cmk_key_id)
 
-aws kms get-key-rotation-status \
-  --key-id $(terraform output -raw kms_key_arn)
+# Metadatos de la llave
+aws kms describe-key --key-id $KEY_ID \
+  --query 'KeyMetadata.{KeyId:KeyId,Enabled:Enabled,KeyState:KeyState,Description:Description}'
+
+# Rotación automática habilitada
+aws kms get-key-rotation-status --key-id $KEY_ID
 # Esperado: { "KeyRotationEnabled": true }
-# Nota: get-key-rotation-status no acepta alias, requiere Key ID (UUID) o ARN
 ```
 
-### 2. Recuperar el secreto generado
+### 2. Confirmar el alias
 
 ```bash
-aws secretsmanager get-secret-value \
-  --secret-id $(terraform output -raw secret_name) \
-  --query SecretString --output text | python3 -m json.tool
+aws kms list-aliases --key-id $KEY_ID \
+  --query 'Aliases[].AliasName'
+# Esperado: ["alias/lab14-main"]
 ```
 
-Resultado esperado:
-
-```json
-{
-    "username": "dbadmin",
-    "password": "K#3mP!...(32 chars)...",
-    "engine": "mysql",
-    "host": "lab14-db.xxxx.us-east-1.rds.amazonaws.com",
-    "port": 3306,
-    "dbname": "appdb"
-}
-```
-
-La contraseña es visible al recuperar el secreto con permisos adecuados, pero
-nunca apareció en ninguna variable de entrada ni en la salida de Terraform.
-
-### 3. Verificar el cifrado del secreto con la CMK
+### 3. Verificar la Key Policy y la segregación
 
 ```bash
-aws secretsmanager describe-secret \
-  --secret-id $(terraform output -raw secret_name) \
-  --query '{Name:Name,KmsKeyId:KmsKeyId,RotationEnabled:RotationEnabled}'
-# KmsKeyId debe apuntar a alias/lab14-secrets, no a aws/secretsmanager
+aws kms get-key-policy --key-id $KEY_ID --policy-name default \
+  --query Policy --output text | python3 -m json.tool
 ```
 
-### 4. Verificar el cifrado del volumen RDS
+Confirmar que aparecen los tres Sid: `EnableRootAccess`, `AllowKeyAdministration`, `AllowAWSServicesViaGrants`.
+
+### 4. Comprobar el cifrado del volumen EBS
 
 ```bash
-aws rds describe-db-instances \
-  --db-instance-identifier lab14-db \
-  --query 'DBInstances[0].{Status:DBInstanceStatus,Encrypted:StorageEncrypted,KmsKeyId:KmsKeyId}'
-# Esperado: Encrypted = true, KmsKeyId = ARN de la CMK
+aws ec2 describe-volumes \
+  --volume-ids $(terraform output -raw ebs_volume_id) \
+  --query 'Volumes[0].{Encrypted:Encrypted,KmsKeyId:KmsKeyId,VolumeType:VolumeType}'
+# Esperado: Encrypted = true, KmsKeyId contiene el ARN de la CMK
 ```
 
-### 5. Verificar el hardening del backend S3
+### 5. Comprobar el cifrado del bucket S3
 
 ```bash
-aws s3api head-object \
-  --bucket "$BUCKET" \
-  --key "lab14/terraform.tfstate" \
-  --query '{SSE:ServerSideEncryption,KMSKeyId:SSEKMSKeyId}'
-# Esperado: SSE = "aws:kms", KMSKeyId = ARN de la CMK (no "aws/s3")
+aws s3api get-bucket-encryption --bucket $(terraform output -raw s3_bucket_name)
+# Esperado: SSEAlgorithm = "aws:kms", KMSMasterKeyID = ARN de la CMK
 ```
 
-### 6. Confirmar que la contraseña no es visible en el plan
+### 6. Prueba de cifrado y descifrado con la CMK
 
 ```bash
-terraform plan
+ALIAS="alias/lab14-main"
+
+# Cifrar texto plano
+# --cli-binary-format raw-in-base64-out: la CLI v2 acepta texto plano directamente
+CIPHER=$(aws kms encrypt \
+  --key-id $ALIAS \
+  --plaintext "hola-lab14" \
+  --cli-binary-format raw-in-base64-out \
+  --query CiphertextBlob --output text)
+
+echo "CiphertextBlob: $CIPHER"
+
+# Descifrar (round-trip)
+# $CIPHER ya es base64 — decrypt no necesita --cli-binary-format
+# La salida Plaintext también llega en base64, de ahí el | base64 -d
+aws kms decrypt \
+  --ciphertext-blob "$CIPHER" \
+  --query Plaintext --output text | base64 -d
+# Esperado: hola-lab14
 ```
 
-Busca `password = (sensitive value)` en la sección de `aws_db_instance.main`.
-El operador nunca ve la contraseña en texto plano, ni en el plan ni en los logs.
+### 7. Prueba de cifrado forzoso en S3
 
-### 7. Consumo del secreto desde una aplicación
+```bash
+BUCKET=$(terraform output -raw s3_bucket_name)
 
-Las aplicaciones deben recuperar el secreto en tiempo de ejecución, no en tiempo
-de despliegue. Ejemplo con Python:
+# Subida correcta: con SSE-KMS y la CMK del lab
+echo "dato-secreto" | aws s3 cp - s3://$BUCKET/correcto.txt \
+  --sse aws:kms --sse-kms-key-id alias/lab14-main
+# Esperado: upload OK
 
-```python
-import boto3, json
-
-def get_db_credentials(secret_name: str) -> dict:
-    client = boto3.client("secretsmanager", region_name="us-east-1")
-    response = client.get_secret_value(SecretId=secret_name)
-    return json.loads(response["SecretString"])
-
-creds = get_db_credentials("lab14/rds/master-credentials")
-connection_string = (
-    f"mysql+pymysql://{creds['username']}:{creds['password']}"
-    f"@{creds['host']}:{creds['port']}/{creds['dbname']}"
-)
+# Subida bloqueada: sin cifrado
+echo "dato-en-claro" | aws s3 cp - s3://$BUCKET/bloqueado.txt
+# Esperado: upload failed ... An error occurred (AccessDenied) ... with an explicit deny in a resource-based policy
 ```
 
-La aplicación obtiene las credenciales directamente de Secrets Manager en cada
-arranque. La contraseña nunca se persiste en variables de entorno ni en archivos
-de configuración.
+### 8. Verificar el cabecera de cifrado en el objeto subido
+
+```bash
+aws s3api head-object --bucket $BUCKET --key correcto.txt \
+  --query '{SSEAlgorithm:ServerSideEncryption,KMSKeyId:SSEKMSKeyId}'
+# Esperado: SSEAlgorithm = "aws:kms", KMSKeyId = ARN de la CMK
+```
 
 ## Retos
 
-### Reto 1 — Rol de aplicación con acceso exclusivo al secreto
+### Reto 1 — Segunda CMK para un entorno separado
 
-El flujo Zero-Touch garantiza que la contraseña no pasa por variables del
-operador, pero actualmente cualquier principal IAM con permisos
-`secretsmanager:GetSecretValue` puede leer el secreto.
-
-Cierra ese acceso implementando dos recursos:
-
-1. Un **rol IAM** (`aws_iam_role`) que represente a la aplicación que necesita
-   las credenciales de la base de datos, con una política inline que le permita
-   llamar a `GetSecretValue` sobre el secreto.
-
-2. Una **política de recurso** (`aws_secretsmanager_secret_policy`) sobre el
-   secreto que deniegue `GetSecretValue` a cualquier principal que no sea ese
-   rol de aplicación.
-
-```hcl
-# Rol de la aplicación — completar la Trust Policy y la política inline
-resource "aws_iam_role" "app" {
-  name = "${var.project_name}-app-role"
-  # ...
-}
-
-resource "aws_iam_role_policy" "app_read_secret" {
-  name = "${var.project_name}-read-secret"
-  role = aws_iam_role.app.id
-  # ...
-}
-
-# Política de recurso — completar el Statement de denegación
-resource "aws_secretsmanager_secret_policy" "db" {
-  secret_arn = aws_secretsmanager_secret.db.arn
-  policy = jsonencode({
-    # ...
-  })
-}
-```
+Crea una segunda CMK (`aws_kms_key.secondary`) y su alias (`alias/lab14-staging`)
+para representar el entorno de staging. La política de bucket debe actualizarse
+para permitir objetos cifrados con **cualquiera de las dos CMKs**.
 
 **Pistas:**
-- La Trust Policy del rol debe permitir que alguien lo asuma. Usa
-  `ec2.amazonaws.com` como principal (simula que es el rol de una instancia).
-- La política inline necesita `secretsmanager:GetSecretValue` y
-  `secretsmanager:DescribeSecret` sobre el ARN exacto del secreto.
-- La política de recurso debe tener un `Deny` con `StringNotLike` sobre
-  `aws:PrincipalArn` apuntando al ARN del rol de aplicación.
+- Necesitarás una segunda `aws_kms_key` y `aws_kms_alias`.
+- La condición `DenyWrongKMSKey` en la Bucket Policy deberá usar `ForAllValues:StringNotEquals` con una lista de ARNs permitidos.
 
 #### Prueba
 
 ```bash
-SECRET=$(terraform output -raw secret_name)
+# La segunda CMK debe existir con alias propio
+aws kms list-aliases | grep lab14
 
-# 1. Confirmar que el rol de aplicación existe
-aws iam get-role --role-name lab14-app-role \
-  --query 'Role.{RoleName:RoleName,Arn:Arn}'
+# Subir con la segunda CMK debe ser permitido
+echo "dato-staging" | aws s3 cp - s3://$(terraform output -raw s3_bucket_name)/staging.txt \
+  --sse aws:kms --sse-kms-key-id alias/lab14-staging
+# Esperado: upload OK
 
-# 2. Confirmar que el rol tiene la política inline que permite leer el secreto
-aws iam get-role-policy \
-  --role-name lab14-app-role \
-  --policy-name lab14-read-secret \
-  --query 'PolicyDocument.Statement[0].{Effect:Effect,Action:Action,Resource:Resource}'
-# Esperado: Effect "Allow", Action incluye secretsmanager:GetSecretValue,
-#           Resource = ARN exacto del secreto
+# Subir sin cifrado sigue bloqueado
+echo "dato" | aws s3 cp - s3://$(terraform output -raw s3_bucket_name)/sin-cifrar.txt
+# Esperado: AccessDenied
+```
 
-# 3. Verificar el contenido de la resource policy del secreto
-aws secretsmanager get-resource-policy \
-  --secret-id "$SECRET" \
-  --query ResourcePolicy --output text | python3 -m json.tool
-# Esperado: Statement con Deny y condición StringNotLike sobre el rol de app
+### Reto 2 — Snapshot de EBS cifrado con la misma CMK
 
-# 4. Verificación end-to-end: tu usuario actual NO es el rol de app, así que
-#    la resource policy debe denegarte el acceso al secreto. Es la prueba
-#    definitiva de que el control funciona.
-aws secretsmanager get-secret-value --secret-id "$SECRET" 2>&1 | head -3
-# Esperado: AccessDeniedException ... explicit deny in a resource-based policy
+Crea un `aws_ebs_snapshot` del volumen EBS del laboratorio. El snapshot debe
+heredar el cifrado de la CMK del laboratorio (no la llave por defecto).
+
+```hcl
+resource "aws_ebs_snapshot" "main" {
+  # completar...
+}
+```
+
+#### Prueba
+
+```bash
+SNAPSHOT_ID=$(terraform output -raw ebs_snapshot_id)
+
+# El snapshot debe estar cifrado con la CMK del lab
+aws ec2 describe-snapshots --snapshot-ids $SNAPSHOT_ID \
+  --query 'Snapshots[0].{Encrypted:Encrypted,KmsKeyId:KmsKeyId,State:State}'
+# Esperado: Encrypted = true, KmsKeyId = ARN de la CMK, State = "completed"
 ```
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Rol de aplicación con acceso exclusivo al secreto</strong></summary>
+<summary><strong>Solución al Reto 1 — Segunda CMK y Bucket Policy actualizada</strong></summary>
 
-### Solución al Reto 1 — Rol de aplicación con acceso exclusivo al secreto
+### Solución al Reto 1 — Segunda CMK y Bucket Policy actualizada
 
-**Por qué dos capas: política inline + política de recurso**
+**Por qué se necesita una segunda CMK y no solo un segundo alias**
 
-La política inline en el rol concede el permiso desde el lado del principal
-("el rol puede hacer X"). La política de recurso en el secreto deniega desde
-el lado del recurso ("solo este rol puede acceder aquí"). Usadas juntas crean
-una lista blanca bidireccional: para leer el secreto hay que ser el rol correcto
-Y el secreto tiene que permitirlo explícitamente.
+Un alias es simplemente un puntero a una CMK. Si apuntáramos dos alias a la
+misma CMK, revocar el acceso a staging requeriría revocar también el acceso a
+producción. Con dos CMKs independientes se puede deshabilitar, rotar o borrar
+una sin afectar a la otra.
 
-**Por qué `StringNotLike` y no `StringNotEquals` en la política de recurso**
+**Por qué cambia la condición de la Bucket Policy**
 
-Cuando un rol es asumido, el ARN de sesión tiene la forma
-`arn:aws:sts::123456789012:assumed-role/lab14-app-role/session-name`, que es
-distinto al ARN del rol `arn:aws:iam::123456789012:role/lab14-app-role`.
-`StringNotEquals` rechazaría las sesiones asumidas aunque vengan del rol
-correcto. Con `StringNotLike` y el wildcard `*` al final se cubren todas las
-sesiones del rol sin importar el nombre de sesión.
+La política original usa `StringNotEqualsIfExists` con un único ARN:
+si la llave del objeto no coincide con ese ARN, se deniega. Con dos CMKs
+válidas no basta con ese operador — necesitamos `ForAllValues:StringNotEquals`
+para evaluar que el ARN proporcionado **no está en ninguna de las posiciones**
+de la lista permitida. Si el ARN coincide con cualquiera de los dos, la condición
+no se cumple y el `Deny` no se aplica.
 
-**Código completo a añadir en `main.tf`**
+```
+ForAllValues:StringNotEquals  →  niega si el valor NO está en la lista
+                               →  permite si el valor SÍ está en la lista
+```
+
+**Código a añadir en `main.tf`:**
 
 ```hcl
-# Rol IAM que representa a la aplicación consumidora del secreto.
-# Trust Policy: ec2.amazonaws.com puede asumir el rol (simula una instancia EC2).
-resource "aws_iam_role" "app" {
-  name        = "${var.project_name}-app-role"
-  description = "Rol de la aplicacion - unico principal autorizado a leer el secreto de RDS"
+# Segunda CMK para el entorno de staging.
+# Reutiliza el mismo data source de Key Policy (data.aws_iam_policy_document.cmk_policy)
+# porque los administradores y el acceso root son los mismos en ambos entornos.
+resource "aws_kms_key" "secondary" {
+  description             = "CMK de staging del lab14"
+  enable_key_rotation     = true
+  deletion_window_in_days = 7
+  policy                  = data.aws_iam_policy_document.cmk_policy.json
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "AllowEC2Assume"
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
-
-  tags = merge(local.common_tags, { Name = "${var.project_name}-app-role" })
+  tags = merge(local.tags, { Name = "${var.project}-cmk-staging" })
 }
 
-# Política inline: el rol puede leer y describir el secreto de RDS.
-# Se limita al ARN exacto del secreto — principio de mínimo privilegio.
-resource "aws_iam_role_policy" "app_read_secret" {
-  name = "${var.project_name}-read-secret"
-  role = aws_iam_role.app.id
+# Alias independiente: alias/lab14-staging apunta a la CMK de staging.
+# Si en el futuro se sustituye la CMK de staging, basta con actualizar
+# target_key_id aquí sin tocar ninguna otra referencia.
+resource "aws_kms_alias" "secondary" {
+  name          = "alias/${var.project}-staging"
+  target_key_id = aws_kms_key.secondary.key_id
+}
+
+# Bucket Policy actualizada: permite objetos cifrados con cualquiera de las dos CMKs.
+# Se reemplaza el recurso aws_s3_bucket_policy existente (mismo nombre de recurso).
+resource "aws_s3_bucket_policy" "enforce_kms" {
+  bucket = aws_s3_bucket.main.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid    = "ReadRDSSecret"
-      Effect = "Allow"
-      Action = [
-        "secretsmanager:GetSecretValue",
-        "secretsmanager:DescribeSecret",
-      ]
-      Resource = aws_secretsmanager_secret.db.arn
-    }]
-  })
-}
-
-# Política de recurso: deniega GetSecretValue a cualquier principal
-# que no sea el rol de aplicación. El Deny explícito tiene precedencia
-# sobre cualquier Allow en las políticas de identidad de otros principals.
-resource "aws_secretsmanager_secret_policy" "db" {
-  secret_arn = aws_secretsmanager_secret.db.arn
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "DenyAllExceptAppRole"
-      Effect    = "Deny"
-      Principal = { AWS = "*" }
-      Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.db.arn
-      Condition = {
-        StringNotLike = {
-          # El wildcard cubre tanto el ARN del rol como el ARN de las sesiones
-          # asumidas: arn:aws:sts::...:assumed-role/lab14-app-role/*
-          "aws:PrincipalArn" = "${aws_iam_role.app.arn}"
+    Statement = [
+      {
+        # Primer guard: el objeto debe venir con cabecera SSE-KMS.
+        # StringNotEqualsIfExists ignora la condición si la cabecera no existe,
+        # pero el segundo guard atrapa ese caso al verificar el Key ID.
+        Sid       = "DenyNonKMSUploads"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.main.arn}/*"
+        Condition = {
+          StringNotEqualsIfExists = {
+            "s3:x-amz-server-side-encryption" = "aws:kms"
+          }
+        }
+      },
+      {
+        # Segundo guard: el Key ID debe ser uno de los dos ARNs permitidos.
+        # ForAllValues:StringNotEquals evalúa cada valor de la clave de condición
+        # contra la lista; si ninguno coincide, el Deny se activa.
+        Sid       = "DenyWrongKMSKey"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.main.arn}/*"
+        Condition = {
+          "ForAllValues:StringNotEqualsIfExists" = {
+            "s3:x-amz-server-side-encryption-aws-kms-key-id" = [
+              aws_kms_key.main.arn,
+              aws_kms_key.secondary.arn,
+            ]
+          }
         }
       }
-    }]
+    ]
   })
 }
 ```
 
-**Output necesario para la prueba**
+</details>
 
-Añade en `outputs.tf`:
+<details>
+<summary><strong>Solución al Reto 2 — Snapshot de EBS cifrado</strong></summary>
+
+### Solución al Reto 2 — Snapshot de EBS cifrado
+
+**Qué hace un snapshot de EBS cifrado**
+
+Un snapshot es una copia puntual del contenido del volumen almacenada en S3
+(gestionado internamente por AWS, no en tu bucket). Si el volumen origen está
+cifrado, AWS copia también los metadatos de cifrado: el snapshot hereda la misma
+CMK automáticamente. No es necesario especificar `kms_key_id` en el snapshot
+porque AWS lo infiere del volumen.
+
+El snapshot puede usarse para:
+- Restaurar el volumen en caso de pérdida de datos.
+- Crear volúmenes en otras zonas de disponibilidad (siempre cifrados con la misma CMK).
+- Compartir datos cifrados con otra cuenta de AWS (requiriendo que la cuenta
+  destino tenga permisos sobre la CMK mediante una grant).
+
+**Implicación de coste**: los snapshots se facturan por GiB-mes del espacio
+diferencial utilizado. Un snapshot de un volumen de 10 GiB vacío ocupa muy poco,
+pero conviene destruirlos al terminar el laboratorio.
+
+**Código a añadir en `main.tf`:**
 
 ```hcl
-output "app_role_arn" {
-  description = "ARN del rol IAM de la aplicacion"
-  value       = aws_iam_role.app.arn
+# El snapshot hereda encrypted = true y kms_key_id del volumen origen.
+# AWS no permite crear un snapshot no cifrado de un volumen cifrado.
+resource "aws_ebs_snapshot" "main" {
+  volume_id   = aws_ebs_volume.main.id
+  description = "Snapshot del volumen EBS del lab14 - cifrado con CMK"
+
+  tags = merge(local.tags, { Name = "${var.project}-snapshot" })
 }
-
 ```
 
-**Efecto neto tras aplicar**
+**Output a añadir en `outputs.tf`:**
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  aws_secretsmanager_secret "db"                         │
-│                                                         │
-│  Política de recurso:                                   │
-│    Deny GetSecretValue → todos EXCEPTO lab14-app-role   │
-│                                                         │
-│  ✓ lab14-app-role          → Allow (política inline)    │
-│  ✗ cualquier otro usuario  → Deny  (política recurso)   │
-│  ✗ cualquier otro rol      → Deny  (política recurso)   │
-└─────────────────────────────────────────────────────────┘
+```hcl
+output "ebs_snapshot_id" {
+  description = "ID del snapshot del volumen EBS"
+  value       = aws_ebs_snapshot.main.id
+}
 ```
 
-> **Nota:** después de aplicar, tu usuario de operador también quedará bloqueado
-> para `GetSecretValue` (a menos que lo añadas a la condición `StringNotLike`).
-> Esto es intencional — demuestra que el Deny de la política de recurso tiene
-> precedencia sobre cualquier Allow en las políticas de identidad.
+**Por qué `terraform apply` podría tardar varios minutos**
 
-> **Implicación al destruir:** Terraform invoca `GetSecretValue` durante el
-> refresh para leer el estado de `aws_secretsmanager_secret_version`. Con la
-> resource policy aplicada tu operador queda bloqueado y `terraform destroy`
-> falla con `AccessDeniedException`. La sección [Limpieza](#limpieza) documenta
-> el workaround.
+Terraform llama a `ec2:CreateSnapshot` y luego espera a que el estado sea
+`completed` antes de continuar. En volúmenes pequeños y vacíos suele tardar
+entre 1 y 5 minutos. El progreso se puede monitorizar con:
+
+```bash
+aws ec2 describe-snapshots \
+  --snapshot-ids $(terraform output -raw ebs_snapshot_id) \
+  --query 'Snapshots[0].{State:State,Progress:Progress}'
+```
 
 </details>
 
 ## Limpieza
 
-> Si migraste el backend a KMS, revierte `kms_key_id` en `aws.s3.tfbackend`
-> y ejecuta `terraform init -backend-config=aws.s3.tfbackend -backend-config="bucket=$BUCKET" -reconfigure` antes de destruir — de lo contrario
-> la CMK se destruirá primero y el estado quedará ilegible.
->
-> La CMK tiene `deletion_window_in_days = 7`: durante esos 7 días está
-> deshabilitada pero no eliminada. Puedes cancelar el borrado con
-> `aws kms cancel-key-deletion --key-id <key-id>`.
-
-> **Si aplicaste el Reto 1**, la resource policy del secreto deniega
-> `GetSecretValue` a tu operador. Terraform necesita esa acción durante el
-> refresh previo al destroy (para leer el estado de `aws_secretsmanager_secret_version`),
-> así que el destroy fallará con `AccessDeniedException`. Solución:
->
-> ```bash
-> # Eliminar la resource policy con la CLI
-> aws secretsmanager delete-resource-policy \
->   --secret-id $(terraform output -raw secret_name)
->
-> # Refrescar el estado para que Terraform vea que la policy ya no está
-> terraform refresh
-
 ```bash
+cd labs/lab-14/aws
 terraform destroy
 ```
+
+> Los volúmenes EBS se facturan por GiB-hora aunque estén sin adjuntar; los snapshots se facturan por GiB-mes.
+> Destruye los recursos al terminar el laboratorio.
 
 ## Buenas prácticas aplicadas
 
 | Práctica | Implementación |
 |----------|----------------|
-| Zero-Touch — sin credenciales en variables de entrada | `random_password.result` inyectado directamente, sin `var.db_password` |
-| Sensitive value | `random_password` oculta el valor en `terraform plan` y logs |
-| Formato JSON en Secrets Manager | Una sola llamada a `GetSecretValue` devuelve todos los datos de conexión |
-| CMK compartida entre servicios | Una sola llave KMS cifra Secrets Manager, RDS y el backend S3 |
-| Hardening del backend | `kms_key_id` en el backend S3 protege el `.tfstate` que contiene la contraseña |
-| `recovery_window_in_days = 0` | Evita conflictos de nombre al destruir y re-crear el lab |
-| Rotación automática de la CMK | `enable_key_rotation = true` — anual, sin cambio de ARN |
+| Root account siempre en Key Policy | Statement `EnableRootAccess` — recuperación ante errores |
+| Segregación admin/usuario | Administradores no pueden cifrar/descifrar; usuarios no pueden gestionar la llave |
+| Alias como capa de indirección | La sustitución de CMK no requiere cambios en el código |
+| Rotación automática | `enable_key_rotation = true` — rotación anual sin interrupciones |
+| Bucket Key activado | Reduce coste de KMS hasta un 99% en buckets con alta densidad |
+| Cifrado forzoso en S3 | Bucket Policy con `Deny` explícito — ningún objeto puede subirse sin cifrar |
+| `deletion_window_in_days = 7` | Ventana mínima — permite cancelar borrados accidentales |
 
 ## Recursos
 
-- [random_password — Terraform Registry](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/password)
-- [Secrets Manager — Buenas prácticas](https://docs.aws.amazon.com/secretsmanager/latest/userguide/best-practices.html)
-- [Rotación de secretos para RDS](https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html)
-- [KMS Key Rotation — AWS Docs](https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html)
-- [Backend S3 — kms_key_id](https://developer.hashicorp.com/terraform/language/backend/s3#kms_key_id)
-- [Sensitive data in Terraform state](https://developer.hashicorp.com/terraform/language/manage-sensitive-data)
-- [aws_secretsmanager_secret_version — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/secretsmanager_secret_version)
+- [AWS KMS — Customer Managed Keys](https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk)
+- [Key Policy — AWS Docs](https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html)
+- [S3 SSE-KMS — AWS Docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html)
+- [EBS Encryption — AWS Docs](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-encryption.html)
+- [S3 Bucket Key — AWS Docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html)
+- [aws_kms_key — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/kms_key)
+- [aws_kms_alias — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/kms_alias)

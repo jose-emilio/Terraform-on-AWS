@@ -1,14 +1,57 @@
-output "bucket_id" {
-  description = "Nombre del bucket S3"
-  value       = module.bucket.bucket_id
+# --- Red ---
+
+output "vpc_id" {
+  description = "ID de la VPC"
+  value       = module.corporate_rds.vpc_id
 }
 
-output "bucket_arn" {
-  description = "ARN del bucket S3"
-  value       = module.bucket.bucket_arn
+output "vpc_cidr" {
+  description = "CIDR de la VPC"
+  value       = module.corporate_rds.vpc_cidr
 }
 
-output "effective_tags" {
-  description = "Etiquetas finales aplicadas al bucket"
-  value       = module.bucket.effective_tags
+output "private_subnet_ids" {
+  description = "IDs de las subredes privadas"
+  value       = module.corporate_rds.private_subnet_ids
+}
+
+# --- Base de datos ---
+
+output "db_endpoint" {
+  description = "Endpoint de conexión de la instancia RDS"
+  value       = module.corporate_rds.db_instance_endpoint
+}
+
+output "db_port" {
+  description = "Puerto de la instancia RDS"
+  value       = module.corporate_rds.db_instance_port
+}
+
+output "db_name" {
+  description = "Nombre de la base de datos"
+  value       = module.corporate_rds.db_instance_name
+}
+
+output "db_secret_arn" {
+  description = "ARN del secreto con la contraseña (gestionada por RDS)"
+  value       = module.corporate_rds.db_master_user_secret_arn
+}
+
+# --- Compliance ---
+
+output "db_storage_encrypted" {
+  description = "Confirmación: almacenamiento cifrado"
+  value       = module.corporate_rds.db_storage_encrypted
+}
+
+output "db_deletion_protection" {
+  description = "Confirmación: protección contra borrado"
+  value       = module.corporate_rds.db_deletion_protection
+}
+
+# --- Security group ---
+
+output "security_group_id" {
+  description = "ID del security group de RDS"
+  value       = module.corporate_rds.security_group_id
 }

@@ -1,83 +1,93 @@
-# --- Data Sources ---
+# ── Data sources ─────────────────────────────────────────────────────────────
+data "aws_caller_identity" "current" {}
 
-data "aws_availability_zones" "available" {
-  state = "available"
-}
+# ── OIDC Provider: GitHub Actions ────────────────────────────────────────────
+# Desde julio 2023 AWS valida automáticamente los JWT de GitHub Actions contra
+# el JWKS público (https://token.actions.githubusercontent.com/.well-known/jwks)
+# sin necesidad de configurar thumbprint_list. El provider Terraform lo soporta
+# desde 5.x: el campo es opcional. Antes era obligatorio y todo el mundo
+# hardcodeaba el thumbprint del DigiCert root CA, requiriendo actualizaciones
+# manuales cada vez que GitHub rotaba el certificado.
+resource "aws_iam_openid_connect_provider" "github" {
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
 
-# --- Locals ---
-
-locals {
-  # Seleccionar las 3 primeras AZs disponibles en la región
-  azs = slice(data.aws_availability_zones.available.names, 0, 3)
-
-  # Mapa de subredes: 3 públicas (índices 0-2) y 3 privadas (índices 10-12).
-  # El índice se usa en cidrsubnet() para calcular el rango IP sin solapamiento.
-  subnets = {
-    "public-1"  = { az_index = 0, subnet_index = 0, public = true }
-    "public-2"  = { az_index = 1, subnet_index = 1, public = true }
-    "public-3"  = { az_index = 2, subnet_index = 2, public = true }
-    "private-1" = { az_index = 0, subnet_index = 10, public = false }
-    "private-2" = { az_index = 1, subnet_index = 11, public = false }
-    "private-3" = { az_index = 2, subnet_index = 12, public = false }
-  }
-
-  # Tags base aplicados a todos los recursos
-  common_tags = {
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Project     = var.project_name
+  tags = {
+    Name      = "${var.project}-github-oidc"
+    Project   = var.project
+    ManagedBy = "terraform"
   }
 }
 
-# --- VPC ---
+# ── Trust Policy: sólo el repositorio y la ref autorizados pueden asumir el rol ─
+data "aws_iam_policy_document" "github_actions_trust" {
+  statement {
+    sid     = "AllowGitHubOIDC"
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
 
-resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
 
-  tags = merge(local.common_tags, {
-    Name = "vpc-${var.project_name}"
-  })
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
 
-  lifecycle {
-    postcondition {
-      condition = can(regex(
-        "^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)", self.cidr_block
-      ))
-      error_message = "El CIDR de la VPC debe pertenecer a un rango privado RFC 1918 (10.0.0.0/8, 172.16.0.0/12 o 192.168.0.0/16)."
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      # Formato: repo:<org>/<repo>:<ref>
+      # Ejemplos:
+      #   allowed_ref = "*"                      → cualquier rama o tag
+      #   allowed_ref = "ref:refs/heads/main"    → sólo la rama main
+      values = ["repo:${var.github_org}/${var.github_repo}:${var.allowed_ref}"]
     }
   }
 }
 
-# --- Subredes (6 en total: 3 públicas + 3 privadas) ---
+# ── IAM Role: identidad efímera para el pipeline ─────────────────────────────
+resource "aws_iam_role" "github_actions" {
+  name               = "${var.project}-github-actions"
+  description        = "Rol asumido por GitHub Actions via OIDC - sin llaves de acceso permanentes"
+  assume_role_policy = data.aws_iam_policy_document.github_actions_trust.json
 
-resource "aws_subnet" "this" {
-  for_each = local.subnets
+  tags = {
+    Name      = "${var.project}-github-actions"
+    Project   = var.project
+    ManagedBy = "terraform"
+  }
+}
 
-  vpc_id            = aws_vpc.main.id
-  availability_zone = local.azs[each.value.az_index]
-
-  # cidrsubnet(prefix, newbits, netnum)
-  # Con /16 + 8 newbits = subredes /24 (256 IPs cada una).
-  # subnet_index separa públicas (0,1,2) de privadas (10,11,12).
-  cidr_block = cidrsubnet(aws_vpc.main.cidr_block, 8, each.value.subnet_index)
-
-  map_public_ip_on_launch = each.value.public
-
-  tags = merge(
-    local.common_tags,
-    {
-      Name = "${var.project_name}-${each.key}"
-      Tier = each.value.public ? "public" : "private"
-    },
-    # Tags requeridos por EKS para el descubrimiento automático de subredes
-    each.value.public ? {
-      "kubernetes.io/role/elb"                    = "1"
-      "kubernetes.io/cluster/${var.project_name}" = "shared"
-      } : {
-      "kubernetes.io/role/internal-elb"           = "1"
-      "kubernetes.io/cluster/${var.project_name}" = "shared"
-    }
-  )
+# ── Permisos del rol: PowerUserAccess ────────────────────────────────────────
+#
+# Para simplificar el laboratorio adjuntamos la política gestionada por AWS
+# `PowerUserAccess`, que concede acceso a casi todos los servicios (S3, KMS,
+# EC2, Lambda, etc.) excluyendo la gestión de IAM, organizaciones y account
+# settings. Es la política "todoterreno" que permite que el pipeline ejecute
+# Terraform contra prácticamente cualquier recurso sin tener que ampliar la
+# policy cada vez que el alumno cambia el demo.
+#
+# ⚠️ EN PRODUCCIÓN NO se usa así.
+#
+# El principio de privilegio mínimo (PoLP) exige conceder solo los permisos
+# imprescindibles para el caso de uso concreto. Una política inline restringida
+# a, por ejemplo:
+#
+#   - s3:Get*/Put*/List* solo sobre el bucket de estado
+#   - kms:Encrypt/Decrypt solo sobre la CMK del proyecto
+#   - ec2:Describe* y los Create/Delete específicos para los recursos del módulo
+#
+# reduce el blast radius si las credenciales temporales se vieran filtradas:
+# un atacante con esas credenciales solo podría tocar lo que el rol gestiona,
+# no exfiltrar otros servicios o cuentas. Esto es lo que un equipo real
+# despliega — y cuesta mantener cada vez que la infraestructura crece, motivo
+# por el que el lab simplifica con PowerUserAccess. Ver el [Reto 2] del README
+# para el ejercicio de convertir esto a privilegio mínimo real.
+resource "aws_iam_role_policy_attachment" "github_actions_poweruser" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
 }

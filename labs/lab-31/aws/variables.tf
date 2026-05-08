@@ -11,7 +11,7 @@ variable "project" {
 
 variable "runtime" {
   type        = string
-  description = "Runtime de Python para la función Lambda y la Layer"
+  description = "Runtime de Python para la función Lambda"
   default     = "python3.12"
 }
 

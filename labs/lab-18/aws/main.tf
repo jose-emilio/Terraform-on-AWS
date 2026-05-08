@@ -1,11 +1,19 @@
 # ===========================================================================
-# Lab18 — Seguridad y Control de Tráfico en VPC
+# Lab17 — Optimización de Salida a Internet y "NAT Tax"
 # ===========================================================================
-# Modelo de seguridad por capas: NACL (Capa 4) + Security Groups (Capa 4/7)
-# Patrón ALB -> EC2 con referencia por Security Group
-# VPC Flow Logs para diagnostico de trafico REJECT
 
 # --- Data Sources ---
+
+# Obtener las AZs que soportan instancias t4g (Graviton ARM).
+# Las AZs que soportan instancias modernas también soportan NAT Gateways;
+# las que no (ej: us-east-1e) suelen tener soporte limitado de servicios.
+data "aws_ec2_instance_type_offerings" "t4g" {
+  filter {
+    name   = "instance-type"
+    values = ["t4g.small"]
+  }
+  location_type = "availability-zone-id"
+}
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -14,9 +22,16 @@ data "aws_availability_zones" "available" {
     name   = "opt-in-status"
     values = ["opt-in-not-required"]
   }
+
+  # Solo AZs que soportan t4g.small (proxy fiable para soporte de NAT Gateway)
+  filter {
+    name   = "zone-id"
+    values = data.aws_ec2_instance_type_offerings.t4g.locations
+  }
 }
 
-data "aws_ami" "al2023" {
+# AMI de Amazon Linux 2023 ARM para la Instancia NAT (solo se usa si use_nat_instance = true)
+data "aws_ami" "nat" {
   most_recent = true
   owners      = ["amazon"]
 
@@ -39,13 +54,15 @@ data "aws_ami" "al2023" {
 # --- Locals ---
 
 locals {
-  azs = slice(data.aws_availability_zones.available.names, 0, 2)
+  azs = slice(data.aws_availability_zones.available.names, 0, 3)
 
   subnets = {
     "public-1"  = { az_index = 0, subnet_index = 0, public = true }
     "public-2"  = { az_index = 1, subnet_index = 1, public = true }
+    "public-3"  = { az_index = 2, subnet_index = 2, public = true }
     "private-1" = { az_index = 0, subnet_index = 10, public = false }
     "private-2" = { az_index = 1, subnet_index = 11, public = false }
+    "private-3" = { az_index = 2, subnet_index = 12, public = false }
   }
 
   public_subnets  = { for k, v in local.subnets : k => v if v.public }
@@ -58,9 +75,7 @@ locals {
   }
 }
 
-# ===========================================================================
-# VPC
-# ===========================================================================
+# --- VPC ---
 
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
@@ -89,7 +104,7 @@ resource "aws_subnet" "this" {
 }
 
 # ===========================================================================
-# Internet Gateway
+# Internet Gateway — Comunicación bidireccional para subredes públicas
 # ===========================================================================
 
 resource "aws_internet_gateway" "main" {
@@ -124,314 +139,172 @@ resource "aws_route_table_association" "public" {
 }
 
 # ===========================================================================
-# NAT Gateway — Salida a Internet para subredes privadas
+# NAT Gateway × 3 (producción) — Uno por AZ para alta disponibilidad
 # ===========================================================================
+# Coste: ~$32/mes × 3 = ~$96/mes base + $0.045/GB procesado
+# Ventaja: si cae una AZ, las subredes privadas de las otras 2 siguen con salida.
+# Sin tráfico cross-AZ: cada subred privada sale por el NAT de su propia AZ.
 
 resource "aws_eip" "nat" {
-  domain = "vpc"
+  for_each = var.use_nat_instance ? toset([]) : toset(local.azs)
+  domain   = "vpc"
 
   tags = merge(local.common_tags, {
-    Name = "eip-nat-${var.project_name}"
+    Name = "eip-nat-${var.project_name}-${each.key}"
   })
 }
 
-resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.this["public-1"].id
+resource "aws_nat_gateway" "this" {
+  for_each = var.use_nat_instance ? {} : {
+    for idx, az in local.azs : az => "public-${idx + 1}"
+  }
+
+  allocation_id = aws_eip.nat[each.key].id
+  subnet_id     = aws_subnet.this[each.value].id
 
   tags = merge(local.common_tags, {
-    Name = "natgw-${var.project_name}"
+    Name = "natgw-${var.project_name}-${each.key}"
   })
 
   depends_on = [aws_internet_gateway.main]
 }
 
-# --- Tabla de rutas privada ---
+# ===========================================================================
+# Instancia NAT × 3 (desarrollo) — EC2 t4g.small ARM, una por AZ
+# ===========================================================================
+# Coste: ~$12.26/mes × 3 = ~$36.78/mes — ahorro ~62% vs NAT Gateway × 3
+# Ventaja ARM: mejor relación precio/rendimiento que x86 equivalente
+# Limitación: mantenimiento manual (parches, iptables), sin escalado automático
 
-resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
+resource "aws_security_group" "nat" {
+  count = var.use_nat_instance ? 1 : 0
+
+  name        = "nat-instance-${var.project_name}"
+  description = "Permite trafico de las subredes privadas hacia Internet via NAT Instance"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [for k, s in aws_subnet.this : s.cidr_block if !local.subnets[k].public]
+    description = "Todo el trafico desde subredes privadas"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Todo el trafico saliente"
+  }
 
   tags = merge(local.common_tags, {
-    Name = "${var.project_name}-private-rt"
+    Name = "nat-instance-sg-${var.project_name}"
   })
 }
 
-resource "aws_route" "private_nat" {
-  route_table_id         = aws_route_table.private.id
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.main.id
+resource "aws_instance" "nat" {
+  for_each = var.use_nat_instance ? {
+    for idx, az in local.azs : az => "public-${idx + 1}"
+  } : {}
+
+  ami                    = data.aws_ami.nat.id
+  instance_type          = "t4g.small"
+  subnet_id              = aws_subnet.this[each.value].id
+  vpc_security_group_ids = [aws_security_group.nat[0].id]
+  iam_instance_profile   = aws_iam_instance_profile.ssm.name
+
+  # CLAVE: Desactivar la verificación de origen/destino.
+  # Por defecto, EC2 descarta tráfico cuyo origen o destino no sea la propia instancia.
+  # Una instancia NAT DEBE reenviar tráfico de otros orígenes, por lo que esta
+  # verificación debe estar deshabilitada.
+  source_dest_check = false
+
+  # Configurar iptables para NAT al arrancar la instancia.
+  # AL2023 minimal no trae NAT preconfigurado (a diferencia de las antiguas AMIs
+  # amzn-ami-vpc-nat), por lo que hay que habilitar IP forwarding y crear la
+  # regla MASQUERADE manualmente.
+  user_data = templatefile("${path.module}/scripts/nat_init.sh", {
+    vpc_cidr = var.vpc_cidr
+  })
+
+  tags = merge(local.common_tags, {
+    Name = "nat-instance-${var.project_name}-${each.key}"
+  })
 }
 
+# ===========================================================================
+# Tablas de rutas privadas — Una por AZ, cada una apunta a su NAT local
+# ===========================================================================
+# Esto garantiza que el tráfico de cada subred privada sale por el NAT de su
+# misma AZ, evitando tráfico cross-AZ y manteniendo la resiliencia.
+
+resource "aws_route_table" "private" {
+  for_each = toset(local.azs)
+  vpc_id   = aws_vpc.main.id
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-private-rt-${each.key}"
+  })
+}
+
+# Ruta por defecto: NAT Gateway (producción)
+resource "aws_route" "private_nat_gateway" {
+  for_each = var.use_nat_instance ? toset([]) : toset(local.azs)
+
+  route_table_id         = aws_route_table.private[each.key].id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.this[each.key].id
+}
+
+# Ruta por defecto: Instancia NAT (desarrollo)
+resource "aws_route" "private_nat_instance" {
+  for_each = var.use_nat_instance ? toset(local.azs) : toset([])
+
+  route_table_id         = aws_route_table.private[each.key].id
+  destination_cidr_block = "0.0.0.0/0"
+  network_interface_id   = aws_instance.nat[each.key].primary_network_interface_id
+}
+
+# Cada subred privada se asocia a la tabla de rutas de su propia AZ
 resource "aws_route_table_association" "private" {
   for_each = local.private_subnets
 
   subnet_id      = aws_subnet.this[each.key].id
-  route_table_id = aws_route_table.private.id
+  route_table_id = aws_route_table.private[local.azs[each.value.az_index]].id
 }
 
 # ===========================================================================
-# Security Group del ALB — Puertos dinamicos desde Internet
+# VPC Gateway Endpoint para S3 — Tráfico gratuito, sin pasar por NAT
 # ===========================================================================
-# Las reglas se gestionan en recursos independientes
-# (aws_vpc_security_group_ingress_rule / aws_vpc_security_group_egress_rule),
-# sucesores oficiales de aws_security_group_rule desde el provider AWS 5.x.
-# Ventajas frente a los bloques `ingress`/`egress` inline:
-#   - Cada regla es un recurso con su propio ciclo de vida y address en el
-#     state, lo que permite lifecycle granular (ignore_changes, taint, etc.).
-#   - Evita drifts cuando AWS o un humano añade reglas fuera de Terraform:
-#     el SG en sí queda "open" (sin reglas declaradas inline) y solo las
-#     reglas con su propio recurso son gestionadas.
-#   - Rompe dependencias circulares cuando dos SGs se referencian entre si.
+# El tráfico hacia S3 viaja por la red interna de AWS en lugar de salir por
+# el NAT Gateway. Esto elimina el cargo de $0.045/GB que cobra el NAT por
+# cada GB procesado. El Gateway Endpoint es completamente gratuito.
 
-resource "aws_security_group" "alb" {
-  name        = "alb-${var.project_name}"
-  description = "Trafico HTTP/HTTPS desde Internet hacia el ALB"
-  vpc_id      = aws_vpc.main.id
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+
+  route_table_ids = concat(
+    [aws_route_table.public.id],
+    [for rt in aws_route_table.private : rt.id],
+  )
 
   tags = merge(local.common_tags, {
-    Name = "alb-sg-${var.project_name}"
-  })
-}
-
-# Una regla por cada puerto en var.alb_ingress_ports (80 y 443 por defecto).
-resource "aws_vpc_security_group_ingress_rule" "alb_ports" {
-  for_each = { for p in var.alb_ingress_ports : tostring(p) => p }
-
-  security_group_id = aws_security_group.alb.id
-  cidr_ipv4         = "0.0.0.0/0"
-  from_port         = each.value
-  to_port           = each.value
-  ip_protocol       = "tcp"
-  description       = "Puerto ${each.value} desde Internet"
-
-  tags = merge(local.common_tags, {
-    Name = "alb-ingress-${each.key}-${var.project_name}"
-  })
-}
-
-resource "aws_vpc_security_group_egress_rule" "alb_all" {
-  security_group_id = aws_security_group.alb.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
-  description       = "Todo el trafico saliente"
-
-  tags = merge(local.common_tags, {
-    Name = "alb-egress-${var.project_name}"
+    Name = "vpce-s3-${var.project_name}"
   })
 }
 
 # ===========================================================================
-# Security Group de las EC2 — Solo trafico desde el ALB
+# IAM Role SSM — Compartido por la instancia NAT y la instancia de test
 # ===========================================================================
-# Patrón clave: referenced_security_group_id apunta al SG del ALB, no a un
-# CIDR. Si el ALB cambia de IP, la regla sigue funcionando.
+# Permite administrar ambas instancias via SSM Session Manager sin necesidad
+# de abrir puertos SSH ni gestionar claves.
 
-resource "aws_security_group" "app" {
-  name        = "app-${var.project_name}"
-  description = "Trafico solo desde el ALB"
-  vpc_id      = aws_vpc.main.id
-
-  tags = merge(local.common_tags, {
-    Name = "app-sg-${var.project_name}"
-  })
-}
-
-resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
-  security_group_id            = aws_security_group.app.id
-  referenced_security_group_id = aws_security_group.alb.id
-  from_port                    = 80
-  to_port                      = 80
-  ip_protocol                  = "tcp"
-  description                  = "HTTP desde el ALB"
-
-  tags = merge(local.common_tags, {
-    Name = "app-ingress-from-alb-${var.project_name}"
-  })
-}
-
-resource "aws_vpc_security_group_egress_rule" "app_all" {
-  security_group_id = aws_security_group.app.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
-  description       = "Todo el trafico saliente (actualizaciones, SSM, etc.)"
-
-  tags = merge(local.common_tags, {
-    Name = "app-egress-${var.project_name}"
-  })
-}
-
-# ===========================================================================
-# Network ACL — Subred pública (bloqueo de IP maliciosa)
-# ===========================================================================
-# Las NACLs son stateless: necesitan reglas explicitas para trafico de
-# entrada Y salida. Las reglas se evaluan en orden numerico ascendente;
-# la primera que coincida se aplica.
-
-resource "aws_network_acl" "public" {
-  vpc_id     = aws_vpc.main.id
-  subnet_ids = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
-
-  # --- Reglas de entrada (ingress) ---
-
-  # Regla 50: Bloquear IP maliciosa (DENY antes de cualquier ALLOW)
-  ingress {
-    rule_no    = 50
-    action     = "deny"
-    protocol   = "-1"
-    from_port  = 0
-    to_port    = 0
-    cidr_block = var.blocked_ip
-  }
-
-  # Regla 100: Permitir HTTP
-  ingress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 80
-    to_port    = 80
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # Regla 110: Permitir HTTPS
-  ingress {
-    rule_no    = 110
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 443
-    to_port    = 443
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # Regla 120: Puertos efimeros (trafico de retorno)
-  # Las NACLs son stateless: sin esta regla, las respuestas a conexiones
-  # salientes (actualizaciones, NAT, etc.) serian bloqueadas.
-  ingress {
-    rule_no    = 120
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 1024
-    to_port    = 65535
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # --- Reglas de salida (egress) ---
-
-  # Regla 100: Permitir todo el trafico saliente
-  egress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "-1"
-    from_port  = 0
-    to_port    = 0
-    cidr_block = "0.0.0.0/0"
-  }
-
-  tags = merge(local.common_tags, {
-    Name = "nacl-public-${var.project_name}"
-  })
-}
-
-# ===========================================================================
-# Network ACL — Subred privada
-# ===========================================================================
-
-resource "aws_network_acl" "private" {
-  vpc_id     = aws_vpc.main.id
-  subnet_ids = [for k, s in aws_subnet.this : s.id if !local.subnets[k].public]
-
-  # --- Reglas de entrada ---
-
-  # Regla 100: Permitir trafico desde la VPC (ALB -> EC2)
-  ingress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "-1"
-    from_port  = 0
-    to_port    = 0
-    cidr_block = var.vpc_cidr
-  }
-
-  # Regla 110: Puertos efimeros desde Internet (respuestas a conexiones salientes)
-  ingress {
-    rule_no    = 110
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 1024
-    to_port    = 65535
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # --- Reglas de salida ---
-
-  # Regla 100: Permitir todo el trafico saliente
-  egress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "-1"
-    from_port  = 0
-    to_port    = 0
-    cidr_block = "0.0.0.0/0"
-  }
-
-  tags = merge(local.common_tags, {
-    Name = "nacl-private-${var.project_name}"
-  })
-}
-
-# ===========================================================================
-# Application Load Balancer
-# ===========================================================================
-
-resource "aws_lb" "main" {
-  name               = "${var.project_name}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
-
-  tags = merge(local.common_tags, {
-    Name = "alb-${var.project_name}"
-  })
-}
-
-resource "aws_lb_target_group" "app" {
-  name     = "${var.project_name}-tg"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
-
-  health_check {
-    path                = "/"
-    protocol            = "HTTP"
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    timeout             = 5
-    interval            = 10
-  }
-
-  tags = local.common_tags
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
-
-  tags = local.common_tags
-}
-
-# ===========================================================================
-# Instancias EC2 de aplicacion — Una por AZ en subredes privadas
-# ===========================================================================
-
-resource "aws_iam_role" "app" {
-  name = "app-instance-role-${var.project_name}"
+resource "aws_iam_role" "ssm" {
+  name = "ssm-instance-role-${var.project_name}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -448,99 +321,70 @@ resource "aws_iam_role" "app" {
 }
 
 resource "aws_iam_role_policy_attachment" "ssm" {
-  role       = aws_iam_role.app.name
+  role       = aws_iam_role.ssm.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_instance_profile" "app" {
-  name = "app-instance-profile-${var.project_name}"
-  role = aws_iam_role.app.name
+resource "aws_iam_role_policy_attachment" "s3_read" {
+  role       = aws_iam_role.ssm.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+}
+
+resource "aws_iam_instance_profile" "ssm" {
+  name = "ssm-instance-profile-${var.project_name}"
+  role = aws_iam_role.ssm.name
 
   tags = local.common_tags
 }
 
-resource "aws_instance" "app" {
-  for_each = local.private_subnets
+# ===========================================================================
+# Instancia de test — Verifica la conectividad NAT desde una subred privada
+# ===========================================================================
+# Se conecta vía SSM Session Manager (no necesita IP pública ni SSH).
+# SSM funciona porque el agente sale a Internet a través del NAT.
 
-  ami                    = data.aws_ami.al2023.id
+resource "aws_security_group" "test" {
+  name        = "test-instance-${var.project_name}"
+  description = "Instancia de test: solo trafico saliente"
+  vpc_id      = aws_vpc.main.id
+
+  # Sin ingress: la instancia no acepta conexiones entrantes. La administración
+  # se hace por SSM Session Manager (saliente al endpoint de Systems Manager),
+  # nunca por SSH. Declaramos `ingress = []` de forma explícita para que sea
+  # evidente que la ausencia de reglas es intencional (linters/políticas tipo
+  # tfsec/Checkov suelen marcar como warning los SGs sin bloque ingress
+  # declarado, aunque el comportamiento por defecto ya sea "deny all").
+  ingress = []
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Todo el trafico saliente (necesario para SSM y pruebas NAT)"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "test-instance-sg-${var.project_name}"
+  })
+}
+
+resource "aws_instance" "test" {
+  ami                    = data.aws_ami.nat.id
   instance_type          = "t4g.micro"
-  subnet_id              = aws_subnet.this[each.key].id
-  vpc_security_group_ids = [aws_security_group.app.id]
-  iam_instance_profile   = aws_iam_instance_profile.app.name
+  subnet_id              = aws_subnet.this["private-1"].id
+  vpc_security_group_ids = [aws_security_group.test.id]
+  iam_instance_profile   = aws_iam_instance_profile.ssm.name
 
-  user_data = file("${path.module}/scripts/app_init.sh")
-
-  tags = merge(local.common_tags, {
-    Name = "app-${var.project_name}-${each.key}"
-  })
-
-  depends_on = [aws_route.private_nat]
-}
-
-resource "aws_lb_target_group_attachment" "app" {
-  for_each = local.private_subnets
-
-  target_group_arn = aws_lb_target_group.app.arn
-  target_id        = aws_instance.app[each.key].id
-  port             = 80
-}
-
-# ===========================================================================
-# VPC Flow Logs — Solo trafico REJECT para diagnostico
-# ===========================================================================
-
-resource "aws_cloudwatch_log_group" "flow_logs" {
-  name              = "/vpc/${var.project_name}/flow-logs"
-  retention_in_days = var.flow_log_retention_days
-
-  tags = local.common_tags
-}
-
-resource "aws_iam_role" "flow_logs" {
-  name = "vpc-flow-logs-${var.project_name}"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "vpc-flow-logs.amazonaws.com"
-      }
-    }]
-  })
-
-  tags = local.common_tags
-}
-
-resource "aws_iam_role_policy" "flow_logs" {
-  name = "vpc-flow-logs-${var.project_name}"
-  role = aws_iam_role.flow_logs.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents",
-        "logs:DescribeLogGroups",
-        "logs:DescribeLogStreams",
-      ]
-      Effect   = "Allow"
-      Resource = "*"
-    }]
-  })
-}
-
-resource "aws_flow_log" "reject" {
-  vpc_id               = aws_vpc.main.id
-  traffic_type         = "REJECT"
-  log_destination_type = "cloud-watch-logs"
-  log_destination      = aws_cloudwatch_log_group.flow_logs.arn
-  iam_role_arn         = aws_iam_role.flow_logs.arn
+  # Instalar SSM Agent (AL2023 minimal no lo incluye)
+  user_data = file("${path.module}/scripts/test_init.sh")
 
   tags = merge(local.common_tags, {
-    Name = "flow-log-reject-${var.project_name}"
+    Name = "test-instance-${var.project_name}"
   })
+
+  depends_on = [
+    aws_route.private_nat_gateway,
+    aws_route.private_nat_instance,
+  ]
 }

@@ -1,6 +1,4 @@
-# ── Data sources ──────────────────────────────────────────────────────────────
-data "aws_caller_identity" "current" {}
-
+# ── Data sources ─────────────────────────────────────────────────────────────
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -9,323 +7,202 @@ data "aws_ami" "al2023" {
     name   = "name"
     values = ["al2023-ami-2023.*-arm64"]
   }
+
   filter {
     name   = "architecture"
     values = ["arm64"]
   }
+
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
   }
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VPCs — una por cada entrada en var.vpc_config
-# ══════════════════════════════════════════════════════════════════════════════
-
-resource "aws_vpc" "this" {
-  for_each = local.vpcs_map
-
-  cidr_block           = each.value.cidr_block
-  enable_dns_support   = true
-  enable_dns_hostnames = true
+# ── Par de claves SSH ─────────────────────────────────────────────────────────
+# La clave publica se sube a AWS; la privada permanece solo en tu maquina.
+# Genera el par antes del primer apply:
+#   ssh-keygen -t ed25519 -f ~/.ssh/lab38_key -N ""
+resource "aws_key_pair" "lab" {
+  key_name   = "${var.project}-key"
+  public_key = file("${var.ssh_private_key_path}.pub")
 
   tags = {
-    Name    = "${var.project}-vpc-${each.key}"
-    VpcName = each.key
-  }
-
-  lifecycle {
-    # ── ignore_changes para tags gestionadas por AWS ──────────────────────────
-    # AWS Organizations, Security Hub, AWS Config y otras herramientas de
-    # gobernanza anaden automaticamente tags a los recursos (por ejemplo,
-    # "aws:cloudformation:stack-name", "CreatedBy", "aws:organizations:*").
-    # Sin ignore_changes, el siguiente terraform plan detectaria esas tags
-    # como drift y las eliminaria, rompiendo las politicas de gobernanza.
-    #
-    # ignore_changes acepta una lista de atributos o subatributos.
-    # La sintaxis tags["clave"] permite ignorar tags individuales sin
-    # ignorar el bloque tags completo (lo que ocultaria cambios legitimos).
-    ignore_changes = [
-      tags["CreatedBy"],
-      tags["aws:cloudformation:stack-name"],
-      tags["aws:organizations:delegated-administrator"],
-    ]
+    Name    = "${var.project}-key"
+    Project = var.project
   }
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SUBREDES — Flatten Pattern + merge() de etiquetas
-#
-# local.subnets_map contiene una entrada por cada subred de todos los VPCs,
-# con clave compuesta "vpc_key/subnet_key". Esto permite crear todas las
-# subredes de todos los VPCs en un unico bloque resource con for_each,
-# en lugar de tener un bloque por VPC.
-# ══════════════════════════════════════════════════════════════════════════════
-
-resource "aws_subnet" "this" {
-  for_each = local.subnets_map
-
-  vpc_id                  = aws_vpc.this[each.value.vpc_key].id
-  cidr_block              = each.value.cidr_block
-  availability_zone       = each.value.availability_zone
-  map_public_ip_on_launch = each.value.public
-
-  # merge() — las etiquetas resultantes (calculadas en locals.tf) fusionan
-  # las etiquetas de departamento con las de identificacion del recurso.
-  # Las etiquetas corporativas llegan automaticamente via default_tags.
-  tags = local.subnet_tags[each.key]
-
-  lifecycle {
-    # El mismo patron que en aws_vpc.this: ignorar tags que AWS o herramientas
-    # de gobernanza puedan anadir automaticamente sobre las subredes.
-    ignore_changes = [
-      tags["CreatedBy"],
-      tags["aws:cloudformation:stack-name"],
-      tags["kubernetes.io/role/elb"],           # anadida por EKS para ALBs
-      tags["kubernetes.io/role/internal-elb"],  # anadida por EKS para NLBs internos
-    ]
-  }
-}
-
-# ── Internet Gateway (solo para VPCs con subredes publicas) ───────────────────
-resource "aws_internet_gateway" "this" {
-  for_each = local.vpcs_with_public_subnets
-
-  vpc_id = aws_vpc.this[each.key].id
+# ── Security Group ────────────────────────────────────────────────────────────
+resource "aws_security_group" "web" {
+  name        = "${var.project}-web-sg"
+  description = "HTTP publico + SSH restringido para el provisioner de Terraform"
 
   tags = {
-    Name = "${var.project}-igw-${each.key}"
+    Name    = "${var.project}-web-sg"
+    Project = var.project
   }
 }
 
-# ── Route tables publicas y asociaciones ──────────────────────────────────────
-# Necesarias para que el bloque check {} pueda verificar via data source
-# que las subredes publicas tienen ruta a Internet.
-resource "aws_route_table" "public" {
-  for_each = local.vpcs_with_public_subnets
-
-  vpc_id = aws_vpc.this[each.key].id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.this[each.key].id
-  }
-
-  tags = {
-    Name = "${var.project}-rt-public-${each.key}"
-    Tier = "public"
-  }
+resource "aws_vpc_security_group_ingress_rule" "ssh" {
+  security_group_id = aws_security_group.web.id
+  from_port         = 22
+  to_port           = 22
+  ip_protocol       = "tcp"
+  cidr_ipv4         = var.ssh_allowed_cidr
+  description       = "SSH para terraform provisioner - restringir a tu IP"
 }
 
-resource "aws_route_table_association" "public" {
-  for_each = local.public_subnets_map
-
-  subnet_id      = aws_subnet.this[each.key].id
-  route_table_id = aws_route_table.public[each.value.vpc_key].id
+resource "aws_vpc_security_group_ingress_rule" "http" {
+  security_group_id = aws_security_group.web.id
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "HTTP publico para verificar el despliegue"
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# INSTANCIA DE MONITOREO — precondition + postcondition + optional()
-#
-# Esta instancia solo se crea cuando monitoring_config.enabled = true.
-# Demuestra dos mecanismos de validacion en runtime:
-#
-#   precondition:  se evalua ANTES de crear el recurso (durante el plan).
-#                  Si falla, el plan se aborta con un mensaje descriptivo.
-#                  Util para validar configuraciones antes de gastar tiempo
-#                  o dinero en un apply que va a fallar.
-#
-#   postcondition: se evalua DESPUES de crear el recurso (durante el apply).
-#                  Si falla, Terraform marca el recurso como tainted y aborta.
-#                  Util para verificar invariantes que AWS debe garantizar
-#                  pero que quieres comprobar explicitamente.
-# ══════════════════════════════════════════════════════════════════════════════
-
-resource "aws_security_group" "monitoring" {
-  count = var.monitoring_config.enabled ? 1 : 0
-
-  name        = "${var.project}-monitoring-sg"
-  description = "Trafico de salida para la instancia de monitoreo"
-  vpc_id      = aws_vpc.this["networking"].id
-
-  tags = {
-    Name = "${var.project}-monitoring-sg"
-    Role = "monitoring"
-  }
-}
-
-resource "aws_vpc_security_group_egress_rule" "monitoring_all" {
-  count = var.monitoring_config.enabled ? 1 : 0
-
-  security_group_id = aws_security_group.monitoring[0].id
+resource "aws_vpc_security_group_egress_rule" "all" {
+  security_group_id = aws_security_group.web.id
   ip_protocol       = "-1"
   cidr_ipv4         = "0.0.0.0/0"
-  description       = "Todo el trafico saliente (actualizaciones, metricas)"
+  description       = "Todo el trafico saliente (dnf update, etc.)"
 }
 
-resource "aws_instance" "monitoring" {
-  count = var.monitoring_config.enabled ? 1 : 0
-
-  ami                         = data.aws_ami.al2023.id
-  instance_type               = var.monitoring_config.instance_type
-  subnet_id                   = aws_subnet.this["networking/public-a"].id
-  vpc_security_group_ids      = [aws_security_group.monitoring[0].id]
-  associate_public_ip_address = var.monitoring_config.associate_public_ip
-
-  root_block_device {
-    volume_size = var.monitoring_config.root_volume_size_gb
-    volume_type = "gp3"
-    encrypted   = true
+# ── IAM Instance Profile ──────────────────────────────────────────────────────
+# Permite gestion via SSM Session Manager como alternativa al SSH
+data "aws_iam_policy_document" "ec2_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
   }
+}
 
+resource "aws_iam_role" "ec2" {
+  name               = "${var.project}-ec2-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+
+  tags = {
+    Name    = "${var.project}-ec2-role"
+    Project = var.project
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.project}-ec2-profile"
+  role = aws_iam_role.ec2.name
+
+  tags = {
+    Name    = "${var.project}-ec2-profile"
+    Project = var.project
+  }
+}
+
+# ── Instancia EC2 ─────────────────────────────────────────────────────────────
+resource "aws_instance" "web" {
+  ami                         = data.aws_ami.al2023.id
+  instance_type               = var.instance_type
+  key_name                    = aws_key_pair.lab.key_name
+  iam_instance_profile        = aws_iam_instance_profile.ec2.name
+  vpc_security_group_ids      = [aws_security_group.web.id]
+  associate_public_ip_address = true
+
+  # IMDSv2 obligatorio: previene ataques SSRF contra el metadata service
   metadata_options {
     http_endpoint = "enabled"
     http_tokens   = "required"
   }
 
   tags = {
-    Name = "${var.project}-monitoring"
-    Role = "monitoring"
-  }
-
-  lifecycle {
-    # ── precondition ─────────────────────────────────────────────────────────
-    # Se evalua durante el PLAN, antes de que Terraform intente crear o
-    # modificar este recurso. Si la condicion es false, el plan falla
-    # inmediatamente con el mensaje de error definido.
-    #
-    # Caso de uso: el equipo de seguridad define una lista de AZs autorizadas
-    # para despliegues de produccion. Desplegar en una AZ no autorizada
-    # puede incumplir requisitos de residencia de datos o de SLA.
-    #
-    # self.availability_zone no esta disponible en precondition porque el
-    # recurso aun no existe — usamos la variable directamente.
-    precondition {
-      condition = contains(
-        var.monitoring_config.allowed_azs,
-        var.monitoring_config.availability_zone
-      )
-      error_message = <<-EOT
-        La zona de disponibilidad '${var.monitoring_config.availability_zone}'
-        no esta en la lista de zonas autorizadas para este entorno:
-        ${jsonencode(var.monitoring_config.allowed_azs)}.
-        Actualiza monitoring_config.availability_zone con un valor permitido.
-      EOT
-    }
-
-    # ── postcondition ─────────────────────────────────────────────────────────
-    # Se evalua despues de que AWS crea el recurso y Terraform recibe
-    # su estado actual. Si la condicion es false, Terraform marca el recurso
-    # como tainted y aborta el apply.
-    #
-    # Caso de uso: la instancia de monitoreo necesita IP publica para que
-    # los agentes externos puedan reportar metricas. Si AWS no asigna la IP
-    # (por ejemplo, la subnet no tiene auto-assign IP y associate_public_ip
-    # no funciono como esperabamos), queremos detectarlo inmediatamente en
-    # lugar de descubrirlo horas despues cuando los dashboards dejen de
-    # actualizarse.
-    #
-    # self referencia el recurso recien creado — todos sus atributos
-    # estan disponibles aqui, incluidos los calculados por AWS.
-    postcondition {
-      condition     = self.public_ip != null && self.public_ip != ""
-      error_message = <<-EOT
-        La instancia de monitoreo ${self.id} no tiene direccion IP publica
-        asignada. Verifica que:
-          - associate_public_ip_address = true en monitoring_config
-          - La subnet 'networking/public-a' tiene map_public_ip_on_launch = true
-          - El VPC 'networking' tiene enable_dns_hostnames = true
-      EOT
-    }
+    Name    = "${var.project}-web"
+    Project = var.project
   }
 }
 
-# ── SNS + CloudWatch Alarm (solo si se proporciona alarm_email) ───────────────
-# Usa local.monitoring_alarm_enabled (calculado con can() en locals.tf)
-# en lugar de evaluar la condicion directamente en cada count.
-# Ventaja: la logica de decision esta centralizada en un unico local;
-# si las condiciones cambian (por ejemplo, se añade un nuevo requisito),
-# solo hay que modificar locals.tf, no cada recurso individualmente.
-
-resource "aws_sns_topic" "monitoring_alerts" {
-  count = local.monitoring_alarm_enabled ? 1 : 0
-  name  = "${var.project}-monitoring-alerts"
-
-  tags = {
-    Name = "${var.project}-monitoring-alerts"
-    Role = "monitoring"
-  }
-}
-
-resource "aws_sns_topic_subscription" "monitoring_email" {
-  count     = local.monitoring_alarm_enabled ? 1 : 0
-  topic_arn = aws_sns_topic.monitoring_alerts[0].arn
-  protocol  = "email"
-  # try() — acceso seguro: si alarm_email fuera null aqui (no deberia porque
-  # monitoring_alarm_enabled ya lo verifica), devuelve "" en lugar de error.
-  endpoint  = try(local.monitoring_alarm_email, "")
-}
-
-resource "aws_cloudwatch_metric_alarm" "monitoring_cpu" {
-  count = local.monitoring_alarm_enabled ? 1 : 0
-
-  alarm_name          = "${var.project}-monitoring-cpu-high"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 300
-  statistic           = "Average"
-  threshold           = 80
-  alarm_description   = "CPU de la instancia de monitoreo supera el 80% durante 10 minutos"
-
-  dimensions = {
-    InstanceId = aws_instance.monitoring[0].id
-  }
-
-  alarm_actions = [aws_sns_topic.monitoring_alerts[0].arn]
-
-  tags = {
-    Name = "${var.project}-monitoring-cpu-high"
-    Role = "monitoring"
-  }
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CHECK BLOCK — verificacion post-apply de conectividad de subredes publicas
+# ── terraform_data: orquestacion imperativa post-despliegue ───────────────────
 #
-# check {} es diferente de postcondition:
-#   - Se evalua al FINAL del apply, despues de que TODOS los recursos existen.
-#   - Si falla, emite una ADVERTENCIA pero NO aborta el apply ni taintea nada.
-#   - Tiene acceso a data sources propios declarados dentro del bloque.
-#   - Util para healthchecks E2E que no deben bloquear el despliegue pero
-#     si deben avisar al operador de que algo no esta como se espera.
+# terraform_data es un recurso del provider "terraform" integrado (sin bloque
+# required_providers). Sustituye a null_resource desde Terraform 1.4 con
+# dos mejoras clave:
+#   - triggers_replace: reemplaza el recurso (destruye + crea) cuando cambia
+#     cualquier valor del mapa, disparando todos los provisioners de nuevo.
+#   - input / output: permite almacenar y recuperar valores arbitrarios.
 #
-# Caso de uso: verificar que la subred publica principal tiene efectivamente
-# una ruta por defecto (0.0.0.0/0) hacia el Internet Gateway. Esto podria
-# fallar si alguien eliminara manualmente la ruta (drift) o si la asociacion
-# de route table fallara silenciosamente.
-# ══════════════════════════════════════════════════════════════════════════════
+# Cuando se reemplaza el recurso, los provisioners se ejecutan en orden:
+#   1. file      → sube el script al servidor
+#   2. remote-exec → ejecuta el script
+#   3. local-exec  → registra el despliegue en un log local
+resource "terraform_data" "app_deploy" {
 
-check "public_subnet_has_internet_route" {
-  # El data source dentro de check {} se evalua al final del apply.
-  # Solo puede haber UN data source por bloque check (sin for_each).
-  # Inspeccionamos la subred principal: networking/public-a.
-  data "aws_route_table" "networking_public_a" {
-    subnet_id = aws_subnet.this["networking/public-a"].id
+  # triggers_replace: cualquier cambio en estos valores destruye y recrea
+  # este recurso, forzando la re-ejecucion de todos los provisioners.
+  #   - app_version: permite redesplegar la aplicacion sin tocar la instancia.
+  #   - instance_id: garantiza que si la instancia se reemplaza, los
+  #     provisioners se vuelven a ejecutar automaticamente sobre la nueva.
+  triggers_replace = {
+    app_version = var.app_version
+    instance_id = aws_instance.web.id
   }
 
-  assert {
-    condition = anytrue([
-      for route in data.aws_route_table.networking_public_a.routes :
-      route.cidr_block == "0.0.0.0/0" && route.gateway_id != null && route.gateway_id != ""
-    ])
-    error_message = <<-EOT
-      La subred 'networking/public-a' no tiene ruta por defecto (0.0.0.0/0)
-      hacia un Internet Gateway. Las instancias en esta subred no podran
-      alcanzar Internet. Verifica aws_route_table.public["networking"] y
-      aws_route_table_association.public["networking/public-a"].
+  # Bloque connection: define como Terraform abre el canal SSH.
+  # Se aplica a todos los provisioners que no declaren su propio connection.
+  # timeout: tiempo maximo que Terraform espera a que la instancia acepte SSH
+  # (cloud-init puede tardar 1-2 min en arrancar sshd en una instancia nueva).
+  connection {
+    type        = "ssh"
+    host        = aws_instance.web.public_ip
+    user        = "ec2-user"
+    private_key = file(var.ssh_private_key_path)
+    timeout     = "5m"
+  }
+
+  # Paso 1 — provisioner "file": sube el script al servidor remoto.
+  # - source:      ruta local al fichero (relativa a path.module)
+  # - destination: ruta absoluta en el servidor remoto
+  # Nota: el directorio destino debe existir y el usuario debe tener permiso
+  # de escritura. /tmp siempre es valido para ec2-user.
+  provisioner "file" {
+    source      = "${path.module}/../scripts/deploy.sh"
+    destination = "/tmp/deploy.sh"
+  }
+
+  # Paso 2 — provisioner "remote-exec": ejecuta comandos en el servidor.
+  # Se conecta via SSH usando el bloque connection del recurso.
+  # inline: lista de comandos ejecutados en orden con un interprete /bin/sh.
+  # La version de la aplicacion se pasa como variable de entorno al script.
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/deploy.sh",
+      "sudo APP_VERSION=${var.app_version} PROJECT=${var.project} /tmp/deploy.sh",
+    ]
+  }
+
+  # Paso 3 — provisioner "local-exec": registra el despliegue en la maquina
+  # que ejecuta Terraform (no en el servidor remoto).
+  #
+  # on_failure = continue: si el comando falla (por ejemplo, el fichero
+  # deployment.log esta bloqueado por otra escritura concurrente), Terraform
+  # registra el error como advertencia y continua el apply sin abortar.
+  # Sin este parametro, un fallo aqui rollbackearia todo el despliegue.
+  #
+  # self.triggers_replace: referencia a los valores del mapa triggers_replace
+  # del propio recurso terraform_data. Permite acceder a app_version e
+  # instance_id sin crear dependencias circulares.
+  provisioner "local-exec" {
+    on_failure  = continue
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | version=${self.triggers_replace.app_version} | instance=${self.triggers_replace.instance_id} | ip=${aws_instance.web.public_ip}" \
+        >> deployment.log
+      echo "Despliegue registrado en deployment.log"
     EOT
   }
 }

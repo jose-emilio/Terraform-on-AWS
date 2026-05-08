@@ -29,7 +29,7 @@ resource "aws_iam_user" "team" {
   name = each.key # nombre del usuario = clave del map
 
   tags = {
-    Department = each.value.department  # metadatos del valor del map
+    Department = each.value.department # metadatos del valor del map
     CostCenter = each.value.cost_center
     ManagedBy  = "terraform"
   }

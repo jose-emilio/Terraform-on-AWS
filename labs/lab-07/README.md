@@ -12,7 +12,7 @@ En este laboratorio configurarás el backend remoto de Terraform usando el bucke
 
 > El bucket S3 (`terraform-state-labs-<ACCOUNT_ID>`) ya fue creado y configurado en el lab02 con versionado, cifrado AES-256 y bloqueo de acceso público. Este laboratorio **no vuelve a crear el bucket**: lo referencia y añade la tabla DynamoDB para state locking.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -28,7 +28,7 @@ Al finalizar este laboratorio serás capaz de:
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### ¿Por qué un backend remoto?
 
@@ -108,7 +108,7 @@ El bloque `backend "s3"` apunta al bucket compartido del lab-02 (`encrypt = true
 
 ---
 
-## Despliegue
+## Despliegue en AWS
 
 ### Prerrequisito: bucket del lab-02
 

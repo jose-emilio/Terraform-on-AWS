@@ -1,4 +1,4 @@
-# Laboratorio 38 — Ingeniería de Datos y Resiliencia con Lifecycle
+# Laboratorio 38 — Orquestación Imperativa con terraform_data
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,66 +8,40 @@
 
 ## Visión general
 
-Las configuraciones de red reales no son listas planas de recursos: son
-estructuras jerarquicas (entornos → VPCs → subredes) con etiquetas que
-combinan políticas corporativas y especificaciones de departamento. Gestionar
-esta complejidad con `count` o con múltiples bloques `resource` duplicados
-produce codigo fragil y dificil de mantener.
+Terraform es fundamentalmente **declarativo**: describes el estado deseado y el
+motor calcula el plan para alcanzarlo. Sin embargo, hay tareas post-despliegue
+que son inherentemente imperativas — ejecutar un script de configuración,
+notificar a un sistema externo, registrar un evento — y que no encajan bien en
+el modelo declarativo.
 
-Este laboratorio introduce siete herramientas de Terraform que, combinadas,
-permiten gestionar esa complejidad de forma declarativa y robusta:
+`terraform_data` (introducido en Terraform 1.4 para reemplazar `null_resource`)
+es el mecanismo oficial para orquestar estas tareas imperativas sin depender de
+un provider externo. Junto con los provisioners `file`, `remote-exec` y
+`local-exec`, permite configurar servidores remotos directamente desde Terraform
+y controlar exactamente *cuando* se vuelven a ejecutar mediante `triggers_replace`.
 
-1. **Flatten Pattern**: transforma un mapa anidado (VPCs con subredes) en
-   una lista plana apta para `for_each`, eliminando la necesidad de bloques
-   resource duplicados por VPC.
+> **Advertencia**: los provisioners son el ultimo recurso en Terraform. Cuando
+> sea posible, usa `user_data` para bootstrap inicial o SSM Run Command para
+> configuración posterior. Este laboratorio los usa intencionalmente para
+> entender su funcionamiento y sus limitaciones.
 
-2. **`merge()`**: fusiona etiquetas corporativas globales con etiquetas
-   especificas de departamento en cada recurso, sin repetir codigo.
+## Objetivos de aprendizaje
 
-3. **`optional()`**: permite definir variables con atributos opcionales y
-   valores por defecto, haciendo las configuraciones flexibles sin sacrificar
-   el tipado estricto.
-
-4. **`precondition` / `postcondition`**: validan invariantes en tiempo de
-   ejecución — la precondición aborta el plan si la AZ elegida no está
-   autorizada; la postcondición verifica que la instancia tiene IP pública
-   tras el apply.
-
-5. **`try()` / `can()`**: acceso seguro a valores que pueden ser nulos o
-   estructuras que pueden no existir, sin abortar el plan con errores de
-   tipo o atributo nulo.
-
-6. **`check {}`**: healthcheck post-apply que verifica que las subredes
-   publicas tienen ruta a Internet, emitiendo advertencia sin bloquear
-   el despliegue.
-
-7. **`lifecycle { ignore_changes }`**: protege las tags de VPCs y subredes
-   frente a modificaciones automaticas de AWS Organizations, EKS y otras
-   herramientas de gobernanza.
-
-## Objetivos
-
-- Implementar el Flatten Pattern con `flatten()` y expresiones `for` anidadas
-  para transformar `map(map(object))` en `map(object)` apto para `for_each`.
-- Usar `merge()` para combinar etiquetas corporativas y de departamento sin
-  duplicar codigo.
-- Definir una variable con atributos `optional()` con valores por defecto.
-- Escribir una `precondition` que valide la zona de disponibilidad antes del
-  plan y produzca un mensaje de error descriptivo.
-- Escribir una `postcondition` que verifique la asignacion de IP publica
-  tras el apply usando `self`.
-- Usar `try()` para acceso defensivo a valores opcionales y `can()` para
-  centralizar logica condicional en locals.
-- Implementar un bloque `check {}` con data source interno para verificar
-  la conectividad de red post-apply.
-- Configurar `lifecycle { ignore_changes }` para proteger tags gestionadas
-  por herramientas externas a Terraform.
-- Entender cuando usar cada mecanismo de validación y por qué son complementarios.
+- Entender el ciclo de vida de `terraform_data` y como difiere de los recursos
+  de infraestructura convencionales.
+- Usar `triggers_replace` para controlar exactamente cuando se re-ejecutan los
+  provisioners.
+- Subir un fichero a un servidor remoto con `provisioner "file"`.
+- Definir un bloque `connection` SSH y ejecutar comandos remotos con `remote-exec`.
+- Usar `provisioner "local-exec"` con `on_failure = continue` para tareas de
+  registro que no deben bloquear el despliegue.
+- Comprender las limitaciones de los provisioners y cuando no usarlos.
 
 ## Requisitos previos
 
-- **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3).
+- **Terraform >= 1.10** instalado (`terraform_data`: 1.4, `postcondition`/`check`: 1.5, `use_lockfile` en backend S3: 1.10).
 - AWS CLI configurado con perfil `default`.
+- Par de claves SSH generado localmente (ver Paso 0 del despliegue).
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 
 ```bash
@@ -77,1133 +51,671 @@ export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 
 ## Arquitectura
 
-![Flatten pattern (var.vpc_config jerárquico → maps planos) + ignore_changes en tags + EC2 monitoring con precondition/postcondition + check block final](arch/diagrama.svg)
-
-`var.vpc_config` es una estructura jerárquica (entornos → VPCs → subredes); `locals.tf` la transforma con un **flatten pattern** en mapas planos (`vpcs_map` y `subnets_map` con clave compuesta `vpc_key/subnet_key`) para que un único bloque `aws_vpc.this` y un único `aws_subnet.this` con `for_each` generen todos los recursos. Cada VPC y subred lleva `lifecycle.ignore_changes` sobre tags concretas (`CreatedBy`, `aws:cloudformation:*`, `kubernetes.io/role/elb` …) — sin eso, el siguiente apply borraría tags añadidas por AWS Organizations / EKS. Una EC2 de monitoreo opcional combina **precondition** (AZ en lista autorizada, antes del plan), **postcondition** (`public_ip` no nula, tras crear) y un bloque **check** al final del apply que valida la ruta a Internet de la subred pública sin bloquear si falla — solo emite warning.
+```
+Maquina local (Terraform)
+┌───────────────────────────────────────────────────────────┐
+│                                                           │
+│  terraform apply                                          │
+│       │                                                   │
+│       ├─► aws_key_pair        → sube clave publica a EC2  │
+│       ├─► aws_security_group  → SSH (tu IP) + HTTP        │
+│       ├─► aws_iam_*           → Instance Profile + SSM    │
+│       ├─► aws_instance        → EC2 con IMDSv2            │
+│       │                                                   │
+│       └─► terraform_data.app_deploy                       │
+│               │                                           │
+│               │  triggers_replace: {app_version,          │
+│               │                     instance_id}          │
+│               │                                           │
+│               ├─[connection SSH]──────────────────────┐   │
+│               │                                       │   │
+│               ├─► provisioner "file"                  │   │
+│               │     scripts/deploy.sh → /tmp/         │   │
+│               │                                       ▼   │
+│               ├─► provisioner "remote-exec"     EC2 remota│
+│               │     chmod + sudo APP_VERSION=... ./deploy │
+│               │                                       │   │
+│               └─► provisioner "local-exec"            │   │
+│                     on_failure = continue             │   │
+│                     >> deployment.log                 │   │
+│                                                       │   │
+└───────────────────────────────────────────────────────┼───┘
+                                                        │
+                              nginx activo en puerto 80 │
+                              /version.json con la      │
+                              version desplegada ◄──────┘
+```
 
 ## Conceptos clave
 
-### Flatten Pattern
+### `terraform_data`
 
-El problema de iterar sobre estructuras anidadas:
+Es un recurso del provider `terraform` integrado — no necesita bloque
+`required_providers`. Su único propósito es agrupar provisioners y disparar su
+ejecución de forma controlada.
 
-```hcl
-variable "vpc_config" {
-  type = map(object({
-    cidr_block = string
-    subnets    = map(object({ ... }))  # mapa dentro de mapa
-  }))
-}
+Tiene dos atributos principales:
 
-# INCORRECTO: for_each sobre el mapa externo crea VPCs, no subredes
-resource "aws_subnet" "this" {
-  for_each = var.vpc_config   # ← itera sobre VPCs, no sobre subredes
-}
-```
-
-La solución es aplanar la estructura antes de iterar:
+| Atributo | Uso |
+|---|---|
+| `triggers_replace` | Mapa de valores cuyo cambio fuerza la *destrucción y recreación* del recurso (y re-ejecución de provisioners) |
+| `input` | Almacena valores arbitrarios; accesibles en outputs via `output` |
 
 ```hcl
-locals {
-  # Paso 1: flatten de lista de listas → lista plana
-  subnets_flat = flatten([
-    for vpc_key, vpc in var.vpc_config : [      # for externo: VPCs
-      for subnet_key, subnet in vpc.subnets : { # for interno: subredes
-        key      = "${vpc_key}/${subnet_key}"   # clave compuesta unica
-        vpc_key  = vpc_key
-        cidr     = subnet.cidr_block
-        # ... resto de atributos
-      }
-    ]
-  ])
-
-  # Paso 2: lista → mapa (for_each requiere mapa, no lista)
-  subnets_map = {
-    for s in local.subnets_flat : s.key => s
-  }
-}
-
-# CORRECTO: for_each sobre el mapa plano crea una subred por entrada
-resource "aws_subnet" "this" {
-  for_each = local.subnets_map
-  cidr_block = each.value.cidr
-  vpc_id     = aws_vpc.this[each.value.vpc_key].id
-}
-```
-
-**Por que clave compuesta**: usar `"vpc_key/subnet_key"` como clave garantiza
-unicidad global (dos VPCs pueden tener una subred llamada `"public-a"`) y
-produce direcciones de estado semanticas y estables:
-`aws_subnet.this["networking/public-a"]`.
-
-### `merge()` para etiquetas por capas
-
-```hcl
-tags = merge(
-  # Capa 1 — etiquetas de departamento (menor prioridad)
-  {
-    Department  = subnet.department_tags.department
-    BillingCode = subnet.department_tags.billing_code
-  },
-  # Capa 2 — etiquetas de identificacion (mayor prioridad)
-  # Si BillingCode aparece en ambas capas, gana la ultima
-  {
-    Name = "${var.project}-${each.key}"
-  }
-)
-```
-
-`merge()` acepta cualquier numero de mapas y da **prioridad al ultimo
-argumento** en caso de colision de claves. Las etiquetas corporativas
-(ManagedBy, Project, Environment) llegan automáticamente a todos los
-recursos via `default_tags` del provider, sin necesidad de incluirlas
-en cada `merge()`.
-
-### `optional()` en tipos de objeto
-
-Sin `optional()`, todos los atributos de un `object` son obligatorios:
-
-```hcl
-# SIN optional(): el operador debe especificar todos los campos
-variable "monitoring_config" {
-  type = object({
-    enabled       = bool
-    instance_type = string   # obligatorio — error si se omite
-    alarm_email   = string   # obligatorio — error si se omite
-  })
-}
-
-# CON optional(): solo 'enabled' es obligatorio
-variable "monitoring_config" {
-  type = object({
-    enabled       = bool
-    instance_type = optional(string, "t4g.micro")  # default si se omite
-    alarm_email   = optional(string, null)          # null si se omite
-  })
-}
-
-# Ahora el operador puede especificar solo lo que necesita:
-monitoring_config = {
-  enabled = true
-  # instance_type usa "t4g.micro" por defecto
-  # alarm_email es null — no se creara alarma
-}
-```
-
-### `precondition`: validación antes del plan
-
-```hcl
-resource "aws_instance" "monitoring" {
-  lifecycle {
-    precondition {
-      condition     = contains(var.allowed_azs, var.chosen_az)
-      error_message = "La AZ '${var.chosen_az}' no esta autorizada."
-    }
+resource "terraform_data" "ejemplo" {
+  triggers_replace = {
+    version = var.app_version   # Cambia esto → provisioners vuelven a correr
   }
 }
 ```
 
-- Se evalua durante `terraform plan`, antes de crear el recurso.
-- Si falla, **el plan se aborta** con el mensaje de error definido.
-- No tiene acceso a `self` — el recurso aun no existe.
-- Util para validar configuraciones que si fueran incorrectas causarian
-  un error críptico de AWS o un recurso mal configurado.
+### Por que `triggers_replace` y no `triggers`
 
-### `postcondition`: verificacion despues del apply
+`null_resource` usaba `triggers` (un mapa de strings). `terraform_data` usa
+`triggers_replace`, que es conceptualmente mas honesto: cuando cambia el valor,
+el recurso se **reemplaza** — primero se ejecutan los provisioners de destruccion
+(`when = destroy`) y luego los de creacion. Esto hace el ciclo de vida explicito.
+
+### Provisioner `file`
+
+Transfiere un fichero o directorio desde la maquina local al servidor remoto
+via SSH (o WinRM). La conexión la define el bloque `connection` del recurso padre.
 
 ```hcl
-resource "aws_instance" "monitoring" {
-  lifecycle {
-    postcondition {
-      condition     = self.public_ip != null && self.public_ip != ""
-      error_message = "La instancia ${self.id} no tiene IP publica."
-    }
-  }
+provisioner "file" {
+  source      = "${path.module}/../scripts/deploy.sh"  # Ruta local
+  destination = "/tmp/deploy.sh"                        # Ruta en el servidor
 }
 ```
 
-- Se evalua durante `terraform apply`, despues de crear o actualizar el recurso.
-- Si falla, **el apply se aborta** y el recurso queda marcado como tainted.
-- Tiene acceso completo a `self` — todos los atributos del recurso creado.
-- Útil para verificar invariantes que AWS debería garantizar pero que quieres
-  comprobar explicitamente (IP asignada, ARN no vacio, estado `available`...).
+**Limitaciones**:
+- El directorio destino debe existir.
+- El usuario de la conexión debe tener permiso de escritura en el destino.
+- `/tmp` es siempre seguro para `ec2-user`.
 
-### Diferencia entre `precondition`, `postcondition` y `variable validation`
+### Provisioner `remote-exec`
 
-| Mecanismo | Cuando se evalua | Acceso a `self` | Si falla |
-|---|---|---|---|
-| `variable validation` | Al parsear la variable | No | Error antes del plan |
-| `precondition` | Durante `plan` | No | Plan abortado |
-| `postcondition` | Durante `apply` | Si | Apply abortado, recurso tainted |
-| `check {}` | Al final del apply | No (usa data source) | Advertencia, no aborta |
+Ejecuta comandos en el servidor remoto via SSH. Tiene tres modos:
 
-### `try()` y `can()` — acceso defensivo a valores opcionales
-
-Cuando navegas estructuras anidadas con valores opcionales, un atributo `null`
-o un indice inexistente produce un error que aborta el plan. `try()` y `can()`
-permiten manejar esos casos sin codigo defensivo verboso:
+| Modo | Descripción |
+|---|---|
+| `inline` | Lista de comandos ejecutados en orden con `/bin/sh -c` |
+| `script` | Sube un script local y lo ejecuta (equivale a `file` + `inline`) |
+| `scripts` | Como `script` pero con múltiples ficheros en orden |
 
 ```hcl
-# SIN try(): si alarm_email es null, esto falla con "attempt to call null"
-count = var.monitoring_config.alarm_email != null ? 1 : 0
-
-# CON try(): si la expresion falla por cualquier razon, devuelve el fallback
-alarm_email = try(var.monitoring_config.alarm_email, null)
-
-# can(): devuelve true/false si la expresion es evaluable sin error
-# Util para centralizar logica condicional en locals
-monitoring_alarm_enabled = (
-  var.monitoring_config.enabled &&
-  can(var.monitoring_config.alarm_email) &&
-  var.monitoring_config.alarm_email != null
-)
-```
-
-**¿Cuándo usar cada uno?**:
-
-| Función | Devuelve | Caso de uso típico |
-|---|---|---|
-| `try(expr, fallback)` | El valor o el fallback | Acceso a atributos opcionales o potencialmente nulos |
-| `can(expr)` | `true` / `false` | Condiciones en `count`, `for_each` o `if` dentro de `for` |
-
-> **Advertencia**: `try()` silencia **cualquier** error, no solo los de tipo
-> nulo. Usarlo con expresiones complejas puede ocultar errores reales de logica.
-> Prefiere `try()` en expresiones simples de acceso a atributos.
-
-### `check {}` — healthcheck post-apply no bloqueante
-
-A diferencia de `postcondition` (que falla el apply si la condición no se
-cumple), `check {}` emite una advertencia y deja que el apply termine.
-Es el mecanismo correcto para verificar invariantes que no debes considerar
-errores fatales pero si quieres monitorizar:
-
-```hcl
-check "public_subnet_has_internet_route" {
-  # Data source interno — se evalua al final del apply
-  data "aws_route_table" "check" {
-    subnet_id = aws_subnet.this["networking/public-a"].id
-  }
-
-  assert {
-    condition = anytrue([
-      for route in data.aws_route_table.check.routes :
-      route.cidr_block == "0.0.0.0/0" && route.gateway_id != null
-    ])
-    error_message = "La subred publica no tiene ruta a Internet."
-  }
+provisioner "remote-exec" {
+  inline = [
+    "chmod +x /tmp/deploy.sh",
+    "sudo APP_VERSION=${var.app_version} /tmp/deploy.sh",
+  ]
 }
 ```
 
-Cuando el assert falla, el apply produce:
+Si cualquier comando devuelve un codigo de salida distinto de 0, el provisioner
+falla y el recurso queda marcado como *tainted* — Terraform lo recrea en el
+siguiente apply.
 
-```
-╷
-│ Warning: Check block assertion failed
-│
-│   check.public_subnet_has_internet_route
-│
-│ La subred publica no tiene ruta a Internet.
-╵
-```
+### Bloque `connection`
 
-### `lifecycle { ignore_changes }` — protección frente a drift externo
-
-Las herramientas de gobernanza de AWS (Organizations, Security Hub, EKS,
-CloudFormation StackSets) añaden tags automáticamente a los recursos. Sin
-`ignore_changes`, Terraform las detecta como drift en el siguiente plan y
-las elimina, rompiendo las políticas corporativas:
+Define el canal de comunicación entre Terraform y el servidor remoto. Cuando se
+declara a nivel de recurso, todos los provisioners del recurso lo heredan.
 
 ```hcl
-resource "aws_subnet" "this" {
-  # ...
-  lifecycle {
-    # Ignorar tags individuales sin ignorar el bloque tags completo.
-    # Si ignoras tags["*"] o todo el bloque tags, Terraform dejaria de
-    # detectar cambios legitimos en las tags que tu gestionas.
-    ignore_changes = [
-      tags["CreatedBy"],                          # anadida por AWS Organizations
-      tags["aws:cloudformation:stack-name"],       # anadida por CloudFormation
-      tags["kubernetes.io/role/elb"],              # anadida por EKS
-    ]
-  }
+connection {
+  type        = "ssh"
+  host        = aws_instance.web.public_ip
+  user        = "ec2-user"
+  private_key = file(var.ssh_private_key_path)
+  timeout     = "5m"  # Tiempo de espera mientras la instancia arranca
 }
 ```
 
-**Regla practica**: ignora solo las tags cuya clave conoces y que sabes que
-son gestionadas externamente. No uses `ignore_changes = [tags]` (bloque
-completo) porque ocultaria cualquier cambio en las tags que si gestionas.
+El parámetro `timeout` es crítico: una instancia EC2 recien creada tarda 1-2
+minutos en que cloud-init arranque sshd. Sin un timeout suficiente, el
+provisioner fallara antes de que el servidor este listo.
+
+### Provisioner `local-exec`
+
+Ejecuta un comando en la **maquina que corre Terraform** (no en el servidor
+remoto). Util para:
+- Registrar eventos en logs locales o sistemas externos.
+- Invocar scripts de notificación (Slack, PagerDuty...).
+- Actualizar inventarios de CMDB.
+
+```hcl
+provisioner "local-exec" {
+  on_failure  = continue   # Si falla, advertencia en lugar de error
+  interpreter = ["/bin/bash", "-c"]
+  command     = "echo '...' >> deployment.log"
+}
+```
+
+**`on_failure`** puede ser:
+- `fail` (defecto): un fallo aborta el apply y *taint*-ea el recurso.
+- `continue`: el fallo se registra como advertencia y el apply prosigue.
+
+Usa `continue` únicamente para operaciones de registro o notificación que no
+son críticas para el estado de la infraestructura.
+
+### `self` dentro de provisioners
+
+Dentro de un bloque `provisioner`, `self` referencia el recurso que contiene
+el provisioner. En `terraform_data`, permite acceder a los valores de
+`triggers_replace` sin crear dependencias circulares:
+
+```hcl
+# En un provisioner de terraform_data.app_deploy:
+"version=${self.triggers_replace.app_version}"
+```
+
+### El problema del estado de los provisioners
+
+Terraform **no conoce el resultado** de un provisioner — solo sabe si termino
+con exito o con error. Si el provisioner `remote-exec` se ejecuto correctamente
+pero el servidor fallo mas tarde, Terraform no lo detecta. Por eso:
+
+- Incluye validaciones en el propio script (`set -euo pipefail`, checks de HTTP).
+- Usa `output` para exponer URLs verificables post-apply.
+- Considera complementar con healthchecks externos (ALB, Route53 health check).
 
 ## Estructura del proyecto
 
 ```
 lab-38/
-├── diagrama.drawio          # Fuente editable del diagrama de arquitectura
-├── arch/
-│   └── diagrama.svg         # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf        # Terraform >= 1.10 + default_tags corporativas
-│   ├── variables.tf        # vpc_config (mapa anidado), monitoring_config (optional)
-│   ├── locals.tf           # Flatten Pattern + merge() + try() + can()
-│   ├── main.tf             # VPCs, subredes, route tables, instancia, check {}
-│   ├── outputs.tf          # IDs, claves del flatten, tags fusionadas, billing codes
-│   └── aws.s3.tfbackend    # Backend S3
+│   ├── providers.tf          # Terraform >= 1.10 + provider AWS ~> 6.0
+│   ├── variables.tf          # region, project, app_version, ssh_*, instance_type
+│   ├── main.tf               # AMI, key pair, SG, IAM, EC2, terraform_data
+│   ├── outputs.tf            # IPs, URLs, version desplegada, comando SSH
+│   └── aws.s3.tfbackend      # Configuracion parcial del backend S3
+├── scripts/
+│   └── deploy.sh             # Script subido via "file" y ejecutado via "remote-exec"
 └── README.md
 ```
 
----
+## Despliegue en AWS
 
-## Despliegue en AWS real
+### Paso 0 — Generar el par de claves SSH
 
-### Paso 1 — Inicializar y desplegar
+```bash
+# Genera un par de claves ed25519 sin passphrase (para uso automatizado)
+ssh-keygen -t ed25519 -f ~/.ssh/lab38_key -N ""
+
+# Verificar que se crearon ambos ficheros:
+ls -la ~/.ssh/lab38_key ~/.ssh/lab38_key.pub
+```
+
+La clave privada (`lab38_key`) nunca sale de tu maquina. Terraform sube solo la
+publica (`lab38_key.pub`) a AWS como `aws_key_pair`.
+
+### Paso 1 — Obtener tu IP para restringir SSH
+
+```bash
+# Obtener tu IP publica actual
+MY_IP=$(curl -s https://checkip.amazonaws.com)
+echo "Tu IP: ${MY_IP}"
+```
+
+Abrir el puerto 22 a `0.0.0.0/0` es funcional pero inseguro. Restringirlo a tu
+IP elimina la exposicion a scanners automaticos de Internet.
+
+### Paso 2 — Inicializar y desplegar
 
 ```bash
 cd labs/lab-38/aws
 
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
+export MY_IP=$(curl -s https://checkip.amazonaws.com)
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
   -backend-config="bucket=${BUCKET}"
 
-terraform plan
-terraform apply
+terraform plan \
+  -var="ssh_allowed_cidr=${MY_IP}/32"
+
+terraform apply \
+  -var="ssh_allowed_cidr=${MY_IP}/32"
 ```
 
-El apply crea **9 recursos**:
-- 2 VPCs (`networking`, `data`)
-- 5 subredes (3 en `networking`, 2 en `data`) — generadas por el Flatten Pattern
-- 1 Internet Gateway para el VPC `networking` (tiene subredes publicas)
-- 1 Security Group para la instancia de monitoreo
-- 1 Security Group Egress Rule
-- 1 instancia EC2 de monitoreo
+**Durante el apply**, observa la secuencia de mensajes:
 
----
+```
+aws_key_pair.lab: Creating...
+aws_security_group.web: Creating...
+aws_iam_role.ec2: Creating...
+...
+aws_instance.web: Creation complete after 15s
+terraform_data.app_deploy: Creating...
+terraform_data.app_deploy: Provisioning with 'file'...
+terraform_data.app_deploy: Provisioning with 'remote-exec'...
+terraform_data.app_deploy (remote-exec): [2024-...] Iniciando despliegue v1.0.0
+terraform_data.app_deploy (remote-exec): [2024-...] Actualizando paquetes...
+terraform_data.app_deploy (remote-exec): [2024-...] Instalando nginx...
+terraform_data.app_deploy (remote-exec): [2024-...] Despliegue v1.0.0 completado
+terraform_data.app_deploy: Provisioning with 'local-exec'...
+terraform_data.app_deploy: Creation complete
+```
 
-### Paso 2 — Inspeccionar el resultado del Flatten Pattern
+El apply tarda aproximadamente 3-4 minutos: 1-2 min para que la instancia
+arranque sshd y 1-2 min para el script de configuración.
+
+## Verificación final
+
+### Comprobar la aplicacion desplegada
 
 ```bash
-# Ver las claves compuestas generadas por el flatten
-terraform output flattened_subnets_keys
-# Esperado:
-# tolist([
-#   "data/db-a",
-#   "data/db-b",
-#   "networking/private-a",
-#   "networking/public-a",
-#   "networking/public-b",
-# ])
+PUBLIC_IP=$(terraform output -raw public_ip)
 
-# Ver el total de subredes creadas desde el mapa anidado
-terraform output flattened_subnets_count
-# Esperado: 5
+# Pagina principal con la version
+curl http://${PUBLIC_IP}
+# Esperado: HTML con version 1.0.0
 
-# Ver los IDs de subredes agrupados por VPC
-terraform output subnets_by_vpc
+# Endpoint JSON de version (para healthchecks automaticos)
+curl http://${PUBLIC_IP}/version.json
+# Esperado: {"project":"lab38","version":"1.0.0","deployed_at":"..."}
 ```
 
----
-
-### Paso 3 — Inspeccionar las etiquetas fusionadas con `merge()`
+### Verificar el log de despliegue local
 
 ```bash
-# Ver las etiquetas de una subred de muestra
-terraform output sample_subnet_tags
-# Esperado (sin las etiquetas corporativas que llegan via default_tags):
-# {
-#   "BillingCode" = "NET-001"
-#   "Department"  = "networking"
-#   "Name"        = "lab38-networking/public-a"
-#   "Team"        = "net-ops"
-#   "Tier"        = "public"
-# }
-
-# Verificar en AWS que las etiquetas corporativas (default_tags) tambien estan
-PRIMARY_SUBNET=$(terraform output -json subnet_ids | jq -r '.["networking/public-a"]')
-aws ec2 describe-subnets \
-  --subnet-ids "${PRIMARY_SUBNET}" \
-  --query "Subnets[0].Tags" \
-  --output table
-# Las columnas ManagedBy, Project, Environment, CostCenter, Owner
-# deben aparecer aunque no las hayas declarado en el bloque tags del recurso
+# El local-exec escribe en deployment.log en el directorio desde donde ejecutas terraform
+cat deployment.log
+# Esperado: 2024-...T...Z | version=1.0.0 | instance=i-0abc... | ip=54.xx.xx.xx
 ```
 
----
-
-### Paso 4 — Verificar la postcondition: IP publica asignada
+### Conectarse al servidor y revisar el log remoto
 
 ```bash
-# Ver la IP publica verificada por la postcondition
-terraform output monitoring_public_ip
-# Si el valor es null o vacio, la postcondition habria abortado el apply
+# Usar el comando SSH del output
+$(terraform output -raw ssh_command)
 
-# Verificar en AWS que la instancia tiene la IP
-INSTANCE_ID=$(terraform output -raw monitoring_instance_id)
-aws ec2 describe-instances \
-  --instance-ids "${INSTANCE_ID}" \
-  --query "Reservations[0].Instances[0].PublicIpAddress" \
-  --output text
+# Una vez dentro, ver el log del script de despliegue
+sudo cat /var/log/lab38-deploy.log
+sudo systemctl status nginx
 ```
 
----
+### Probar triggers_replace — redespliegue sin cambiar la instancia
 
-### Paso 5 — Disparar la precondition con una AZ no autorizada
-
-Pasa un valor de `monitoring_config` con una AZ fuera de la lista autorizada
-directamente en la linea de comandos, sin modificar `variables.tf`:
+Cambia la versión de la aplicación y aplica de nuevo:
 
 ```bash
-terraform plan -var='monitoring_config={"enabled":true,"availability_zone":"us-east-1d"}'
+terraform apply \
+  -var="ssh_allowed_cidr=${MY_IP}/32" \
+  -var="app_version=2.0.0"
 ```
 
-Terraform debe fallar durante el plan con el mensaje descriptivo:
+Terraform mostrara:
 
 ```
-╷
-│ Error: Resource precondition failed
-│
-│   on main.tf line XX, in resource "aws_instance" "monitoring":
-│    XX:       condition = contains(var.monitoring_config.allowed_azs, ...)
-│
-│ La zona de disponibilidad 'us-east-1d' no esta en la lista de zonas
-│ autorizadas para este entorno: ["us-east-1a","us-east-1b","us-east-1c"].
-│ Actualiza monitoring_config.availability_zone con un valor permitido.
-╵
+terraform_data.app_deploy: Destroying...  ← se destruye el recurso anterior
+terraform_data.app_deploy: Destruction complete
+terraform_data.app_deploy: Creating...    ← se crea uno nuevo
+terraform_data.app_deploy: Provisioning with 'file'...
+terraform_data.app_deploy: Provisioning with 'remote-exec'...
+terraform_data.app_deploy (remote-exec): [2024-...] Iniciando despliegue v2.0.0
+...
 ```
 
-Observa que **ningun recurso se crea ni se destruye** — el plan se aborta
-antes de intentar cualquier cambio. Restaura el valor original antes de
-continuar.
-
----
-
-### Paso 6 — Activar la alarma de CPU con `optional()` y verificar `can()`
-
-Demuestra el atributo `optional(string, null)`: añade un email para activar
-el SNS topic y la alarma de CloudWatch sin modificar ninguna otra parte del
-codigo:
+La instancia EC2 NO se modifica — solo `terraform_data` se recrea. Al finalizar:
 
 ```bash
-terraform plan -var='monitoring_config={"enabled":true,"alarm_email":"alertas@example.com"}'
-# Debe mostrar 3 recursos nuevos: sns_topic + sns_subscription + cw_alarm
+curl http://$(terraform output -raw public_ip)/version.json
+# Esperado: {"version":"2.0.0",...}
 
-terraform apply -var='monitoring_config={"enabled":true,"alarm_email":"alertas@example.com"}'
+cat deployment.log
+# Esperado: dos lineas, una por cada version desplegada
 ```
-
-Verifica que `local.monitoring_alarm_enabled` (calculado con `can()`) refleja
-correctamente el estado:
-
-```bash
-terraform output monitoring_alarm_enabled
-# Esperado: true
-```
-
-Limpia los 3 recursos de alerta antes de los retos volviendo al valor por
-defecto (sin `alarm_email`):
-
-```bash
-terraform apply
-# Esperado: 3 recursos destruidos (sns_topic, sns_subscription, cw_alarm)
-
-terraform output monitoring_alarm_enabled
-# Esperado: false
-```
-
----
-
-### Paso 7 — Verificar `try()` con los codigos de facturacion
-
-`try()` extrae el `billing_code` de cada subred de forma defensiva. Inspecciona
-el output para confirmar que todos tienen valor (en este lab siempre lo tienen,
-pero el `try()` garantiza que el plan no fallaria si alguna subred heredada
-no tuviera ese campo):
-
-```bash
-terraform output subnet_billing_codes
-# Esperado:
-# {
-#   "data/db-a"            = "DAT-001"
-#   "data/db-b"            = "DAT-001"
-#   "networking/private-a" = "NET-002"
-#   "networking/public-a"  = "NET-001"
-#   "networking/public-b"  = "NET-001"
-# }
-```
-
-Para ver `try()` en accion con un valor ausente, abre la consola de Terraform
-(`terraform console`) y evalua una expresion que fallaria sin `try()`:
-
-```bash
-terraform console
-```
-
-```hcl
-# Dentro del console:
-
-# SIN try() — falla si el atributo no existe:
-null.foo
-# Error: Attempt to get attribute from null value
-
-# CON try() — devuelve el fallback:
-try(null.foo, "UNTAGGED")
-# "UNTAGGED"
-
-# can() — booleano de evaluabilidad:
-can(null.foo)
-# false
-
-can("valor-real")
-# true
-```
-
----
-
-### Paso 8 — Observar el bloque `check {}` en accion
-
-El bloque `check "public_subnet_has_internet_route"` se evalua al final de
-cada apply. En condiciones normales debería pasar:
-
-```bash
-terraform apply
-# Al final del apply, si la ruta existe:
-# Apply complete! Resources: X added, 0 changed, 0 destroyed.
-# (sin advertencias de check)
-```
-
-El escenario idoneo para `check {}` es detectar **drift externo**: alguien
-elimina una ruta manualmente en AWS sin pasar por Terraform. En ese caso el
-data source del check lee el estado real de AWS tal como esta, y el `assert`
-se evalua contra esa realidad.
-
-Simula el drift eliminando la ruta directamente desde AWS CLI:
-
-```bash
-# Obtener el ID de la route table publica del VPC networking
-RT_ID=$(terraform output -json public_route_table_ids | jq -r '.networking')
-
-# Eliminar la ruta 0.0.0.0/0 manualmente (simula accion de un operador)
-aws ec2 delete-route \
-  --route-table-id "$RT_ID" \
-  --destination-cidr-block "0.0.0.0/0"
-```
-
-Ejecuta `terraform plan` — el data source del check consulta el estado real
-de AWS (ruta eliminada) y el `assert` dispara el mensaje personalizado:
-
-```bash
-terraform plan
-# Esperado:
-# Plan: 0 to add, 1 to change, 0 to destroy.
-# ╷
-# │ Warning: Check block assertion failed
-# │
-# │   on main.tf line 320, in check "public_subnet_has_internet_route":
-# │  320:     condition = anytrue([
-# │  321:       for route in data.aws_route_table.networking_public_a.routes :
-# │  322:       route.cidr_block == "0.0.0.0/0" && route.gateway_id != null && route.gateway_id != ""
-# │  323:     ])
-# │     ├────────────────
-# │     │ data.aws_route_table.networking_public_a.routes is empty list of object
-# │
-# │ La subred 'networking/public-a' no tiene ruta por defecto (0.0.0.0/0)
-# │ hacia un Internet Gateway. Las instancias en esta subred no podran
-# │ alcanzar Internet. Verifica aws_route_table.public["networking"] y
-# │ aws_route_table_association.public["networking/public-a"].
-# ╵
-# (el plan NO se aborta — el check es solo una advertencia)
-```
-
-> Terraform muestra tanto la condición evaluada como el valor que la causa
-> (`routes is empty list of object`) y el `error_message` personalizado.
-> La route table existe y el data source la encuentra, pero al haber
-> eliminado la única ruta gestionada, `routes` queda vacio y `anytrue([])`
-> devuelve `false`.
-
-Aplica para restaurar la ruta y verifica que el check vuelve a pasar:
-
-```bash
-terraform apply --auto-approve
-# Apply complete! Resources: 0 added, 1 changed, 0 destroyed.
-# (sin advertencias de check — la ruta esta restaurada)
-```
-
----
-
-### Paso 9 — Simular drift de tags con `ignore_changes`
-
-`ignore_changes` protege los tags que herramientas externas puedan añadir.
-Simula que AWS Organizations añade un tag `CreatedBy` a uno de los VPCs:
-
-```bash
-VPC_ID=$(terraform output -json vpc_ids | jq -r '.networking')
-
-# Anadir una tag externamente (simula AWS Organizations o Security Hub)
-aws ec2 create-tags \
-  --resources "${VPC_ID}" \
-  --tags Key=CreatedBy,Value=aws-organizations
-
-# Verificar que la tag existe en AWS
-aws ec2 describe-tags \
-  --filters "Name=resource-id,Values=${VPC_ID}" "Name=key,Values=CreatedBy" \
-  --query "Tags[0].Value" \
-  --output text
-# Esperado: aws-organizations
-```
-
-```bash
-# Sin ignore_changes, esto devolveria:
-# ~ tags = { - "CreatedBy" = "aws-organizations" }  ← Terraform la eliminaria
-
-# CON ignore_changes: Terraform no la ve como drift
-terraform plan
-# Esperado: No changes. Your infrastructure matches the configuration.
-```
-
-La tag `CreatedBy` permanece en AWS intacta aunque no este declarada en el
-codigo HCL — exactamente el comportamiento que necesitas cuando convives con
-herramientas de gobernanza.
-
----
 
 ## Retos
 
-### Reto 1 — Añadir una nueva VPC con subredes sin modificar el código
+### Reto 1 — Historial de versiones desplegadas con `terraform_data` e `input`/`output`
 
-El Flatten Pattern debe permitir añadir nuevas VPCs y subredes simplemente
-extendiendo la variable `vpc_config`, sin tocar ningun bloque `resource`.
+Actualmente `terraform_data.app_deploy` solo usa `triggers_replace`. El recurso
+tiene un segundo atributo — `input` — que permite almacenar valores arbitrarios
+en el estado y recuperarlos despues via `output`.
 
-**Objetivo**: añade un tercer VPC `"app"` con dos subredes
-(`"app-a"` en `us-east-1a` y `"app-b"` en `us-east-1b`, ambas publicas)
-al valor por defecto de `var.vpc_config`.
+**Objetivo**: construir un historial de las ultimas versiones desplegadas
+combinando `input`/`output` de `terraform_data` con un fichero local que
+persiste entre ejecuciones.
 
-1. Modifica `variables.tf` para añadir el VPC `"app"` con sus dos subredes.
-2. Ejecuta `terraform plan`.
-3. Confirma que el plan muestra exactamente los recursos nuevos para `"app"`
-   y cero cambios en los recursos existentes de `"networking"` y `"data"`.
-4. Aplica y verifica con `terraform output subnets_by_vpc`.
+Implementa lo siguiente en `main.tf` y `outputs.tf`:
 
-**Lo que debes ver**: `app/app-a` y `app/app-b` en los outputs, junto con
-un nuevo Internet Gateway para el VPC `"app"` (tiene subredes publicas).
+1. Añade un `local` llamado `previous_version` que lea el contenido del fichero
+   `aws/.last_version` con la función `file()`. Usa `try()` para devolver
+   `"none"` si el fichero no existe aun (primer despliegue).
+
+2. Añade un segundo recurso `terraform_data` llamado `version_history` cuyo
+   `input` sea un objeto con `current = var.app_version` y
+   `previous = local.previous_version`.
+
+3. Añade un `provisioner "local-exec"` en ese recurso que escriba `var.app_version`
+   en el fichero `.last_version` al finalizar cada apply exitoso.
+
+4. Añade un output `version_history` que exponga `terraform_data.version_history.output`.
+
+**Por que no se puede usar una auto-referencia**: Terraform resuelve el grafo
+de dependencias en la fase de plan. Si un recurso se referenciara a si mismo
+(`terraform_data.version_history.output.current` dentro del mismo recurso),
+se crearia un ciclo que el motor no puede resolver — de ahi el error
+`Self-referential block`. El fichero local rompe el ciclo: `file()` es una
+función que se evalúa en local antes del plan, sin depender del grafo.
+
+#### Prueba
+
+```bash
+# Primer despliegue (el fichero .last_version no existe aun)
+terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=1.0.0"
+terraform output version_history
+# Esperado: { current = "1.0.0", previous = "none" }
+
+# El local-exec ha escrito "1.0.0" en aws/.last_version
+cat aws/.last_version
+
+# Segundo despliegue
+terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
+terraform output version_history
+# Esperado: { current = "2.0.0", previous = "1.0.0" }
+
+# Tercer despliegue
+terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=3.0.0"
+terraform output version_history
+# Esperado: { current = "3.0.0", previous = "2.0.0" }
+```
 
 ---
 
-### Reto 2 — Implementar una precondition de solapamiento de CIDR
+### Reto 2 — Verificación del despliegue con `postcondition` y `check`
 
-Las VPCs no pueden tener bloques CIDR solapados si se van a conectar
-mediante VPC Peering o Transit Gateway. Actualmente Terraform no valida esto.
+Actualmente Terraform no tiene forma de saber si `deploy.sh` dejo la aplicacion
+funcionando correctamente — solo sabe que el provisioner termino sin error.
+Un script puede completarse con exit 0 y aun asi dejar nginx caido si las
+verificaciones internas no son suficientes.
 
-**Objetivo**: añade una `precondition` en `aws_vpc.this` que verifique que
-ninguno de los CIDRs de `var.vpc_config` se solapa con los demas.
+Terraform ofrece dos mecanismos nativos para verificar el estado real de la
+infraestructura despues de un apply:
+
+- **`postcondition`**: se evalua dentro del bloque `lifecycle` de un recurso.
+  Si falla, el apply se considera erroneo y el recurso queda marcado como
+  tainted. Se ejecuta despues de crear o actualizar el recurso.
+- **`check`**: bloque de nivel raiz (fuera de cualquier recurso). Se evalua
+  al final del apply. Si falla, emite una advertencia pero **no** aborta el
+  apply ni tainta el recurso — util para healthchecks que no deben bloquear.
+
+**Objetivo**: añade ambos mecanismos a `main.tf`:
+
+1. Un bloque `lifecycle { postcondition {} }` en `aws_instance.web` que
+   verifique que la instancia tiene IP publica asignada antes de que
+   `terraform_data` intente conectarse via SSH.
+
+2. Un bloque `check` de nivel raiz que haga una peticion HTTP a
+   `http://<public_ip>/version.json` y verifique que la respuesta contiene
+   la versión actualmente desplegada (`var.app_version`). Usa un
+   `data "http"` para la peticion.
 
 **Pistas**:
-- La función `cidrnetmask()` permite inspeccionar un CIDR.
-- Para detectar solapamiento entre dos CIDRs puedes comparar si la primera
-  IP de uno cae dentro del rango del otro con `cidrhost()`.
-- Alternativamente, una validación pragmática es verificar que todos los
-  CIDRs son distintos: `length(distinct(values(...))) == length(values(...))`.
-  Implementa primero esta versión simple y luego, si quieres, la versión
-  con solapamiento real.
+- El provider `http` necesita declararse en `required_providers`:
+  `hashicorp/http ~> 3.0`.
+- `data "http"` devuelve el cuerpo de la respuesta en `response_body`.
+  La función `strcontains()` permite verificar que contiene un substring.
+- En el bloque `check`, el `data source` se declara dentro del propio bloque.
 
----
+#### Prueba
 
-### Reto 3 — Configuración de monitoreo por entorno con `optional()`
-
-Actualmente `monitoring_config` tiene un único conjunto de valores por
-defecto. En un proyecto real, los valores por defecto varian por entorno:
-`production` usa `t4g.small` y requiere alarma; `dev` usa `t4g.micro` y
-no necesita alarma.
-
-**Objetivo**: define una variable `monitoring_defaults_by_env` de tipo
-`map(object({ instance_type, alarm_email }))` y usa `lookup()` y `merge()`
-para construir la configuración efectiva de monitoreo fusionando los defaults
-del entorno con los valores que el operador haya especificado explicitamente.
-
-```hcl
-variable "monitoring_defaults_by_env" {
-  type = map(object({
-    instance_type = string
-    alarm_email   = optional(string, null)
-  }))
-  default = {
-    production = { instance_type = "t4g.small",  alarm_email = "prod-alerts@example.com" }
-    staging    = { instance_type = "t4g.micro",  alarm_email = null }
-    dev        = { instance_type = "t4g.micro",  alarm_email = null }
-  }
-}
+```bash
+terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
+# Al final del apply debe aparecer:
+# Check block "healthcheck_version" passed.  ← si nginx responde con la version correcta
+# o:
+# Warning: Check block assertion failed      ← si nginx no esta listo aun (race condition)
 ```
-
-La logica de fusion en `locals.tf`:
-```hcl
-locals {
-  effective_monitoring = merge(
-    lookup(var.monitoring_defaults_by_env, var.environment, {}),
-    { for k, v in var.monitoring_config : k => v if v != null }
-  )
-}
-```
-
----
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Añadir una nueva VPC con subredes</strong></summary>
+<summary><strong>Solución al Reto 1 — Historial de versiones con terraform_data input/output</strong></summary>
 
-### Solución al Reto 1 — Añadir una nueva VPC con subredes
+### Solución al Reto 1 — Historial de versiones con terraform_data input/output
 
-Añade en `variables.tf` dentro del `default` de `vpc_config`:
-
-```hcl
-"app" = {
-  cidr_block = "10.41.0.0/16"
-  subnets = {
-    "app-a" = {
-      cidr_block        = "10.41.1.0/24"
-      availability_zone = "us-east-1a"
-      public            = true
-      department_tags = {
-        department   = "application"
-        team         = "app-team"
-        billing_code = "APP-001"
-      }
-    }
-    "app-b" = {
-      cidr_block        = "10.41.2.0/24"
-      availability_zone = "us-east-1b"
-      public            = true
-      department_tags = {
-        department   = "application"
-        team         = "app-team"
-        billing_code = "APP-001"
-      }
-    }
-  }
-}
-```
-
-```bash
-terraform plan
-# Esperado: 4 recursos nuevos
-#   aws_vpc.this["app"]
-#   aws_subnet.this["app/app-a"]
-#   aws_subnet.this["app/app-b"]
-#   aws_internet_gateway.this["app"]   ← tiene subredes publicas
-#
-# 0 cambios en networking y data
-
-terraform apply
-terraform output subnets_by_vpc
-# "app" = {
-#   "app/app-a" = "subnet-0abc..."
-#   "app/app-b" = "subnet-0xyz..."
-# }
-```
-
-El Flatten Pattern no requirio ningun cambio en el codigo de recursos —
-solo en la variable de entrada.
-
-</details>
-
-<details>
-<summary><strong>Solución al Reto 2 — Precondition de solapamiento de CIDR</strong></summary>
-
-### Solución al Reto 2 — Precondition de solapamiento de CIDR
-
-#### Donde añadir la precondition
-
-`aws_vpc.this` ya tiene un bloque `lifecycle` con `ignore_changes`. Añade
-la `precondition` dentro de ese mismo bloque, antes de `ignore_changes`:
-
-```hcl
-# ANTES — lifecycle solo con ignore_changes
-resource "aws_vpc" "this" {
-  for_each = local.vpcs_map
-  # ...
-  lifecycle {
-    ignore_changes = [
-      tags["CreatedBy"],
-      tags["aws:cloudformation:stack-name"],
-      tags["aws:organizations:delegated-administrator"],
-    ]
-  }
-}
-
-# DESPUES — precondition añadida dentro del mismo bloque lifecycle
-resource "aws_vpc" "this" {
-  for_each = local.vpcs_map
-  # ...
-  lifecycle {
-    precondition {
-      condition = length(distinct([
-        for vpc in var.vpc_config : vpc.cidr_block
-      ])) == length(var.vpc_config)
-      error_message = <<-EOT
-        Dos o mas VPCs tienen el mismo bloque CIDR. Los CIDRs deben ser
-        unicos para permitir conectividad futura via VPC Peering o
-        Transit Gateway. CIDRs actuales: ${jsonencode([
-          for k, v in var.vpc_config : "${k}: ${v.cidr_block}"
-        ])}
-      EOT
-    }
-
-    ignore_changes = [
-      tags["CreatedBy"],
-      tags["aws:cloudformation:stack-name"],
-      tags["aws:organizations:delegated-administrator"],
-    ]
-  }
-}
-```
-
-#### Cómo funciona la condición
-
-```hcl
-length(distinct([
-  for vpc in var.vpc_config : vpc.cidr_block
-])) == length(var.vpc_config)
-```
-
-Paso a paso con los valores del laboratorio:
-
-| Expresion | Resultado |
-|-----------|-----------|
-| `[for vpc in var.vpc_config : vpc.cidr_block]` | `["10.39.0.0/16", "10.40.0.0/16"]` |
-| `distinct([...])` | `["10.39.0.0/16", "10.40.0.0/16"]` (sin cambios, todos distintos) |
-| `length(distinct([...]))` | `2` |
-| `length(var.vpc_config)` | `2` |
-| `2 == 2` | `true` → precondition pasa |
-
-Si dos VPCs tuviesen el mismo CIDR (`10.39.0.0/16`, `10.39.0.0/16`):
-
-| Expresion | Resultado |
-|-----------|-----------|
-| `[for vpc in var.vpc_config : vpc.cidr_block]` | `["10.39.0.0/16", "10.39.0.0/16"]` |
-| `distinct([...])` | `["10.39.0.0/16"]` (elimina duplicados) |
-| `length(distinct([...]))` | `1` |
-| `length(var.vpc_config)` | `2` |
-| `1 == 2` | `false` → precondition falla |
-
-#### Como probar que funciona
-
-Añade temporalmente una tercera VPC en el `default` de `vpc_config` en
-[variables.tf](aws/variables.tf) con el mismo CIDR que `networking`:
-
-```hcl
-# Anadir al final del default de vpc_config, dentro del mapa:
-"duplicado" = {
-  cidr_block = "10.39.0.0/16"   # mismo CIDR que "networking" → debe fallar
-  subnets = {
-    "test-a" = {
-      cidr_block        = "10.39.50.0/24"
-      availability_zone = "us-east-1a"
-      public            = false
-      department_tags = {
-        department   = "test"
-        team         = "test-team"
-        billing_code = "TST-001"
-      }
-    }
-  }
-}
-```
-
-```bash
-terraform plan
-# Esperado — el mismo error aparece UNA VEZ POR VPC en el mapa.
-# Con networking + data + duplicado (3 VPCs), el error se repite 3 veces.
-# Si tambien tienes la VPC "app" del Reto 1, se repite 4 veces:
-#
-# ╷
-# │ Error: Resource precondition failed
-# │
-# │   on main.tf line 40, in resource "aws_vpc" "this":
-# │   40:       condition = length(distinct([
-# │   41:         for vpc in var.vpc_config : vpc.cidr_block
-# │   42:       ])) == length(var.vpc_config)
-# │     ├────────────────
-# │     │ var.vpc_config is map of object with 4 elements
-# │
-# │ Dos o mas VPCs tienen el mismo bloque CIDR. Los CIDRs deben ser
-# │ unicos para permitir conectividad futura via VPC Peering o
-# │ Transit Gateway. CIDRs actuales: ["app: 10.41.0.0/16","data: 10.40.0.0/16",
-# │ "duplicado: 10.39.0.0/16","networking: 10.39.0.0/16"]
-# ╵
-# ╷
-# │ Error: Resource precondition failed
-# │   ... (mismo mensaje, instancia diferente del for_each)
-# ╵
-# ... (repetido una vez por cada VPC en el mapa)
-```
-
-> **Por que se repite el error**: `lifecycle { precondition }` pertenece al
-> recurso `aws_vpc.this`, que usa `for_each`. Terraform evalua el bloque
-> `lifecycle` independientemente para cada instancia del `for_each`
-> (`networking`, `data`, `app`, `duplicado`), produciendo un error por cada
-> una. La condición es idéntica en todos los casos porque evalúa
-> `var.vpc_config` completo — no el VPC actual — por lo que el mensaje se
-> repite con el mismo contenido. Es el comportamiento esperado y correcto.
-
-Elimina la VPC `"duplicado"` de `variables.tf` y verifica que el plan
-vuelve a pasar sin errores:
-
-```bash
-terraform plan
-# Esperado: No changes. Your infrastructure matches the configuration.
-```
-
-</details>
-
-<details>
-<summary><strong>Solución al Reto 3 — Configuración de monitoreo por entorno</strong></summary>
-
-### Solución al Reto 3 — Configuración de monitoreo por entorno
-
-Añade en `variables.tf`:
-
-```hcl
-variable "monitoring_defaults_by_env" {
-  type = map(object({
-    instance_type = string
-    alarm_email   = optional(string, null)
-  }))
-  default = {
-    production = { instance_type = "t4g.small",  alarm_email = "prod-alerts@example.com" }
-    staging    = { instance_type = "t4g.micro",  alarm_email = null }
-    dev        = { instance_type = "t4g.micro",  alarm_email = null }
-  }
-}
-```
-
-Añade en `locals.tf`:
+Añade en `main.tf`:
 
 ```hcl
 locals {
-  # Los valores del operador sobreescriben los defaults del entorno.
-  # Se filtran los null para que no sobreescriban un default valido.
-  effective_monitoring = merge(
-    lookup(var.monitoring_defaults_by_env, var.environment, {
-      instance_type = "t4g.micro"
-      alarm_email   = null
-    }),
-    { for k, v in var.monitoring_config : k => v if v != null }
-  )
+  # file() se evalua en local antes del plan — no participa en el grafo
+  # de dependencias, por lo que no crea ciclos.
+  # try() devuelve "none" si el fichero no existe aun (primer despliegue).
+  previous_version = try(trimspace(file("${path.module}/.last_version")), "none")
+}
+
+resource "terraform_data" "version_history" {
+  # input se evalua durante el plan con los valores actuales de las variables
+  # y del fichero local. Terraform lo persiste en el estado como "output"
+  # una vez que el apply termina con exito.
+  input = {
+    current  = var.app_version
+    previous = local.previous_version
+  }
+
+  # Despues de cada apply exitoso, escribe la version actual en el fichero.
+  # El proximo plan leerá este valor como "previous" via local.previous_version.
+  provisioner "local-exec" {
+    command = "printf '%s' '${var.app_version}' > '${path.module}/.last_version'"
+  }
 }
 ```
 
-Hay dos archivos donde sustituir referencias. El motivo es siempre el mismo:
-`var.monitoring_config` contiene solo lo que el operador especificó
-explicitamente; `local.effective_monitoring` es el resultado de fusionar
-los defaults del entorno con esos valores. Si leemos directamente la
-variable, ignoramos los defaults del entorno y el reto no tiene efecto.
-
----
-
-**[main.tf](aws/main.tf)** — `aws_instance.monitoring`, atributo `instance_type`:
+Añade en `outputs.tf`:
 
 ```hcl
-# ANTES — lee directamente la variable; si el operador no especifica
-# instance_type, usa el default del tipo ("t4g.micro") sin tener en
-# cuenta que production deberia arrancar con "t4g.small"
-instance_type = var.monitoring_config.instance_type
-
-# DESPUES — lee el local fusionado; para production obtiene "t4g.small"
-# del mapa de defaults aunque el operador no haya escrito nada
-instance_type = local.effective_monitoring.instance_type
-```
-
----
-
-**[locals.tf](aws/locals.tf)** — dos locales que acceden a `alarm_email`:
-
-```hcl
-# ANTES — monitoring_alarm_email extrae el email directamente de la
-# variable; si el operador no puso alarm_email, devuelve null aunque
-# el entorno production tenga "prod-alerts@example.com" como default
-monitoring_alarm_email = try(var.monitoring_config.alarm_email, null)
-
-# DESPUES — extrae el email del local fusionado; para production
-# obtiene "prod-alerts@example.com" aunque el operador no lo haya puesto
-monitoring_alarm_email = try(local.effective_monitoring.alarm_email, null)
-```
-
-```hcl
-# ANTES — can() evalua si var.monitoring_config.alarm_email es accesible;
-# si el operador no especifico alarm_email, can() devuelve false y no
-# se crea la alarma aunque production deberia tenerla por defecto
-monitoring_alarm_enabled = (
-  var.monitoring_config.enabled &&
-  can(var.monitoring_config.alarm_email) &&
-  local.monitoring_alarm_email != null
-)
-
-# DESPUES — can() evalua el local fusionado; para production,
-# local.effective_monitoring.alarm_email existe y no es null,
-# por lo que la alarma se crea automaticamente sin que el operador
-# tenga que recordar especificar el email
-monitoring_alarm_enabled = (
-  var.monitoring_config.enabled &&
-  can(local.effective_monitoring.alarm_email) &&
-  local.monitoring_alarm_email != null
-)
-```
-
----
-
-**[variables.tf](aws/variables.tf)** — `instance_type` en `monitoring_config` debe usar `null` como default, no `"t4g.micro"`:
-
-```hcl
-# ANTES — optional(string, "t4g.micro") rellena instance_type con "t4g.micro"
-# cuando el operador no lo especifica. Ese valor NO es null, por lo que el
-# filtro "if v != null" en effective_monitoring lo incluye en el merge() y
-# sobreescribe el default del entorno (t4g.small en production). El entorno
-# nunca puede ganar porque la variable siempre aporta un valor no-null.
-instance_type = optional(string, "t4g.micro")
-
-# DESPUES — optional(string, null) deja instance_type como null cuando el
-# operador no lo especifica. El filtro "if v != null" lo excluye del merge()
-# y el default del entorno (t4g.small en production) puede aplicarse.
-# Si el operador SI especifica un valor, ese valor no es null y prevalece.
-instance_type = optional(string, null)
-```
-
----
-
-**[outputs.tf](aws/outputs.tf)** — `monitoring_instance_type` debe leer el local fusionado, no la variable:
-
-```hcl
-# ANTES — muestra el valor de la variable (null ahora, o "t4g.micro" antes);
-# no refleja el tipo efectivo con el que se creo la instancia
-output "monitoring_instance_type" {
-  value = var.monitoring_config.instance_type
-}
-
-# DESPUES — muestra el valor efectivo tras fusionar defaults del entorno
-# con los valores del operador; refleja lo que realmente se despliega
-output "monitoring_instance_type" {
-  value = local.effective_monitoring.instance_type
+output "version_history" {
+  description = "Version actual y version desplegada anteriormente"
+  value       = terraform_data.version_history.output
 }
 ```
 
----
-
-Prueba:
+Añade `.last_version` al `.gitignore` del repositorio para no versionar el
+fichero de estado local:
 
 ```bash
-# Aplica los cambios — la instancia se recrea con el nuevo instance_type
-# y se crean SNS topic + alarma porque production tiene alarm_email por defecto
-terraform apply --auto-approve
-# Esperado en el plan previo al apply:
-#   ~ aws_instance.monitoring[0]              (instance_type: t4g.micro -> t4g.small)
-#   + aws_sns_topic.monitoring_alerts[0]
-#   + aws_sns_topic_subscription.monitoring_email[0]
-#   + aws_cloudwatch_metric_alarm.monitoring_cpu[0]
-
-# Verifica el tipo efectivo y que la alarma se activo
-terraform output monitoring_instance_type
-# Esperado: "t4g.small" (default de produccion)
-
-terraform output monitoring_alarm_enabled
-# Esperado: true (production tiene alarm_email = "prod-alerts@example.com")
-
-# Sobreescribir el default del entorno con -var:
-terraform apply \
-  -var='monitoring_config={"enabled":true,"instance_type":"t4g.medium"}' \
-  --auto-approve
-terraform output monitoring_instance_type
-# Esperado: "t4g.medium" (el operador sobreescribio el default)
-
-terraform output monitoring_alarm_enabled
-# Esperado: true (alarm_email sigue siendo "prod-alerts@example.com"
-# del default del entorno — el operador no lo sobreescribio)
-
-# Cambiar al entorno dev — distintos defaults sin tocar monitoring_config
-terraform apply \
-  -var='environment=dev' \
-  --auto-approve
-# Esperado en el plan previo al apply:
-#   ~ aws_instance.monitoring[0]              (instance_type: t4g.medium -> t4g.micro)
-#   - aws_sns_topic.monitoring_alerts[0]                         (destruido)
-#   - aws_sns_topic_subscription.monitoring_email[0]             (destruido)
-#   - aws_cloudwatch_metric_alarm.monitoring_cpu[0]              (destruido)
-
-terraform output monitoring_instance_type
-# Esperado: "t4g.micro" (default de dev)
-
-terraform output monitoring_alarm_enabled
-# Esperado: false (dev no tiene alarm_email en sus defaults)
+echo "labs/lab-38/aws/.last_version" >> .gitignore
 ```
+
+**Por que funciona — flujo entre ejecuciones**:
+
+```
+Apply 1.0.0                          Apply 2.0.0
+─────────────────────────────────────────────────────────────
+Plan:                                Plan:
+  local.previous_version = "none"      local.previous_version = "1.0.0"
+  input = { current="1.0.0"           input = { current="2.0.0"
+             previous="none" }                   previous="1.0.0" }
+         │                                      │
+         ▼ apply                                ▼ apply
+  output = { current="1.0.0"          output = { current="2.0.0"
+              previous="none" }                   previous="1.0.0" }
+         │                                      │
+         ▼ local-exec                           ▼ local-exec
+  .last_version = "1.0.0"             .last_version = "2.0.0"
+```
+
+`file()` lee el fichero *antes* del plan — siempre contiene el valor escrito
+por el `local-exec` del apply anterior. Si el apply falla antes de llegar al
+`local-exec`, el fichero no se actualiza y el siguiente plan seguira viendo
+la versión anterior correcta.
+
+**Verificacion**:
+
+```bash
+# Primer despliegue
+terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=1.0.0"
+terraform output version_history
+# { "current" = "1.0.0", "previous" = "none" }
+cat .last_version   # 1.0.0
+
+# Segundo despliegue
+terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
+terraform output version_history
+# { "current" = "2.0.0", "previous" = "1.0.0" }
+
+# Ver lo que Terraform guarda en el estado
+terraform state show terraform_data.version_history
+```
+
+**Limitacion**: el fichero `.last_version` es local a la maquina que ejecuta
+Terraform. En un equipo con backend remoto, cada miembro tendría su propio
+fichero. Para un historial compartido, la alternativa es persistir la versión
+en SSM Parameter Store con `aws_ssm_parameter` y leerla con un `data source`
+en el siguiente plan.
 
 </details>
 
----
+<details>
+<summary><strong>Solución al Reto 2 — Verificación del despliegue con postcondition y check</strong></summary>
 
-## Verificación final
+### Solución al Reto 2 — Verificación del despliegue con postcondition y check
 
-```bash
-cd labs/lab-38/aws
+**Paso 1 — Declarar el provider `http` en `providers.tf`**:
 
-# Verificar que la instancia EC2 está running
-aws ec2 describe-instances \
-  --filters "Name=tag:Project,Values=lab38" \
-  --query 'Reservations[*].Instances[*].{ID:InstanceId,State:State.Name,IP:PublicIpAddress}' \
-  --output table
-
-# Verificar que la alarma de CPU está configurada
-aws cloudwatch describe-alarms \
-  --query 'MetricAlarms[?contains(AlarmName,`lab38`)].{Name:AlarmName,State:StateValue}' \
-  --output table
-
-# Verificar los outputs del modulo (tags fusionados, codigos de facturacion)
-terraform output -json
-
-# Confirmar que el bloque check {} no lanza UNKNOWN en el plan
-terraform plan -detailed-exitcode
-echo "Exit code: $? (0=no changes, 1=error, 2=changes pending)"
+```hcl
+terraform {
+  required_version = ">= 1.10"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+    http = {
+      source  = "hashicorp/http"
+      version = "~> 3.0"
+    }
+  }
+  backend "s3" {}
+}
 ```
 
----
+**Paso 2 — `postcondition` en `aws_instance.web`**:
+
+Añade un bloque `lifecycle` al recurso `aws_instance.web`:
+
+```hcl
+resource "aws_instance" "web" {
+  # ... resto de argumentos sin cambios ...
+
+  lifecycle {
+    create_before_destroy = true
+
+    # postcondition se evalua despues de crear o actualizar el recurso.
+    # Si falla, el apply falla y el recurso queda tainted — se recrea
+    # en el siguiente apply.
+    # Aqui verificamos que la instancia tiene IP publica antes de que
+    # terraform_data intente abrir la conexion SSH.
+    postcondition {
+      condition     = self.public_ip != ""
+      error_message = "La instancia ${self.id} no tiene IP publica asignada. Verifica que associate_public_ip_address = true y que la subred tiene auto-assign IP habilitado."
+    }
+  }
+}
+```
+
+`self` dentro de `postcondition` referencia el recurso al que pertenece el
+bloque `lifecycle` — en este caso `aws_instance.web`. Es la única excepción
+en Terraform donde `self` esta disponible fuera de un provisioner.
+
+**Paso 3 — bloque `check` de nivel raiz**:
+
+```hcl
+# check se evalua al FINAL del apply, despues de que todos los recursos
+# esten creados. Usa un data source interno para hacer la peticion HTTP.
+# Si el assert falla, emite una advertencia pero NO aborta el apply
+# ni tainta ningun recurso — ideal para healthchecks post-despliegue.
+check "healthcheck_version" {
+  data "http" "version_json" {
+    url = "http://${aws_instance.web.public_ip}/version.json"
+  }
+
+  assert {
+    condition = data.http.version_json.status_code == 200
+    error_message = "El endpoint /version.json respondio con HTTP ${data.http.version_json.status_code} en lugar de 200."
+  }
+
+  assert {
+    condition     = strcontains(data.http.version_json.response_body, var.app_version)
+    error_message = "La respuesta de /version.json no contiene la version '${var.app_version}'. Puede que el despliegue no haya terminado aun."
+  }
+}
+```
+
+**Diferencia clave entre `postcondition` y `check`**:
+
+| | `postcondition` | `check` |
+|---|---|---|
+| Ubicacion | Dentro de `lifecycle {}` de un recurso | Bloque raiz independiente |
+| Cuando se evalua | Justo despues de crear/actualizar ese recurso | Al final del apply, tras todos los recursos |
+| Si falla | Apply falla, recurso tainted | Advertencia, apply continua |
+| Acceso a recursos | Solo `self` | Cualquier recurso o data source |
+| Uso tipico | Invariantes del recurso (IP asignada, ARN valido) | Healthchecks externos, validaciones E2E |
+
+**Verificacion**:
+
+```bash
+terraform init   # necesario para descargar el provider http
+terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
+
+# Salida esperada al final del apply:
+# ...
+# Check block "healthcheck_version":
+#   "healthcheck_version" passed.   ← ambos asserts OK
+
+# Si nginx aun no ha arrancado cuando check se evalua:
+# Warning: Check block assertion failed
+#   The endpoint /version.json respondio con HTTP 000 ...
+# (no es un error — el apply termina correctamente)
+```
+
+</details>
 
 ## Limpieza
 
 ```bash
 cd labs/lab-38/aws
 
-terraform destroy
-```
+terraform destroy \
+  -var="ssh_allowed_cidr=${MY_IP}/32"
 
----
+# Borrar el log local de despliegues (opcional)
+rm -f deployment.log
+```
 
 ## Buenas prácticas aplicadas
 
-- **Flatten Pattern en `locals.tf`**: separar la transformacion de datos de
-  la declaración de recursos hace el código más legible y testeable. Los
-  locals son el lugar correcto para la logica de transformacion.
-- **Claves compuestas semanticas**: `"networking/public-a"` es mas legible
-  y estable que un indice numerico. Ante un `terraform plan`, el operador
-  sabe exactamente que subred se va a modificar.
-- **`merge()` en capas con precedencia explicita**: organizar las capas de
-  menor a mayor prioridad (departamento → identificacion) hace que el codigo
-  sea autodocumentado sobre que prevalece en caso de colision.
-- **`optional()` con defaults razonables**: los valores por defecto deben
-  funcionar correctamente en el caso de uso mas comun. `alarm_email = null`
-  es un default correcto porque no crear una alarma es la opción segura;
-  en cambio, un `instance_type = null` sería un default incorrecto porque
-  causaría un error en el apply.
-- **`precondition` para errores de configuración**: una precondición con un
-  mensaje descriptivo ahorra al operador la frustración de esperar un apply
-  fallido con un error críptico de AWS. La AZ no autorizada es el ejemplo
-  tipico: AWS devuelve `InvalidParameterValue` sin contexto; la precondicion
-  explica exactamente que esta mal y como corregirlo.
-- **`postcondition` para invariantes de AWS**: no todo lo que AWS debe
-  garantizar queda capturado en el plan. La postcondicion actua como un test
-  de integración mínimo que se ejecuta en cada apply.
-
----
+- **Provisioners como ultimo recurso**: el lab los usa para aprender su
+  funcionamiento, pero en producción prefiere `user_data` para el bootstrap
+  inicial y SSM Run Command o Ansible para configuración posterior.
+- **`timeout` en `connection`**: evita que el apply falle si sshd no esta listo
+  inmediatamente. Un timeout de 5 minutos cubre la mayoria de escenarios de
+  arranque lento.
+- **SSH restringido por IP**: `ssh_allowed_cidr` permite abrir el puerto 22 solo
+  desde la IP del operador, no desde todo Internet.
+- **`on_failure = continue` solo para tareas no criticas**: el log local y el
+  webhook son operaciones de observabilidad; un fallo en ellas no debe impedir
+  el despliegue de la infraestructura.
+- **IMDSv2 obligatorio**: `http_tokens = "required"` en la instancia previene
+  ataques SSRF contra el metadata service.
+- **`triggers_replace` con `instance_id`**: garantiza que si la instancia se
+  reemplaza (por un `taint` o un cambio de AMI), los provisioners se vuelven a
+  ejecutar automáticamente sobre la nueva instancia.
+- **Endpoint `/version.json`**: expone la versión actualmente desplegada en un
+  formato machine-readable, util para healthchecks automaticos y verificacion
+  post-despliegue.
 
 ## Recursos
 
-- [Flatten Pattern — Terraform Docs](https://developer.hashicorp.com/terraform/language/functions/flatten)
-- [merge() — Terraform Docs](https://developer.hashicorp.com/terraform/language/functions/merge)
-- [optional() en tipos de objeto](https://developer.hashicorp.com/terraform/language/expressions/type-constraints#optional-object-type-attributes)
-- [precondition y postcondition](https://developer.hashicorp.com/terraform/language/validate)
-- [default_tags en el provider AWS](https://registry.terraform.io/providers/hashicorp/aws/latest/docs#default_tags-configuration-block)
+- [terraform_data — Documentacion oficial](https://developer.hashicorp.com/terraform/language/resources/terraform-data)
+- [Provisioners — Documentacion oficial](https://developer.hashicorp.com/terraform/language/provisioners)
+- [Provisioner file](https://developer.hashicorp.com/terraform/language/provisioners)
+- [Provisioner remote-exec](https://developer.hashicorp.com/terraform/language/provisioners)
+- [Provisioner local-exec](https://developer.hashicorp.com/terraform/language/provisioners)
+- [Bloque connection](https://developer.hashicorp.com/terraform/language/provisioners)
+- [Migracion de null_resource a terraform_data](https://developer.hashicorp.com/terraform/language/resources/terraform-data#migration-from-null_resource)

@@ -3,12 +3,23 @@ variable "project" {
   default = "lab30-local"
 }
 
-variable "runtime" {
+variable "vpc_cidr" {
   type    = string
-  default = "python3.12"
+  default = "10.0.0.0/16"
 }
 
-variable "app_env" {
+variable "desired_count" {
+  type    = number
+  default = 2
+}
+
+variable "container_image" {
   type    = string
-  default = "development"
+  default = "nginx:alpine"
+}
+
+variable "api_key" {
+  type      = string
+  sensitive = true
+  default   = "mi-clave-de-api-secreta-lab30"
 }

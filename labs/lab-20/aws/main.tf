@@ -1,18 +1,17 @@
 # ===========================================================================
-# Lab20 — Hub-and-Spoke con Transit Gateway y RAM
+# Lab19 — Conectividad Punto a Punto con VPC Peering
 # ===========================================================================
-# Topología con inspección centralizada:
+# Topología:
+#   vpc-app (10.15.0.0/16) ◄──peering──► vpc-db  (10.16.0.0/16)
+#   vpc-app (10.15.0.0/16) ◄──peering──► vpc-c   (10.17.0.0/16)
+#   vpc-c   (10.17.0.0/16)  ── ✗ ──      vpc-db  (sin peering, no transitivo)
 #
-#   client-a (10.16.0.0/16) ──┐
-#                              ├── TGW ── inspection (10.17.0.0/16) ── TGW ── egress (10.18.0.0/16) ── Internet
-#   client-b (10.19.0.0/16) ──┘            (Appliance Mode)                   (IGW + NAT GW)
-#
-# Tablas de rutas del TGW:
-#   - client-rt:      0.0.0.0/0 → inspection (todo pasa por inspección)
-#   - inspection-rt:  0.0.0.0/0 → egress + rutas propagadas de clients
-#   - egress-rt:      rutas propagadas de clients + inspection
-#
-# RAM comparte el TGW con una cuenta de aplicación simulada.
+# vpc-app tiene IGW + NAT Gateway para su propia salida a Internet.
+# vpc-db y vpc-c NO tienen salida a Internet: el peering solo permite trafico
+# cuyo destino sea el CIDR de la VPC peer, no reenvia trafico hacia Internet.
+# Para que el SSM Agent pueda registrarse sin Internet, se crean VPC Interface
+# Endpoints (PrivateLink) en vpc-db y vpc-c hacia los servicios ssm/ssmmessages/
+# ec2messages.
 
 # --- Data Sources ---
 
@@ -25,18 +24,51 @@ data "aws_availability_zones" "available" {
   }
 }
 
+# AMI Amazon Linux 2023 estándar (NO minimal): incluye SSM Agent preinstalado.
+# Las instancias en vpc-db y vpc-c no tienen salida a Internet para descargar
+# paquetes, por lo que necesitan una AMI que ya incluya el agente.
+#
+# Patrones de nombre AL2023 publicados por Amazon (owner = "amazon"):
+#   - estándar : al2023-ami-2023.X.YYYYMMDD.0-kernel-X.Y-arm64
+#   - minimal  : al2023-ami-minimal-2023.X.YYYYMMDD.0-kernel-X.Y-arm64
+# Filtramos exigiendo "kernel-*-arm64" en el nombre y ANCLANDO el prefijo a
+# "al2023-ami-2023." (con el punto), de modo que el patron de minimal —que
+# inserta "minimal-" entre "al2023-ami-" y "2023."— queda excluido sin
+# ambiguedad. Anadimos ademas filtros explicitos por owner-alias, arquitectura,
+# tipo de imagen, virtualizacion y dispositivo de root para evitar que
+# cualquier AMI promocional o de terceros con un nombre parecido haga match.
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["al2023-ami-minimal-*-arm64"]
+    values = ["al2023-ami-2023.*-kernel-*-arm64"]
+  }
+
+  filter {
+    name   = "owner-alias"
+    values = ["amazon"]
   }
 
   filter {
     name   = "architecture"
     values = ["arm64"]
+  }
+
+  filter {
+    name   = "image-type"
+    values = ["machine"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
   }
 
   filter {
@@ -55,527 +87,364 @@ locals {
     ManagedBy   = "terraform"
     Project     = var.project_name
   }
-
-  # Mapeo explícito subred privada → subred pública (con su NAT GW) por AZ.
-  # Cada subred privada de egress sale por el NAT GW de la subred pública
-  # de la misma AZ (índice idéntico). Hacerlo explícito evita el split() de
-  # cadenas y previene errores silenciosos si alguien renombra las claves.
-  egress_az_pairs = {
-    for idx, az in local.azs :
-    "private-${idx + 1}" => "public-${idx + 1}"
-  }
 }
 
 # ===========================================================================
-# VPC client-a
+# VPC app — Con IGW + NAT Gateway (salida a Internet centralizada)
 # ===========================================================================
 
-resource "aws_vpc" "client_a" {
-  cidr_block           = var.client_a_cidr
+resource "aws_vpc" "app" {
+  cidr_block           = var.app_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = merge(local.common_tags, {
-    Name = "vpc-client-a-${var.project_name}"
+    Name = "vpc-app-${var.project_name}"
   })
 }
 
-resource "aws_subnet" "client_a" {
-  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
+# --- Subredes públicas ---
 
-  vpc_id            = aws_vpc.client_a.id
-  availability_zone = each.value.az
-  cidr_block        = cidrsubnet(aws_vpc.client_a.cidr_block, 8, each.value.index)
-
-  tags = merge(local.common_tags, {
-    Name = "client-a-${each.key}-${var.project_name}"
-    Tier = "private"
-  })
-}
-
-resource "aws_route_table" "client_a" {
-  vpc_id = aws_vpc.client_a.id
-
-  tags = merge(local.common_tags, {
-    Name = "client-a-rt-${var.project_name}"
-  })
-}
-
-resource "aws_route_table_association" "client_a" {
-  for_each = aws_subnet.client_a
-
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.client_a.id
-}
-
-# ===========================================================================
-# VPC client-b
-# ===========================================================================
-
-resource "aws_vpc" "client_b" {
-  cidr_block           = var.client_b_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-
-  tags = merge(local.common_tags, {
-    Name = "vpc-client-b-${var.project_name}"
-  })
-}
-
-resource "aws_subnet" "client_b" {
-  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
-
-  vpc_id            = aws_vpc.client_b.id
-  availability_zone = each.value.az
-  cidr_block        = cidrsubnet(aws_vpc.client_b.cidr_block, 8, each.value.index)
-
-  tags = merge(local.common_tags, {
-    Name = "client-b-${each.key}-${var.project_name}"
-    Tier = "private"
-  })
-}
-
-resource "aws_route_table" "client_b" {
-  vpc_id = aws_vpc.client_b.id
-
-  tags = merge(local.common_tags, {
-    Name = "client-b-rt-${var.project_name}"
-  })
-}
-
-resource "aws_route_table_association" "client_b" {
-  for_each = aws_subnet.client_b
-
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.client_b.id
-}
-
-# ===========================================================================
-# VPC inspection — Todo el tráfico inter-VPC y a Internet pasa por aqui
-# ===========================================================================
-
-resource "aws_vpc" "inspection" {
-  cidr_block           = var.inspection_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-
-  tags = merge(local.common_tags, {
-    Name = "vpc-inspection-${var.project_name}"
-  })
-}
-
-resource "aws_subnet" "inspection" {
-  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
-
-  vpc_id            = aws_vpc.inspection.id
-  availability_zone = each.value.az
-  cidr_block        = cidrsubnet(aws_vpc.inspection.cidr_block, 8, each.value.index)
-
-  tags = merge(local.common_tags, {
-    Name = "inspection-${each.key}-${var.project_name}"
-    Tier = "private"
-  })
-}
-
-resource "aws_route_table" "inspection" {
-  vpc_id = aws_vpc.inspection.id
-
-  tags = merge(local.common_tags, {
-    Name = "inspection-rt-${var.project_name}"
-  })
-}
-
-resource "aws_route_table_association" "inspection" {
-  for_each = aws_subnet.inspection
-
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.inspection.id
-}
-
-# ===========================================================================
-# VPC egress — Salida centralizada a Internet (IGW + NAT Gateway)
-# ===========================================================================
-
-resource "aws_vpc" "egress" {
-  cidr_block           = var.egress_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-
-  tags = merge(local.common_tags, {
-    Name = "vpc-egress-${var.project_name}"
-  })
-}
-
-# --- Subredes públicas (IGW) ---
-
-resource "aws_subnet" "egress_public" {
+resource "aws_subnet" "app_public" {
   for_each = { for idx, az in local.azs : "public-${idx + 1}" => { az = az, index = idx } }
 
-  vpc_id                  = aws_vpc.egress.id
+  vpc_id                  = aws_vpc.app.id
   availability_zone       = each.value.az
-  cidr_block              = cidrsubnet(aws_vpc.egress.cidr_block, 8, each.value.index)
+  cidr_block              = cidrsubnet(aws_vpc.app.cidr_block, 8, each.value.index)
   map_public_ip_on_launch = true
 
   tags = merge(local.common_tags, {
-    Name = "egress-${each.key}-${var.project_name}"
+    Name = "app-${each.key}-${var.project_name}"
     Tier = "public"
   })
 }
 
-# --- Subredes privadas (TGW attachment) ---
+# --- Subredes privadas ---
 
-resource "aws_subnet" "egress_private" {
+resource "aws_subnet" "app_private" {
   for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
 
-  vpc_id            = aws_vpc.egress.id
+  vpc_id            = aws_vpc.app.id
   availability_zone = each.value.az
-  cidr_block        = cidrsubnet(aws_vpc.egress.cidr_block, 8, each.value.index)
+  cidr_block        = cidrsubnet(aws_vpc.app.cidr_block, 8, each.value.index)
 
   tags = merge(local.common_tags, {
-    Name = "egress-${each.key}-${var.project_name}"
+    Name = "app-${each.key}-${var.project_name}"
     Tier = "private"
   })
 }
 
 # --- Internet Gateway ---
 
-resource "aws_internet_gateway" "egress" {
-  vpc_id = aws_vpc.egress.id
+resource "aws_internet_gateway" "app" {
+  vpc_id = aws_vpc.app.id
 
   tags = merge(local.common_tags, {
-    Name = "igw-egress-${var.project_name}"
+    Name = "igw-app-${var.project_name}"
   })
 }
 
 # --- Tabla de rutas pública ---
 
-resource "aws_route_table" "egress_public" {
-  vpc_id = aws_vpc.egress.id
+resource "aws_route_table" "app_public" {
+  vpc_id = aws_vpc.app.id
 
   tags = merge(local.common_tags, {
-    Name = "egress-public-rt-${var.project_name}"
+    Name = "app-public-rt-${var.project_name}"
   })
 }
 
-resource "aws_route" "egress_public_internet" {
-  route_table_id         = aws_route_table.egress_public.id
+resource "aws_route" "app_public_internet" {
+  route_table_id         = aws_route_table.app_public.id
   destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.egress.id
+  gateway_id             = aws_internet_gateway.app.id
 }
 
-resource "aws_route_table_association" "egress_public" {
-  for_each = aws_subnet.egress_public
+resource "aws_route_table_association" "app_public" {
+  for_each = aws_subnet.app_public
 
   subnet_id      = each.value.id
-  route_table_id = aws_route_table.egress_public.id
+  route_table_id = aws_route_table.app_public.id
 }
 
-# Rutas de retorno en la tabla pública: el NAT GW necesita saber como
-# devolver tráfico a las otras VPCs via TGW.
-resource "aws_route" "egress_public_to_clients" {
-  for_each = tomap({
-    client_a   = var.client_a_cidr
-    client_b   = var.client_b_cidr
-    inspection = var.inspection_cidr
-  })
+# --- NAT Gateway ---
 
-  route_table_id         = aws_route_table.egress_public.id
-  destination_cidr_block = each.value
-  transit_gateway_id     = aws_ec2_transit_gateway.main.id
-
-  depends_on = [aws_ec2_transit_gateway_vpc_attachment.egress]
-}
-
-# --- NAT Gateway — Uno por AZ para alta disponibilidad ---
-
-resource "aws_eip" "nat_egress" {
-  for_each = aws_subnet.egress_public
-
+resource "aws_eip" "nat_app" {
   domain = "vpc"
 
   tags = merge(local.common_tags, {
-    Name = "eip-nat-egress-${each.key}-${var.project_name}"
+    Name = "eip-nat-app-${var.project_name}"
   })
 }
 
-resource "aws_nat_gateway" "egress" {
-  for_each = aws_subnet.egress_public
-
-  allocation_id = aws_eip.nat_egress[each.key].id
-  subnet_id     = each.value.id
+resource "aws_nat_gateway" "app" {
+  allocation_id = aws_eip.nat_app.id
+  subnet_id     = aws_subnet.app_public["public-1"].id
 
   tags = merge(local.common_tags, {
-    Name = "natgw-egress-${each.key}-${var.project_name}"
+    Name = "natgw-app-${var.project_name}"
   })
 
-  depends_on = [aws_internet_gateway.egress]
+  depends_on = [aws_internet_gateway.app]
 }
 
-# --- Tablas de rutas privadas — Una por AZ, cada una apunta a su NAT local ---
+# --- Tabla de rutas privada ---
 
-resource "aws_route_table" "egress_private" {
-  for_each = aws_subnet.egress_private
-
-  vpc_id = aws_vpc.egress.id
+resource "aws_route_table" "app" {
+  vpc_id = aws_vpc.app.id
 
   tags = merge(local.common_tags, {
-    Name = "egress-private-rt-${each.key}-${var.project_name}"
+    Name = "app-private-rt-${var.project_name}"
   })
 }
 
-resource "aws_route" "egress_private_nat" {
-  for_each = aws_subnet.egress_private
-
-  route_table_id         = aws_route_table.egress_private[each.key].id
+resource "aws_route" "app_private_nat" {
+  route_table_id         = aws_route_table.app.id
   destination_cidr_block = "0.0.0.0/0"
-  # Cada subred privada sale por el NAT Gateway de su misma AZ.
-  # Mapeo explicito en local.egress_az_pairs (sin manipular cadenas).
-  nat_gateway_id = aws_nat_gateway.egress[local.egress_az_pairs[each.key]].id
+  nat_gateway_id         = aws_nat_gateway.app.id
 }
 
-# Rutas de retorno en cada tabla privada: tráfico hacia las otras VPCs via TGW
-resource "aws_route" "egress_private_to_clients" {
-  for_each = {
-    for pair in setproduct(keys(aws_subnet.egress_private), keys(tomap({
-      client_a   = var.client_a_cidr
-      client_b   = var.client_b_cidr
-      inspection = var.inspection_cidr
-      }))) : "${pair[0]}-${pair[1]}" => {
-      subnet_key = pair[0]
-      cidr = tomap({
-        client_a   = var.client_a_cidr
-        client_b   = var.client_b_cidr
-        inspection = var.inspection_cidr
-      })[pair[1]]
-    }
-  }
-
-  route_table_id         = aws_route_table.egress_private[each.value.subnet_key].id
-  destination_cidr_block = each.value.cidr
-  transit_gateway_id     = aws_ec2_transit_gateway.main.id
-
-  depends_on = [aws_ec2_transit_gateway_vpc_attachment.egress]
-}
-
-resource "aws_route_table_association" "egress_private" {
-  for_each = aws_subnet.egress_private
+resource "aws_route_table_association" "app_private" {
+  for_each = aws_subnet.app_private
 
   subnet_id      = each.value.id
-  route_table_id = aws_route_table.egress_private[each.key].id
+  route_table_id = aws_route_table.app.id
 }
 
 # ===========================================================================
-# Transit Gateway — Hub central
+# VPC db — Solo subredes privadas (sale a Internet via peering con app)
 # ===========================================================================
 
-resource "aws_ec2_transit_gateway" "main" {
-  description                     = "TGW central - Hub-and-Spoke Lab20"
-  default_route_table_association = "disable"
-  default_route_table_propagation = "disable"
-  auto_accept_shared_attachments  = "enable"
+resource "aws_vpc" "db" {
+  cidr_block           = var.db_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
   tags = merge(local.common_tags, {
-    Name = "tgw-${var.project_name}"
+    Name = "vpc-db-${var.project_name}"
   })
 }
 
-# ===========================================================================
-# TGW Attachments — Conectar las 4 VPCs al hub
-# ===========================================================================
+resource "aws_subnet" "db" {
+  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
 
-resource "aws_ec2_transit_gateway_vpc_attachment" "client_a" {
-  transit_gateway_id = aws_ec2_transit_gateway.main.id
-  vpc_id             = aws_vpc.client_a.id
-  subnet_ids         = [for k, s in aws_subnet.client_a : s.id]
+  vpc_id            = aws_vpc.db.id
+  availability_zone = each.value.az
+  cidr_block        = cidrsubnet(aws_vpc.db.cidr_block, 8, each.value.index)
 
   tags = merge(local.common_tags, {
-    Name = "tgw-att-client-a-${var.project_name}"
+    Name = "db-${each.key}-${var.project_name}"
+    Tier = "private"
   })
 }
 
-resource "aws_ec2_transit_gateway_vpc_attachment" "client_b" {
-  transit_gateway_id = aws_ec2_transit_gateway.main.id
-  vpc_id             = aws_vpc.client_b.id
-  subnet_ids         = [for k, s in aws_subnet.client_b : s.id]
+resource "aws_route_table" "db" {
+  vpc_id = aws_vpc.db.id
 
   tags = merge(local.common_tags, {
-    Name = "tgw-att-client-b-${var.project_name}"
+    Name = "db-rt-${var.project_name}"
   })
 }
 
-resource "aws_ec2_transit_gateway_vpc_attachment" "inspection" {
-  transit_gateway_id = aws_ec2_transit_gateway.main.id
-  vpc_id             = aws_vpc.inspection.id
-  subnet_ids         = [for k, s in aws_subnet.inspection : s.id]
+resource "aws_route_table_association" "db" {
+  for_each = aws_subnet.db
 
-  # Appliance Mode: garantiza simetría de tráfico (ida y vuelta por la misma AZ).
-  # Esencial para firewalls stateful de terceros (Palo Alto, Fortinet, etc.).
-  appliance_mode_support = var.enable_appliance_mode ? "enable" : "disable"
-
-  tags = merge(local.common_tags, {
-    Name = "tgw-att-inspection-${var.project_name}"
-  })
-}
-
-resource "aws_ec2_transit_gateway_vpc_attachment" "egress" {
-  transit_gateway_id = aws_ec2_transit_gateway.main.id
-  vpc_id             = aws_vpc.egress.id
-  subnet_ids         = [for k, s in aws_subnet.egress_private : s.id]
-
-  tags = merge(local.common_tags, {
-    Name = "tgw-att-egress-${var.project_name}"
-  })
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.db.id
 }
 
 # ===========================================================================
-# TGW Route Tables — Segmentación de tráfico por inspección
+# VPC C — Solo subredes privadas (demuestra no transitividad)
 # ===========================================================================
-# client-rt:      todo el tráfico (0.0.0.0/0) va a inspection
-# inspection-rt:  Internet (0.0.0.0/0) va a egress + rutas de vuelta a clients
-# egress-rt:      rutas de vuelta a clients e inspection
 
-# --- Tabla de clientes ---
-
-resource "aws_ec2_transit_gateway_route_table" "client" {
-  transit_gateway_id = aws_ec2_transit_gateway.main.id
+resource "aws_vpc" "c" {
+  cidr_block           = var.c_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
   tags = merge(local.common_tags, {
-    Name = "tgw-rt-client-${var.project_name}"
+    Name = "vpc-c-${var.project_name}"
   })
 }
 
-resource "aws_ec2_transit_gateway_route_table_association" "client_a" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.client_a.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.client.id
-}
+resource "aws_subnet" "c" {
+  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
 
-resource "aws_ec2_transit_gateway_route_table_association" "client_b" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.client_b.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.client.id
-}
-
-# Todo el tráfico de los clients pasa por inspection
-resource "aws_ec2_transit_gateway_route" "client_default" {
-  destination_cidr_block         = "0.0.0.0/0"
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.inspection.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.client.id
-}
-
-# --- Tabla de inspección ---
-
-resource "aws_ec2_transit_gateway_route_table" "inspection" {
-  transit_gateway_id = aws_ec2_transit_gateway.main.id
+  vpc_id            = aws_vpc.c.id
+  availability_zone = each.value.az
+  cidr_block        = cidrsubnet(aws_vpc.c.cidr_block, 8, each.value.index)
 
   tags = merge(local.common_tags, {
-    Name = "tgw-rt-inspection-${var.project_name}"
+    Name = "c-${each.key}-${var.project_name}"
+    Tier = "private"
   })
 }
 
-resource "aws_ec2_transit_gateway_route_table_association" "inspection" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.inspection.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.inspection.id
-}
-
-# Internet sale por egress
-resource "aws_ec2_transit_gateway_route" "inspection_default" {
-  destination_cidr_block         = "0.0.0.0/0"
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.egress.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.inspection.id
-}
-
-# Rutas de vuelta a los clients (propagadas)
-resource "aws_ec2_transit_gateway_route_table_propagation" "client_a_to_inspection" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.client_a.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.inspection.id
-}
-
-resource "aws_ec2_transit_gateway_route_table_propagation" "client_b_to_inspection" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.client_b.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.inspection.id
-}
-
-# --- Tabla de egress ---
-
-resource "aws_ec2_transit_gateway_route_table" "egress" {
-  transit_gateway_id = aws_ec2_transit_gateway.main.id
+resource "aws_route_table" "c" {
+  vpc_id = aws_vpc.c.id
 
   tags = merge(local.common_tags, {
-    Name = "tgw-rt-egress-${var.project_name}"
+    Name = "c-rt-${var.project_name}"
   })
 }
 
-resource "aws_ec2_transit_gateway_route_table_association" "egress" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.egress.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.egress.id
-}
+resource "aws_route_table_association" "c" {
+  for_each = aws_subnet.c
 
-# Rutas de vuelta a clients e inspection (propagadas)
-resource "aws_ec2_transit_gateway_route_table_propagation" "client_a_to_egress" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.client_a.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.egress.id
-}
-
-resource "aws_ec2_transit_gateway_route_table_propagation" "client_b_to_egress" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.client_b.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.egress.id
-}
-
-resource "aws_ec2_transit_gateway_route_table_propagation" "inspection_to_egress" {
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.inspection.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.egress.id
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.c.id
 }
 
 # ===========================================================================
-# Rutas en las VPCs — Todo el tráfico no local va al TGW
+# VPC Peering — app ↔ db
 # ===========================================================================
 
-# Clients: 0.0.0.0/0 → TGW (el TGW lo envia a inspection)
-resource "aws_route" "client_a_default" {
-  route_table_id         = aws_route_table.client_a.id
-  destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = aws_ec2_transit_gateway.main.id
+resource "aws_vpc_peering_connection" "app_to_db" {
+  vpc_id      = aws_vpc.app.id
+  peer_vpc_id = aws_vpc.db.id
+  auto_accept = true
 
-  depends_on = [aws_ec2_transit_gateway_vpc_attachment.client_a]
-}
-
-resource "aws_route" "client_b_default" {
-  route_table_id         = aws_route_table.client_b.id
-  destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = aws_ec2_transit_gateway.main.id
-
-  depends_on = [aws_ec2_transit_gateway_vpc_attachment.client_b]
-}
-
-# Inspection: 0.0.0.0/0 → TGW (el TGW lo envia a egress)
-resource "aws_route" "inspection_default" {
-  route_table_id         = aws_route_table.inspection.id
-  destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = aws_ec2_transit_gateway.main.id
-
-  depends_on = [aws_ec2_transit_gateway_vpc_attachment.inspection]
-}
-
-# ===========================================================================
-# AWS RAM — Compartir el TGW con una cuenta de aplicación
-# ===========================================================================
-
-resource "aws_ram_resource_share" "tgw" {
-  name                      = "tgw-share-${var.project_name}"
-  allow_external_principals = true
+  # DNS resolution cross-peering: permite que las instancias de cada lado
+  # resuelvan los nombres DNS privados de la VPC peer (por ejemplo, los
+  # endpoints internos de RDS en vpc-db). Sin esto, solo funciona la
+  # conectividad por IP.
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
 
   tags = merge(local.common_tags, {
-    Name = "ram-tgw-share-${var.project_name}"
+    Name = "peering-app-db-${var.project_name}"
   })
 }
 
-resource "aws_ram_resource_association" "tgw" {
-  resource_share_arn = aws_ram_resource_share.tgw.arn
-  resource_arn       = aws_ec2_transit_gateway.main.arn
+# --- Rutas bidireccionales app ↔ db ---
+
+# app → db
+resource "aws_route" "app_to_db" {
+  route_table_id            = aws_route_table.app.id
+  destination_cidr_block    = var.db_cidr
+  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_db.id
 }
 
-resource "aws_ram_principal_association" "app_account" {
-  resource_share_arn = aws_ram_resource_share.tgw.arn
-  principal          = var.app_account_id
+# db → app (solo tráfico hacia el CIDR de app, no ruta por defecto)
+resource "aws_route" "db_to_app" {
+  route_table_id            = aws_route_table.db.id
+  destination_cidr_block    = var.app_cidr
+  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_db.id
+}
+
+# ===========================================================================
+# VPC Peering — app ↔ vpc-c
+# ===========================================================================
+
+resource "aws_vpc_peering_connection" "app_to_c" {
+  vpc_id      = aws_vpc.app.id
+  peer_vpc_id = aws_vpc.c.id
+  auto_accept = true
+
+  requester {
+    allow_remote_vpc_dns_resolution = true
+  }
+  accepter {
+    allow_remote_vpc_dns_resolution = true
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "peering-app-c-${var.project_name}"
+  })
+}
+
+# --- Rutas bidireccionales app ↔ vpc-c ---
+
+# app → vpc-c
+resource "aws_route" "app_to_c" {
+  route_table_id            = aws_route_table.app.id
+  destination_cidr_block    = var.c_cidr
+  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_c.id
+}
+
+# vpc-c → app (solo tráfico hacia el CIDR de app, no ruta por defecto)
+resource "aws_route" "c_to_app" {
+  route_table_id            = aws_route_table.c.id
+  destination_cidr_block    = var.app_cidr
+  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_c.id
+}
+
+# ===========================================================================
+# VPC Interface Endpoints para SSM — vpc-db y vpc-c
+# ===========================================================================
+# El peering no permite reenviar tráfico a Internet. Las instancias usan
+# una AMI con SSM Agent preinstalado (AL2023 estándar), pero el agente
+# necesita conectarse a los endpoints de Systems Manager para registrarse.
+# Los VPC Interface Endpoints (PrivateLink) permiten esa conexion sin Internet.
+
+resource "aws_security_group" "ssm_endpoints_db" {
+  name        = "ssm-endpoints-db-${var.project_name}"
+  description = "HTTPS desde la VPC hacia los endpoints SSM"
+  vpc_id      = aws_vpc.db.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.db_cidr]
+    description = "HTTPS desde la VPC"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "ssm-endpoints-db-sg-${var.project_name}"
+  })
+}
+
+resource "aws_security_group" "ssm_endpoints_c" {
+  name        = "ssm-endpoints-c-${var.project_name}"
+  description = "HTTPS desde la VPC hacia los endpoints SSM"
+  vpc_id      = aws_vpc.c.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.c_cidr]
+    description = "HTTPS desde la VPC"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "ssm-endpoints-c-sg-${var.project_name}"
+  })
+}
+
+resource "aws_vpc_endpoint" "db_ssm" {
+  for_each = toset(["ssm", "ssmmessages", "ec2messages"])
+
+  vpc_id              = aws_vpc.db.id
+  service_name        = "com.amazonaws.${var.region}.${each.key}"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [for k, s in aws_subnet.db : s.id]
+  security_group_ids  = [aws_security_group.ssm_endpoints_db.id]
+  private_dns_enabled = true
+
+  tags = merge(local.common_tags, {
+    Name = "vpce-${each.key}-db-${var.project_name}"
+  })
+}
+
+resource "aws_vpc_endpoint" "c_ssm" {
+  for_each = toset(["ssm", "ssmmessages", "ec2messages"])
+
+  vpc_id              = aws_vpc.c.id
+  service_name        = "com.amazonaws.${var.region}.${each.key}"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [for k, s in aws_subnet.c : s.id]
+  security_group_ids  = [aws_security_group.ssm_endpoints_c.id]
+  private_dns_enabled = true
+
+  tags = merge(local.common_tags, {
+    Name = "vpce-${each.key}-c-${var.project_name}"
+  })
 }
 
 # ===========================================================================
@@ -612,88 +481,20 @@ resource "aws_iam_instance_profile" "ssm" {
 }
 
 # ===========================================================================
-# TGW Flow Logs — Verificar todo el tráfico que atraviesa el hub
-# ===========================================================================
-# A diferencia de los VPC Flow Logs (que sólo capturan tráfico que atraviesa
-# las ENI de la propia VPC), los TGW Flow Logs registran todos los paquetes
-# que pasan por el Transit Gateway, incluidos los DESCARTADOS por rutas
-# blackhole. Esto los hace imprescindibles para auditar la segmentación
-# (sección 3.8) y, en particular, para verificar el aislamiento del Reto 2.
-
-resource "aws_cloudwatch_log_group" "tgw_flow_logs" {
-  name              = "/tgw/${var.project_name}/flow-logs"
-  retention_in_days = var.flow_log_retention_days
-
-  tags = local.common_tags
-}
-
-resource "aws_iam_role" "flow_logs" {
-  name = "vpc-flow-logs-${var.project_name}"
-
-  # El service principal es el mismo (vpc-flow-logs.amazonaws.com) tanto para
-  # VPC Flow Logs como para TGW Flow Logs.
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "vpc-flow-logs.amazonaws.com"
-      }
-    }]
-  })
-
-  tags = local.common_tags
-}
-
-resource "aws_iam_role_policy" "flow_logs" {
-  name = "vpc-flow-logs-${var.project_name}"
-  role = aws_iam_role.flow_logs.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents",
-        "logs:DescribeLogGroups",
-        "logs:DescribeLogStreams",
-      ]
-      Effect   = "Allow"
-      Resource = "*"
-    }]
-  })
-}
-
-resource "aws_flow_log" "tgw" {
-  transit_gateway_id       = aws_ec2_transit_gateway.main.id
-  max_aggregation_interval = 60
-  log_destination_type     = "cloud-watch-logs"
-  log_destination          = aws_cloudwatch_log_group.tgw_flow_logs.arn
-  iam_role_arn             = aws_iam_role.flow_logs.arn
-  # traffic_type no aplica a TGW Flow Logs (siempre captura todo el tráfico).
-
-  tags = merge(local.common_tags, {
-    Name = "flow-log-tgw-${var.project_name}"
-  })
-}
-
-# ===========================================================================
-# Security Groups para instancias de test
+# Security Groups
 # ===========================================================================
 
-resource "aws_security_group" "test_client_a" {
-  name        = "test-client-a-${var.project_name}"
-  description = "Permite ICMP desde otras VPCs y trafico saliente"
-  vpc_id      = aws_vpc.client_a.id
+resource "aws_security_group" "app" {
+  name        = "app-${var.project_name}"
+  description = "Permite ICMP desde db y vpc-c, trafico saliente"
+  vpc_id      = aws_vpc.app.id
 
   ingress {
     from_port   = -1
     to_port     = -1
     protocol    = "icmp"
-    cidr_blocks = [var.client_b_cidr, var.inspection_cidr, var.egress_cidr]
-    description = "ICMP desde otras VPCs"
+    cidr_blocks = [var.db_cidr, var.c_cidr]
+    description = "ICMP desde VPCs con peering"
   }
 
   egress {
@@ -705,21 +506,29 @@ resource "aws_security_group" "test_client_a" {
   }
 
   tags = merge(local.common_tags, {
-    Name = "test-client-a-sg-${var.project_name}"
+    Name = "app-sg-${var.project_name}"
   })
 }
 
-resource "aws_security_group" "test_client_b" {
-  name        = "test-client-b-${var.project_name}"
-  description = "Permite ICMP desde otras VPCs y trafico saliente"
-  vpc_id      = aws_vpc.client_b.id
+resource "aws_security_group" "db" {
+  name        = "db-${var.project_name}"
+  description = "Permite MySQL desde VPC app, ICMP desde app"
+  vpc_id      = aws_vpc.db.id
+
+  ingress {
+    from_port   = 3306
+    to_port     = 3306
+    protocol    = "tcp"
+    cidr_blocks = [var.app_cidr]
+    description = "MySQL desde VPC app"
+  }
 
   ingress {
     from_port   = -1
     to_port     = -1
     protocol    = "icmp"
-    cidr_blocks = [var.client_a_cidr, var.inspection_cidr, var.egress_cidr]
-    description = "ICMP desde otras VPCs"
+    cidr_blocks = [var.app_cidr]
+    description = "ICMP desde VPC app"
   }
 
   egress {
@@ -731,75 +540,89 @@ resource "aws_security_group" "test_client_b" {
   }
 
   tags = merge(local.common_tags, {
-    Name = "test-client-b-sg-${var.project_name}"
+    Name = "db-sg-${var.project_name}"
+  })
+}
+
+resource "aws_security_group" "c" {
+  name        = "c-${var.project_name}"
+  description = "Permite ICMP desde app, trafico saliente"
+  vpc_id      = aws_vpc.c.id
+
+  ingress {
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = [var.app_cidr]
+    description = "ICMP desde VPC app"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Todo el trafico saliente"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "c-sg-${var.project_name}"
   })
 }
 
 # ===========================================================================
-# Instancias de test — Verifican conectividad inter-VPC via TGW
+# Instancias de test
 # ===========================================================================
 
-resource "aws_instance" "test_client_a" {
+resource "aws_instance" "test_app" {
   ami                    = data.aws_ami.al2023.id
   instance_type          = "t4g.micro"
-  subnet_id              = aws_subnet.client_a["private-1"].id
-  vpc_security_group_ids = [aws_security_group.test_client_a.id]
+  subnet_id              = aws_subnet.app_private["private-1"].id
+  vpc_security_group_ids = [aws_security_group.app.id]
   iam_instance_profile   = aws_iam_instance_profile.ssm.name
-  private_ip             = cidrhost(aws_subnet.client_a["private-1"].cidr_block, 10)
+  private_ip             = cidrhost(aws_subnet.app_private["private-1"].cidr_block, 10)
 
-  user_data = file("${path.module}/scripts/test_init.sh")
+  # Sin user_data: la AMI AL2023 estándar ya incluye SSM Agent.
 
   tags = merge(local.common_tags, {
-    Name = "test-client-a-${var.project_name}"
+    Name = "test-app-${var.project_name}"
   })
 
-  # user_data hace `dnf install -y amazon-ssm-agent` (la AMI minimal no lo
-  # incluye), asi que necesita Internet ya disponible al arrancar. Eso
-  # implica que TODA la cadena ida-y-vuelta este operativa antes de la EC2:
-  # client_rt -> inspection -> egress -> NAT -> IGW + rutas de retorno.
-  # Si falta cualquiera de estas dependencias, el dnf falla por timeout y la
-  # instancia se queda sin SSM Agent.
-  depends_on = [
-    aws_route.client_a_default,
-    aws_route.egress_public_internet,
-    aws_route.egress_private_nat,
-    aws_route.egress_public_to_clients,
-    aws_route.egress_private_to_clients,
-    aws_ec2_transit_gateway_route.client_default,
-    aws_ec2_transit_gateway_route.inspection_default,
-    aws_ec2_transit_gateway_route_table_propagation.client_a_to_inspection,
-    aws_ec2_transit_gateway_route_table_propagation.client_a_to_egress,
-    aws_ec2_transit_gateway_route_table_propagation.inspection_to_egress,
-    aws_nat_gateway.egress,
-  ]
+  depends_on = [aws_nat_gateway.app]
 }
 
-resource "aws_instance" "test_client_b" {
+resource "aws_instance" "test_db" {
   ami                    = data.aws_ami.al2023.id
   instance_type          = "t4g.micro"
-  subnet_id              = aws_subnet.client_b["private-1"].id
-  vpc_security_group_ids = [aws_security_group.test_client_b.id]
+  subnet_id              = aws_subnet.db["private-1"].id
+  vpc_security_group_ids = [aws_security_group.db.id]
   iam_instance_profile   = aws_iam_instance_profile.ssm.name
-  private_ip             = cidrhost(aws_subnet.client_b["private-1"].cidr_block, 10)
+  private_ip             = cidrhost(aws_subnet.db["private-1"].cidr_block, 10)
 
-  user_data = file("${path.module}/scripts/test_init.sh")
+  # Sin user_data: la AMI AL2023 estándar ya incluye SSM Agent.
+  # Los VPC Endpoints permiten que el agente se registre sin Internet.
 
   tags = merge(local.common_tags, {
-    Name = "test-client-b-${var.project_name}"
+    Name = "test-db-${var.project_name}"
   })
 
-  # Mismas dependencias que test_client_a (ver comentario alli).
-  depends_on = [
-    aws_route.client_b_default,
-    aws_route.egress_public_internet,
-    aws_route.egress_private_nat,
-    aws_route.egress_public_to_clients,
-    aws_route.egress_private_to_clients,
-    aws_ec2_transit_gateway_route.client_default,
-    aws_ec2_transit_gateway_route.inspection_default,
-    aws_ec2_transit_gateway_route_table_propagation.client_b_to_inspection,
-    aws_ec2_transit_gateway_route_table_propagation.client_b_to_egress,
-    aws_ec2_transit_gateway_route_table_propagation.inspection_to_egress,
-    aws_nat_gateway.egress,
-  ]
+  depends_on = [aws_vpc_endpoint.db_ssm]
+}
+
+resource "aws_instance" "test_c" {
+  ami                    = data.aws_ami.al2023.id
+  instance_type          = "t4g.micro"
+  subnet_id              = aws_subnet.c["private-1"].id
+  vpc_security_group_ids = [aws_security_group.c.id]
+  iam_instance_profile   = aws_iam_instance_profile.ssm.name
+  private_ip             = cidrhost(aws_subnet.c["private-1"].cidr_block, 10)
+
+  # Sin user_data: la AMI AL2023 estándar ya incluye SSM Agent.
+  # Los VPC Endpoints permiten que el agente se registre sin Internet.
+
+  tags = merge(local.common_tags, {
+    Name = "test-c-${var.project_name}"
+  })
+
+  depends_on = [aws_vpc_endpoint.c_ssm]
 }

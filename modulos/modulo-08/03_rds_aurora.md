@@ -422,7 +422,7 @@ monitoring_interval                 = 60    # Enhanced Monitoring
 performance_insights_enabled        = true
 ```
 
-> **El profesor resume:** "Si cometiste un error al configurar RDS sin cifrado, sin Multi-AZ o sin backups en producción, no hay rollback fácil. Terraform no puede cambiar `storage_encrypted` en una instancia existente — necesitas recrear. Por eso el ciclo correcto es: diseña el módulo con todas las configuraciones de seguridad desde el día uno."
+> **Nota importante:** "Si cometiste un error al configurar RDS sin cifrado, sin Multi-AZ o sin backups en producción, no hay rollback fácil. Terraform no puede cambiar `storage_encrypted` en una instancia existente — necesitas recrear. Por eso el ciclo correcto es: diseña el módulo con todas las configuraciones de seguridad desde el día uno."
 
 ---
 

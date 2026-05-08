@@ -1,13 +1,14 @@
 # ===========================================================================
-# Lab23 — Diseño de Interfaz Robusta y "Fail-Safe" (LocalStack)
+# Lab22 — Refactorización Avanzada de S3 (De Monolítico a Modular)
 # ===========================================================================
-# Versión adaptada: usa módulos igual que la versión AWS.
-# El módulo db-config usa SSM SecureString en lugar de Secrets Manager.
+# Version LocalStack: usa account_id fijo ya que skip_requesting_account_id = true
 # ===========================================================================
 
 # --- Locals ---
 
 locals {
+  account_id = "000000000000"
+
   common_tags = {
     Environment = var.environment
     ManagedBy   = "terraform"
@@ -16,42 +17,38 @@ locals {
 }
 
 # ===========================================================================
-# Módulo safe-network — VPC con postcondición RFC 1918
+# Módulo S3 — Bucket de Logs
 # ===========================================================================
 
-module "network" {
-  source = "./modules/safe-network"
+module "logs_bucket" {
+  source = "./modules/s3-bucket"
 
-  vpc_cidr     = var.vpc_cidr
-  project_name = var.project_name
-  environment  = var.environment
-  tags         = local.common_tags
-}
-
-# ===========================================================================
-# Módulo validated-bucket — S3 con nombre validado por regex
-# ===========================================================================
-
-module "corporate_bucket" {
-  source = "./modules/validated-bucket"
-
-  bucket_name   = var.bucket_name
-  force_destroy = true
+  bucket_name       = "${var.project_name}-logs-${local.account_id}"
+  enable_versioning = false
+  force_destroy     = true
 
   tags = merge(local.common_tags, {
-    Purpose = "corporate-data"
+    Purpose            = "logs"
+    DataClassification = "internal"
   })
 }
 
 # ===========================================================================
-# Módulo db-config — Configuración de DB con tipos complejos y secretos
+# Módulo S3 — Bucket de Datos
 # ===========================================================================
 
-module "database" {
-  source = "./modules/db-config"
+module "data_bucket" {
+  source = "./modules/s3-bucket"
 
-  project_name = var.project_name
-  db_config    = var.db_config
-  db_password  = var.db_password
-  tags         = local.common_tags
+  bucket_name       = "${var.project_name}-data-${local.account_id}"
+  enable_versioning = true
+  # En la version aws/, force_destroy = false para proteger datos criticos.
+  # En LocalStack lo dejamos en true para facilitar la limpieza local —
+  # no hay datos reales que proteger en esta emulacion.
+  force_destroy = true
+
+  tags = merge(local.common_tags, {
+    Purpose            = "data"
+    DataClassification = "confidential"
+  })
 }

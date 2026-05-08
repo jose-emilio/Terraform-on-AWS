@@ -1,4 +1,4 @@
-# Laboratorio 11 — Gestión de Drift y Disaster Recovery (3-2-1)
+# Laboratorio 11 — Arquitectura de State Splitting (Capas de Infraestructura)
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,441 +8,636 @@
 
 ## Visión general
 
-Aprender a detectar y gestionar el **drift de infraestructura** (divergencia entre el estado deseado y la realidad) y a aplicar una estrategia de **Disaster Recovery 3-2-1** para recuperar el estado de Terraform desde el versionado de S3.
+En este laboratorio dividirás un estado monolítico en capas independientes para reducir el **blast radius** (radio de impacto) ante errores o cambios. Aprenderás a publicar valores entre proyectos Terraform mediante `output` y a consumirlos desde otra capa con el data source `terraform_remote_state`, sin duplicar ni hardcodear ningún identificador de recursos.
 
-## Conceptos clave
+## Objetivos de aprendizaje
 
-| Concepto | Descripción |
-|---|---|
-| **Drift** | Divergencia entre el estado registrado en `terraform.tfstate` y la infraestructura real |
-| **`terraform plan`** | Detecta drift al comparar estado con la realidad (refresca antes de calcular el plan) |
-| **`terraform apply -refresh-only`** | Actualiza el estado para reflejar la realidad *sin* modificar infraestructura |
-| **Terraform gana** | Estrategia de reconciliación: aplicar para revertir los cambios manuales |
-| **La realidad gana** | Estrategia de reconciliación: actualizar el código para que refleje el cambio manual |
-| **Versioning S3** | Cada `terraform apply` genera una nueva versión del `.tfstate`; permite restaurar versiones anteriores |
-| **Disaster Recovery 3-2-1** | 3 copias, 2 medios distintos, 1 offsite — el S3 con versioning proporciona la copia offsite |
+Al finalizar este laboratorio serás capaz de:
+
+- Entender qué es el blast radius y por qué el estado monolítico lo amplifica
+- Dividir un proyecto Terraform en capas independientes (red y cómputo)
+- Publicar identificadores de recursos como `output` para que actúen como interfaz pública entre capas
+- Leer el estado de otra capa con el data source `terraform_remote_state`
+- Verificar experimentalmente que un error o destrucción en la capa de cómputo no afecta el estado de la capa de red
+- Aplicar la convención de backends S3 separados por capa (AWS real) y backends locales por directorio (LocalStack)
 
 ## Requisitos previos
 
+- **Terraform >= 1.10** instalado
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- AWS CLI configurado con credenciales válidas
-- **Terraform >= 1.10**
+- LocalStack en ejecución — para la sección LocalStack
 
-```bash
-# Exportar el Account ID y nombre del bucket para usar en los comandos
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
-echo "Bucket: $BUCKET"
+---
+
+## Arquitectura
+
+![State splitting: capa de red y capa de cómputo con tfstates aislados, comunicadas vía terraform_remote_state](arch/diagrama.svg)
+
+La solución es separar la infraestructura en proyectos Terraform independientes, cada uno con su propio estado. Cada capa solo gestiona los recursos de su dominio y expone una interfaz pública mínima a través de `output`. Un error o destrucción en la capa de cómputo **no toca** el estado de la capa de red — el blast radius queda contenido al dominio afectado.
+
+---
+
+## Conceptos clave
+
+### Blast radius y el estado monolítico
+
+En un proyecto Terraform donde toda la infraestructura (red, cómputo, bases de datos, DNS…) comparte un único archivo de estado, cualquier operación arriesgada tiene un **blast radius máximo**:
+
+- Un `terraform destroy` accidental puede eliminar toda la infraestructura de una vez.
+- Un error en el plan de la capa de cómputo bloquea también el despliegue de la capa de red, aunque esta no haya cambiado.
+- Dos equipos trabajando sobre el mismo estado pueden pisarse mutuamente al hacer `apply` en paralelo (condición de carrera en el lock).
+
 ```
+Estado monolítico (un solo tfstate)
+┌─────────────────────────────────────────────┐
+│  aws_vpc + aws_subnet                       │  ← Red
+│  aws_security_group + aws_instance          │  ← Cómputo
+│  aws_db_instance                            │  ← Base de datos
+└─────────────────────────────────────────────┘
+         Un error aquí afecta a todo ↑
+```
+
+### `output` como interfaz pública entre capas
+
+Los outputs de un proyecto Terraform se almacenan en su archivo de estado. Actúan como la **API pública** de esa capa: todo lo que otras capas necesiten saber debe estar en un output; lo que no se exporta permanece encapsulado.
+
+```hcl
+# network/outputs.tf — interfaz pública de la capa de red
+output "vpc_id" {
+  description = "ID de la VPC desplegada por la capa de red."
+  value       = aws_vpc.main.id
+}
+```
+
+### Data source `terraform_remote_state`
+
+Permite leer los outputs del estado remoto de otro proyecto Terraform sin acceder a sus recursos ni a su código. Es de **solo lectura**: nunca modifica el estado que lee.
+
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "s3"                           # o "local" en LocalStack
+
+  config = {
+    bucket = var.network_state_bucket      # bucket S3 de la capa de red
+    key    = "lab11/network/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+# Acceder a los outputs de la capa de red:
+local.vpc_id = data.terraform_remote_state.network.outputs.vpc_id
+```
+
+Si la capa de red no ha sido desplegada, el data source falla inmediatamente en la capa de cómputo, sin tocar ningún recurso existente ni bloquear el estado de red.
+
+### Tabla comparativa: monolítico vs capas
+
+| Aspecto | Estado monolítico | Arquitectura de capas |
+|---|---|---|
+| Blast radius ante un error | Toda la infraestructura en riesgo | Contenido a la capa afectada |
+| Tiempo de `plan` | Crece con cada recurso añadido | Proporcional al tamaño de cada capa |
+| Trabajo en equipo | Un lock bloquea a todos | Cada equipo trabaja en su capa |
+| Granularidad de permisos | Un único rol con acceso a todo | Roles por capa (principio de mínimo privilegio) |
+| Complejidad inicial | Baja (un solo directorio) | Moderada (múltiples proyectos) |
+
+---
 
 ## Estructura del proyecto
 
 ```
 lab-11/
-├── README.md                    ← Esta guía
 ├── arch/
-│   └── diagrama.svg             ← Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf             ← Backend S3 parcial
-│   ├── variables.tf
-│   ├── main.tf                  ← VPC + Security Group con tags explícitos
-│   ├── outputs.tf
-│   └── aws.s3.tfbackend         ← Parámetros del backend (sin bucket)
+│   ├── network/
+│   │   ├── providers.tf      # Backend S3 (parcial) + provider AWS
+│   │   ├── variables.tf      # region, vpc_cidr
+│   │   ├── main.tf           # aws_vpc + aws_subnet
+│   │   ├── outputs.tf        # vpc_id, subnet_id, vpc_cidr
+│   │   └── aws.s3.tfbackend  # key = "lab11/network/terraform.tfstate"
+│   └── compute/
+│       ├── providers.tf      # Backend S3 (parcial) + provider AWS
+│       ├── variables.tf      # region, network_state_bucket, network_state_key
+│       ├── main.tf           # terraform_remote_state + aws_security_group
+│       ├── outputs.tf        # vpc_id, subnet_id, security_group_id
+│       └── aws.s3.tfbackend  # key = "lab11/compute/terraform.tfstate"
 └── localstack/
-    ├── README.md                ← Guía específica para LocalStack
-    ├── providers.tf
-    ├── variables.tf
-    ├── main.tf
-    ├── outputs.tf
-    └── localstack.s3.tfbackend  ← Backend completo para LocalStack
+    ├── README.md             # Instrucciones específicas de LocalStack
+    ├── network/
+    │   ├── providers.tf      # Backend local + provider LocalStack
+    │   ├── variables.tf      # region, vpc_cidr
+    │   ├── main.tf           # Idéntico a aws/network/
+    │   └── outputs.tf        # Idéntico a aws/network/
+    └── compute/
+        ├── providers.tf      # Backend local + provider LocalStack
+        ├── variables.tf      # network_state_path (ruta relativa al tfstate de red)
+        ├── main.tf           # terraform_remote_state (local) + aws_security_group
+        └── outputs.tf        # Idéntico a aws/compute/
 ```
 
-## Arquitectura
-
-![Drift detection (refresh/plan) + DR 3-2-1: restaurar tfstate desde versionado S3](arch/diagrama.svg)
-
-Dos fases:
-
-- **Detección de drift:** `terraform plan` compara el state contra AWS real. Cuando difieren (alguien editó tags por consola), Terraform muestra el diff. Estrategia A "Terraform gana" — `apply` revierte el cambio. Estrategia B "la realidad gana" — `apply -refresh-only` o editar el código para reconciliar.
-- **DR 3-2-1 sobre el tfstate:** el versionado S3 del lab-02 mantiene la historia de cada cambio. Si el tfstate se corrompe, `aws s3api list-object-versions` localiza la última versión sana y `get-object --version-id` la restaura. Cross-Region Replication (opcional) cubre el "1 off-site".
-
-## Despliegue inicial
-
-```bash
-cd labs/lab-11/aws
-
-terraform init \
-  -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=$BUCKET"
-
-terraform apply
-```
-
-Anota los outputs, los necesitarás en los pasos siguientes:
-
-```bash
-terraform output
-# vpc_id            = "vpc-0abc123..."
-# security_group_id = "sg-0def456..."
-# security_group_name = "app-lab11"
-```
-
-Verifica el estado almacenado en S3:
-
-```bash
-aws s3 ls s3://$BUCKET/lab11/
-# 2024-01-15 10:00:00       1234 terraform.tfstate
-```
+> **Nota sobre la estructura:** Este laboratorio tiene dos subdirectorios por entorno (`network/` y `compute/`) en lugar del archivo plano de laboratorios anteriores. Cada subdirectorio es un proyecto Terraform independiente con su propio `terraform init`.
 
 ---
 
-## Fase 1 — Detección de Drift
+## Despliegue en AWS
 
-El drift ocurre cuando alguien modifica infraestructura fuera de Terraform (consola web, CLI, otro proceso). Terraform no lo sabe hasta que ejecuta un `plan` o `apply`.
+### Prerrequisito: bucket S3 del lab02
 
-### Introducir drift manualmente
-
-Obtén el ID del security group desplegado:
+Las capas de red y cómputo almacenan sus estados en el bucket compartido del curso creado en el lab02, bajo claves distintas (`lab11/network/` y `lab11/compute/`).
 
 ```bash
-SG_ID=$(terraform output -raw security_group_id)
-echo "Security Group: $SG_ID"
+# Exporta el nombre del bucket del lab02
+export STATE_BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
+
+# Verifica que el bucket existe y tiene versionado activo
+aws s3api get-bucket-versioning --bucket $STATE_BUCKET
+# {"Status": "Enabled"}
 ```
 
-**Cambio 1: Modificar un tag** (simula un cambio "legítimo" pero no registrado en el código):
+Si el bucket no existe, vuelve al lab02 y ejecuta `terraform apply` antes de continuar.
 
-```bash
-aws ec2 create-tags \
-  --resources $SG_ID \
-  --tags Key=Environment,Value=production
-```
+### Código Terraform
 
-**Cambio 2: Abrir un puerto SSH** (simula un cambio accidental o de emergencia):
-
-```bash
-aws ec2 authorize-security-group-ingress \
-  --group-id $SG_ID \
-  --protocol tcp \
-  --port 22 \
-  --cidr 0.0.0.0/0
-```
-
-### Detectar el drift con Terraform
-
-```bash
-terraform plan
-```
-
-Terraform actualizará automáticamente su vista de la realidad y mostrará las diferencias:
-
-```
-  # aws_security_group.app will be updated in-place
-  ~ resource "aws_security_group" "app" {
-        id                     = "sg-xxxxxxxxxxx"
-        name                   = "app-lab11"
-      ~ tags                   = {
-          ~ "Environment" = "production" -> "lab"
-            "ManagedBy"   = "terraform"
-            "Name"        = "app-lab11"
-        }
-      ~ tags_all               = {
-          ~ "Environment" = "production" -> "lab"
-            # (2 unchanged elements hidden)
-        }
-        # (8 unchanged attributes hidden)
-    }
-
-Plan: 0 to add, 1 to change, 0 to destroy.
-```
-
-> **Nota:** El plan solo muestra el drift del tag. La regla de ingreso del puerto 22 **no aparece** porque `aws_security_group` únicamente reconcilia los atributos declarados en el código: al no haber ningún bloque `ingress {}` definido, Terraform no gestiona las reglas de ingreso y las ignora por completo. Este comportamiento es intencional: Terraform solo es responsable de lo que tú le dices que gestione.
-
----
-
-## Fase 2 — Reconciliación
-
-Ante un drift, tienes dos estrategias posibles. La elección depende de si el cambio manual fue un error o una decisión válida que hay que incorporar al código.
-
-### Estrategia A: "Terraform gana" — Revertir al estado deseado
-
-Úsala cuando el cambio manual fue un **error** o no autorizado.
-
-```bash
-terraform apply
-```
-
-Terraform revertirá el tag `Environment` a `"lab"`. La regla de ingreso del puerto 22 **no será eliminada**: como no hay bloques `ingress` en el código, Terraform no la gestiona y la ignora.
-
-Para eliminar la regla fuera de Terraform, usa AWS CLI:
-
-```bash
-aws ec2 revoke-security-group-ingress \
-  --group-id $SG_ID \
-  --protocol tcp \
-  --port 22 \
-  --cidr 0.0.0.0/0
-```
-
-Tras la revocación, la infraestructura coincide exactamente con el código.
-
-### Estrategia B: "La realidad gana" — Actualizar el código
-
-Úsala cuando el cambio manual fue **válido** y hay que mantenerlo.
-
-**Paso 1**: Actualiza el estado de Terraform para que refleje la realidad sin tocar infraestructura:
-
-```bash
-terraform apply -refresh-only
-```
-
-Terraform mostrará los cambios detectados y pedirá confirmación para actualizar *solo el estado*:
-
-```
-~ aws_security_group.app
-  ~ tags
-    ~ Environment = "lab" -> "production"
-  + ingress { ... puerto 22 ... }
-
-Would you like to update the Terraform state to reflect these detected changes?
-  Terraform will write these changes to the state without modifying your infrastructure.
-  As a result, your Terraform plan may differ from this plan.
-
-  Only 'yes' will be accepted to confirm.
-```
-
-**Paso 2**: Ahora el código y el estado no coinciden. Actualiza `main.tf` para incorporar el cambio que quieres conservar:
+**`aws/network/main.tf`** — Capa de Red:
 
 ```hcl
-# En main.tf, actualiza el tag del grupo de seguridad:
-tags = {
-  Name        = "app-lab11"
-  Environment = "production"   # ← incorporamos el cambio válido
-  ManagedBy   = "terraform"
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name      = "vpc-lab11"
+    ManagedBy = "terraform"
+    Layer     = "network"
+  }
+}
+
+resource "aws_subnet" "public" {
+  vpc_id     = aws_vpc.main.id
+  cidr_block = cidrsubnet(var.vpc_cidr, 8, 1)
+
+  tags = {
+    Name      = "subnet-public-lab11"
+    ManagedBy = "terraform"
+    Layer     = "network"
+  }
 }
 ```
 
-**Paso 3**: Aplica. Como el tag ya coincide entre código y realidad, Terraform no hará ningún cambio:
+**`aws/network/outputs.tf`** — Interfaz pública de la capa de red:
+
+```hcl
+output "vpc_id" {
+  description = "ID de la VPC desplegada por la capa de red."
+  value       = aws_vpc.main.id
+}
+
+output "subnet_id" {
+  description = "ID de la subred pública."
+  value       = aws_subnet.public.id
+}
+
+output "vpc_cidr" {
+  description = "Bloque CIDR de la VPC."
+  value       = aws_vpc.main.cidr_block
+}
+```
+
+**`aws/compute/main.tf`** — Capa de Cómputo que consume la red:
+
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "s3"
+
+  config = {
+    bucket = var.network_state_bucket
+    key    = var.network_state_key
+    region = var.region
+  }
+}
+
+locals {
+  vpc_id    = data.terraform_remote_state.network.outputs.vpc_id
+  subnet_id = data.terraform_remote_state.network.outputs.subnet_id
+}
+
+resource "aws_security_group" "app" {
+  name        = "app-lab11"
+  description = "Security group de la capa de computo (Lab10)"
+  vpc_id      = local.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name      = "app-lab11"
+    ManagedBy = "terraform"
+    Layer     = "compute"
+  }
+}
+```
+
+### Despliegue de la Capa de Red
 
 ```bash
+# Desde lab-11/aws/network/
+
+terraform fmt
+terraform init \
+  -backend-config=aws.s3.tfbackend \
+  -backend-config="bucket=$STATE_BUCKET"
+
+terraform plan
 terraform apply
-# No changes. Your infrastructure matches the configuration.
 ```
 
-La regla de ingreso del puerto 22 **sigue en AWS** y también está registrada en el estado (desde el paso 1). Como el código no declara bloques `ingress`, Terraform no la considera un drift a resolver. Para eliminarla usa CLI:
+Los outputs mostrarán los identificadores que usará la capa de cómputo:
 
-```bash
-aws ec2 revoke-security-group-ingress \
-  --group-id $SG_ID \
-  --protocol tcp \
-  --port 22 \
-  --cidr 0.0.0.0/0
+```
+subnet_id = "subnet-0a1b2c3d4e5f67890"
+vpc_cidr  = "10.0.0.0/16"
+vpc_id    = "vpc-0a1b2c3d4e5f67890"
 ```
 
-> **Lección clave:** Terraform solo gestiona lo que declaras en el código. `apply -refresh-only` actualiza el estado para reflejar la realidad, pero no amplía el alcance de gestión de Terraform: si un atributo no está declarado en el código, seguirá fuera del control de Terraform incluso después del `refresh-only`.
-
----
-
-## Fase 3 — Disaster Recovery: Restaurar Estado desde S3
-
-Simularás la corrupción o pérdida del archivo de estado y lo recuperarás usando el versionado de S3.
-
-### Listar versiones del archivo de estado
-
-Antes de corromper nada, lista las versiones disponibles:
+### Despliegue de la Capa de Cómputo
 
 ```bash
-aws s3api list-object-versions \
-  --bucket $BUCKET \
-  --prefix lab11/terraform.tfstate \
-  --query 'Versions[*].[VersionId,LastModified,IsLatest]' \
+# Desde lab-11/aws/compute/
+
+terraform fmt
+terraform init \
+  -backend-config=aws.s3.tfbackend \
+  -backend-config="bucket=$STATE_BUCKET"
+
+terraform plan -var="network_state_bucket=$STATE_BUCKET"
+terraform apply -var="network_state_bucket=$STATE_BUCKET"
+```
+
+Los outputs confirman que `vpc_id` y `subnet_id` son los mismos valores que exportó la capa de red:
+
+```
+security_group_id = "sg-0a1b2c3d4e5f67890"
+subnet_id         = "subnet-0a1b2c3d4e5f67890"
+vpc_id            = "vpc-0a1b2c3d4e5f67890"
+```
+
+### Verificación del Aislamiento (Blast Radius)
+
+Esta es la demostración central del laboratorio. Vas a destruir completamente la capa de cómputo y verificar que la capa de red no se ve afectada.
+
+**Paso 1** — Destruye la capa de cómputo:
+
+```bash
+# Desde lab-11/aws/compute/
+
+terraform destroy -var="network_state_bucket=$STATE_BUCKET"
+```
+
+Terraform destruye únicamente el security group. Confirma que el plan muestra:
+
+```
+Plan: 0 to add, 0 to change, 1 to destroy.
+```
+
+**Paso 2** — Verifica que la capa de red no fue afectada:
+
+```bash
+# Desde lab-11/aws/network/
+
+terraform state list
+```
+
+Resultado esperado:
+
+```
+aws_subnet.public
+aws_vpc.main
+```
+
+El estado de la capa de red permanece intacto. Ningún recurso fue destruido ni modificado.
+
+**Paso 3** — Confirma que la VPC sigue existiendo en AWS:
+
+```bash
+aws ec2 describe-vpcs \
+  --filters "Name=tag:ManagedBy,Values=terraform" \
+           "Name=tag:Layer,Values=network" \
+  --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock,State:State}' \
   --output table
 ```
 
-Deberías ver al menos una versión (la creada por el `apply` inicial). Guarda el `VersionId` de la versión sana:
+La VPC aparece con `State = available`. El blast radius del destroy de cómputo quedó contenido.
+
+**Paso 4** — Redespliega la capa de cómputo sin tocar la de red:
 
 ```bash
-GOOD_VERSION=$(aws s3api list-object-versions \
-  --bucket $BUCKET \
-  --prefix lab11/terraform.tfstate \
-  --query 'Versions[?IsLatest==`true`].VersionId' \
-  --output text)
-echo "Versión sana: $GOOD_VERSION"
+# Desde lab-11/aws/compute/
+
+terraform apply -var="network_state_bucket=$STATE_BUCKET"
 ```
 
-### Simular la corrupción del estado
+El security group se recrea referenciando el mismo `vpc_id` que ya existía. La capa de red nunca fue interrumpida.
+
+### Consultar el Estado Remoto Directamente
+
+Puedes leer los outputs de la capa de red en cualquier momento sin necesidad de estar en el directorio de red:
 
 ```bash
-# Sobreescribir el estado con contenido inválido (no es JSON parseable)
-echo 'CORRUPTED' | \
-  aws s3 cp - s3://$BUCKET/lab11/terraform.tfstate
+# Desde lab-11/aws/compute/ (o cualquier directorio)
+
+aws s3 cp s3://$STATE_BUCKET/lab11/network/terraform.tfstate - | \
+  python3 -c "import sys,json; s=json.load(sys.stdin); \
+  [print(k,'=',v['value']) for k,v in s['outputs'].items()]"
 ```
 
-> **Por qué `CORRUPTED` y no, por ejemplo,  `{"version":4,"corrupted":true}`:** este último es JSON válido con la versión actual del schema, así que Terraform lo aceptaría como un state vacío y respondería con un plan que recrearía toda la infraestructura — más peligroso que un error claro. Un payload no-JSON garantiza un fallo inmediato en la carga del estado.
-
-Verifica que Terraform ya no puede leer el estado:
+También puedes verificar que los dos estados son completamente independientes en S3:
 
 ```bash
-terraform plan
-# ╷
-# │ Error: Unsupported state file format
-# │
-# │ The state file could not be parsed as JSON: syntax error at byte offset 1.
-# ╵
-# ╷
-# │ Error: Unsupported state file format
-# │
-# │ The state file does not have a "version" attribute, which is required to identify the format version.
-# ╵
+aws s3 ls s3://$STATE_BUCKET/lab11/ --recursive
+# lab11/network/terraform.tfstate
+# lab11/compute/terraform.tfstate
 ```
 
-### Restaurar el estado sano desde S3
+---
 
-Usa `s3api copy-object` para restaurar la versión anterior sin descargar el archivo:
+## Verificación final
 
 ```bash
-aws s3api copy-object \
-  --bucket $BUCKET \
-  --copy-source "$BUCKET/lab11/terraform.tfstate?versionId=$GOOD_VERSION" \
-  --key lab11/terraform.tfstate
+# Verificar que la capa de red esta desplegada
+cd labs/lab-11/aws/network
+terraform output vpc_id
+terraform output subnet_id
+
+# Verificar que la capa de computo consume el estado de red
+cd ../compute
+terraform output security_group_id
+
+# Confirmar que terraform_remote_state lee correctamente los outputs de red
+terraform console <<'EOF'
+data.terraform_remote_state.network.outputs.vpc_id
+EOF
+
+# Verificar que no hay cambios pendientes en ninguna capa
+cd ../network && terraform plan -detailed-exitcode
+cd ../compute && terraform plan -detailed-exitcode -var="network_state_bucket=$STATE_BUCKET"
 ```
-
-### Verificar la restauración
-
-```bash
-terraform plan
-# No changes. Your infrastructure matches the configuration.
-```
-
-El estado está restaurado. Terraform puede operar con normalidad.
-
-> **La estrategia 3-2-1 en la práctica:**
-> - **3 copias**: estado local (si existe), S3 (versión actual), S3 (versiones anteriores)
-> - **2 medios**: disco local + almacenamiento en la nube (S3)
-> - **1 offsite**: S3 está en AWS, físicamente separado de tu máquina local
 
 ---
 
 ## Retos
 
-### Reto 1 — Drift Selectivo con `apply -refresh-only`
+### Reto 1 — Segunda Subred
 
-Ahora que conoces las dos estrategias de reconciliación, enfrenta un escenario más realista:
+La capa de red actual despliega una sola subred pública. Tu tarea es añadir una segunda subred con un CIDR diferente y actualizar la capa de cómputo para que cree un segundo security group asociado a esa nueva subred.
 
-**Situación**: Tu equipo introduce dos cambios manuales simultáneos en el security group:
-1. Cambian el tag `Environment` de `"lab"` a `"staging"` — cambio **válido**, acordado en reunión
-2. Añaden el tag `Owner = "equipo-de-ops"` — cambio **accidental**, no debe quedar en el código
+**Requisitos**
 
-**Tu objetivo**: Reconciliar la infraestructura de forma que:
-- El tag `Environment = "staging"` quede **en el código** y en la infraestructura
-- El tag `Owner = "equipo-de-ops"` sea **eliminado** de la infraestructura
-- Al finalizar, `terraform plan` muestre `No changes`
+1. En `network/main.tf`, añade un recurso `aws_subnet.private` con `cidrsubnet(var.vpc_cidr, 8, 2)` y el tag `Name = "subnet-private-lab11"`.
 
-**Restricciones**:
-- No puedes hacer `terraform destroy` y volver a aplicar
-- Debes usar `terraform apply -refresh-only` en algún punto del proceso
+2. En `network/outputs.tf`, añade el output `private_subnet_id` que exponga el ID de la nueva subred.
 
-**Pistas**:
-- ¿En qué orden debes ejecutar `refresh-only` y editar el código?
-- ¿Qué muestra `terraform plan` antes y después del `refresh-only`?
-- ¿Cómo sabes que has terminado correctamente?
+3. En `compute/main.tf`, añade un segundo security group `aws_security_group.internal` que referencie la nueva subred usando `data.terraform_remote_state.network.outputs.private_subnet_id`. Asocia el security group a la misma VPC.
+
+4. Aplica los cambios en ambas capas **en orden** (primero red, luego cómputo) y verifica que los outputs de cómputo muestran el ID del nuevo security group.
+
+**Criterios de Éxito**
+
+- La capa de red despliega dos subredes con CIDRs `10.0.1.0/24` y `10.0.2.0/24`.
+- La capa de cómputo despliega dos security groups, cada uno asociado a la misma VPC.
+- El output de red `private_subnet_id` es accesible desde la capa de cómputo vía `terraform_remote_state`.
+- Puedes destruir y redesplegar la capa de cómputo sin afectar la capa de red.
+
+### Reto 2 — Regla de Ingreso Basada en el CIDR de la VPC
+
+La capa de red ya exporta `vpc_cidr` como output, pero la capa de cómputo no lo consume: solo usa `vpc_id` y `subnet_id`. El security group actual solo tiene una regla de salida (`egress`), lo que significa que no admite tráfico entrante de ningún origen.
+
+Tu tarea es leer el CIDR de la VPC desde el estado de la capa de red y usarlo para añadir una regla de ingreso al security group que permita todo el tráfico interno de la VPC — **sin modificar ningún archivo de la capa de red**.
+
+**Requisitos**
+
+1. En `compute/main.tf`, añade `vpc_cidr` al bloque `locals` leyéndolo desde `data.terraform_remote_state.network.outputs.vpc_cidr`.
+
+2. Añade un bloque `ingress` al recurso `aws_security_group.app` que use `local.vpc_cidr` como fuente de tráfico permitido (todos los puertos y protocolos dentro de la VPC).
+
+3. En `compute/outputs.tf`, añade un output `vpc_cidr` que exponga el CIDR consumido desde la capa de red.
+
+4. Aplica el cambio **únicamente en la capa de cómputo** y verifica que los outputs `vpc_cidr` de ambas capas muestran el mismo valor.
+
+**Criterios de Éxito**
+
+- El plan de la capa de cómputo muestra `1 to change` (el security group actualizado con la regla de ingreso).
+- El plan de la capa de red muestra `No changes` — no se ha tocado ningún archivo de red.
+- El output `vpc_cidr` de la capa de cómputo coincide exactamente con el de la capa de red.
+- Destruir y redesplegar la capa de cómputo no afecta al estado de la capa de red.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Drift Selectivo con `apply -refresh-only`</strong></summary>
+<summary><strong>Solución al Reto 1 — Segunda Subred</strong></summary>
 
-### Solución al Reto 1 — Drift Selectivo con `apply -refresh-only`
+### Solución al Reto 1 — Segunda Subred
 
-#### Paso 1: Introducir los dos drifts
-
-```bash
-SG_ID=$(terraform output -raw security_group_id)
-
-# Drift 1: tag válido
-aws ec2 create-tags \
-  --resources $SG_ID \
-  --tags Key=Environment,Value=staging
-
-# Drift 2: tag accidental
-aws ec2 create-tags \
-  --resources $SG_ID \
-  --tags Key=Owner,Value=equipo-de-ops
-```
-
-#### Paso 2: Verificar el drift
-
-```bash
-terraform plan
-```
-
-El plan muestra ambos cambios de tags en `aws_security_group.app`:
-
-```
-~ resource "aws_security_group" "app" {
-    ~ tags = {
-        ~ "Environment" = "staging" -> "lab"
-        + "Owner"       = "equipo-de-ops" -> null
-      }
-  }
-
-Plan: 0 to add, 1 to change, 0 to destroy.
-```
-
-Terraform quiere revertir `Environment` a `"lab"` y eliminar `Owner` (porque ninguno de los dos está en el código).
-
-#### Paso 3: Capturar el estado real con refresh-only
-
-```bash
-terraform apply -refresh-only
-```
-
-Confirma con `yes`. Ahora el estado refleja la realidad: `Environment = "staging"` y `Owner = "equipo-de-ops"`.
-
-#### Paso 4: Actualizar el código para el cambio válido
-
-Edita `aws/main.tf`, añade `Environment = "staging"` pero **no** añadas `Owner`:
+#### Paso 1 — Añadir la subred privada en `network/main.tf`
 
 ```hcl
-tags = {
-  Name        = "app-lab11"
-  Environment = "staging"    # ← incorporamos el cambio válido
-  ManagedBy   = "terraform"
+resource "aws_subnet" "private" {
+  vpc_id     = aws_vpc.main.id
+  cidr_block = cidrsubnet(var.vpc_cidr, 8, 2)
+
+  tags = {
+    Name      = "subnet-private-lab11"
+    ManagedBy = "terraform"
+    Layer     = "network"
+  }
 }
 ```
 
-#### Paso 5: Aplicar para revertir solo el cambio accidental
+#### Paso 2 — Exportar el nuevo ID en `network/outputs.tf`
+
+```hcl
+output "private_subnet_id" {
+  description = "ID de la subred privada."
+  value       = aws_subnet.private.id
+}
+```
+
+#### Paso 3 — Aplicar la capa de red
 
 ```bash
-terraform plan
+# Desde network/
+terraform apply
 ```
 
-Ahora el plan muestra *únicamente* la eliminación del tag `Owner` (el tag `Environment` ya coincide entre código y realidad):
+El plan muestra `1 to add` (la nueva subred). Los recursos existentes no cambian.
 
-```
-~ resource "aws_security_group" "app" {
-    ~ tags = {
-        - "Owner" = "equipo-de-ops" -> null
-          # (3 unchanged elements hidden)
-      }
+#### Paso 4 — Añadir el segundo security group en `compute/main.tf`
+
+```hcl
+resource "aws_security_group" "internal" {
+  name        = "internal-lab11"
+  description = "Security group interno de la capa de computo (Lab10)"
+  vpc_id      = local.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name      = "internal-lab11"
+    ManagedBy = "terraform"
+    Layer     = "compute"
+  }
+}
+```
+
+En `compute/outputs.tf`, añade:
+
+```hcl
+output "internal_security_group_id" {
+  description = "ID del Security Group interno."
+  value       = aws_security_group.internal.id
+}
+```
+
+#### Paso 5 — Aplicar la capa de cómputo
+
+```bash
+# Desde compute/
+# AWS real:
+terraform apply -var="network_state_bucket=$STATE_BUCKET"
+```
+
+El plan muestra `1 to add` (el nuevo security group). El security group existente no cambia y la capa de red no es tocada.
+
+#### Verificación
+
+```bash
+terraform output
+# internal_security_group_id = "sg-xxxxxxxx"
+# security_group_id          = "sg-yyyyyyyy"
+# subnet_id                  = "subnet-xxxxxxxx"
+# vpc_id                     = "vpc-xxxxxxxx"
+```
+
+Ambos security groups están en la misma VPC. La separación de capas permitió añadir la nueva subred y el nuevo security group sin ningún riesgo de afectar los recursos existentes de la capa de red.
+
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — Regla de Ingreso Basada en el CIDR de la VPC</strong></summary>
+
+### Solución al Reto 2 — Regla de Ingreso Basada en el CIDR de la VPC
+
+#### Paso 1 — Añadir `vpc_cidr` al bloque `locals` en `compute/main.tf`
+
+```hcl
+locals {
+  vpc_id    = data.terraform_remote_state.network.outputs.vpc_id
+  subnet_id = data.terraform_remote_state.network.outputs.subnet_id
+  vpc_cidr  = data.terraform_remote_state.network.outputs.vpc_cidr
+}
+```
+
+El output `vpc_cidr` ya existe en la capa de red desde el inicio del laboratorio. Solo hay que referenciarlo.
+
+#### Paso 2 — Añadir el bloque `ingress` al security group en `compute/main.tf`
+
+```hcl
+resource "aws_security_group" "app" {
+  name        = "app-lab11"
+  description = "Security group de la capa de computo (Lab10)"
+  vpc_id      = local.vpc_id
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [local.vpc_cidr]
+    description = "Trafico interno de la VPC"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name      = "app-lab11"
+    ManagedBy = "terraform"
+    Layer     = "compute"
+  }
+}
+```
+
+#### Paso 3 — Añadir el output `vpc_cidr` en `compute/outputs.tf`
+
+```hcl
+output "vpc_cidr" {
+  description = "CIDR de la VPC consumido desde la capa de red."
+  value       = local.vpc_cidr
+}
+```
+
+#### Paso 4 — Aplicar solo la capa de cómputo
+
+```bash
+# Desde compute/
+
+terraform apply -var="network_state_bucket=$STATE_BUCKET"
+```
+
+El plan debe mostrar exactamente:
+
+```
+  # aws_security_group.app will be updated in-place
+  ~ resource "aws_security_group" "app" {
+      + ingress {
+          + cidr_blocks = ["10.0.0.0/16"]
+          + description = "Trafico interno de la VPC"
+          + from_port   = 0
+          + protocol    = "-1"
+          + to_port     = 0
+        }
+    }
 
 Plan: 0 to add, 1 to change, 0 to destroy.
 ```
 
+#### Paso 5 — Verificar que ambas capas muestran el mismo CIDR
+
 ```bash
-terraform apply
+# Desde compute/
+terraform output vpc_cidr
+# "10.0.0.0/16"
+
+# Desde network/
+terraform output vpc_cidr
+# "10.0.0.0/16"
 ```
 
-#### Paso 6: Verificar el resultado final
+Los valores coinciden. La capa de cómputo leyó el CIDR directamente del estado de la capa de red mediante `terraform_remote_state`, sin duplicar ningún valor en el código. Si la capa de red cambiara el CIDR de la VPC en el futuro, la capa de cómputo lo recogería automáticamente en el siguiente `apply`, sin necesidad de modificar ningún archivo de cómputo.
+
+#### Verificación del Aislamiento
+
+Confirma que la capa de red no fue modificada:
 
 ```bash
+# Desde network/
 terraform plan
 # No changes. Your infrastructure matches the configuration.
 ```
-
-El tag `Environment = "staging"` está en el código y en la infraestructura. El tag `Owner` fue eliminado.
 
 </details>
 
@@ -450,11 +645,19 @@ El tag `Environment = "staging"` está en el código y en la infraestructura. El
 
 ## Limpieza
 
-```bash
-terraform destroy 
-```
+Destruye en orden inverso: primero cómputo (que depende de red), luego red.
 
-> **Nota:** No destruyas el bucket S3, ya que es un recurso compartido entre laboratorios (lab02).
+> Si intentas destruir la capa de red antes que la de cómputo, el security group huérfano seguirá asociado a la VPC e impedirá su eliminación. Destruye siempre de hoja a raíz.
+
+```bash
+# Primero la capa de computo
+cd lab-11/aws/compute/
+terraform destroy -var="network_state_bucket=$STATE_BUCKET"
+
+# Luego la capa de red
+cd ../network/
+terraform destroy
+```
 
 ---
 
@@ -462,23 +665,43 @@ terraform destroy
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-El flujo es idéntico, sustituyendo `aws` por `awslocal` en todos los comandos de AWS CLI.
+En LocalStack se usa backend local en lugar de S3 para la capa de remote state. El concepto de aislamiento por capas (red y cómputo independientes) es idéntico.
+
+---
+
+## Comparativa AWS Real vs LocalStack
+
+| Aspecto | AWS Real | LocalStack |
+|---|---|---|
+| Backend de la capa de red | S3 (`lab11/network/terraform.tfstate`) | Local (`network/terraform.tfstate`) |
+| Backend de la capa de cómputo | S3 (`lab11/compute/terraform.tfstate`) | Local (`compute/terraform.tfstate`) |
+| `terraform_remote_state` (cómputo) | `backend = "s3"` + variables de bucket | `backend = "local"` + ruta relativa |
+| Bucket S3 previo necesario | Sí | No |
+| Verificar VPCs | `aws ec2 describe-vpcs` | `aws --endpoint-url=... ec2 describe-vpcs` |
+| Aislamiento de estados | Archivos separados en S3 | Archivos separados en disco |
+| Comportamiento del blast radius | Idéntico | Idéntico |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **`-refresh-only` para decisión controlada**: aplicar un refresh-only muestra exactamente qué ha cambiado en la nube sin modificar la infraestructura real. Permite decidir si aceptar el drift (actualizar el estado) o revertirlo (aplicar el plan completo).
-- **Versionado del state en S3**: el versionado del bucket de estado permite restaurar el estado anterior si se corrompe o se aplica un plan incorrecto, implementando la regla "1 copia en un soporte diferente" del principio 3-2-1.
-- **Nunca editar el state manualmente**: editar `terraform.tfstate` a mano puede corromper el estado. Usar `terraform state mv`, `terraform state rm` y el bloque `import {}` son las operaciones seguras de manipulación de estado.
-- **`terraform plan -refresh-only` en pipelines**: ejecutar un plan refresh-only periódicamente (por ejemplo, en un scheduled pipeline diario) detecta drift antes de que cause problemas en el siguiente despliegue.
-- **`ignore_changes` para drift esperado**: si ciertos atributos son modificados por procesos externos de forma intencional (por ejemplo, tags de Cost Explorer), usar `lifecycle { ignore_changes = [tags] }` evita falsos positivos de drift.
-- **State locking con DynamoDB**: el locking evita que dos operaciones de Terraform concurrentes corrompan el estado. Siempre habilitarlo en entornos de equipo.
+- **Define la granularidad de las capas según la frecuencia de cambio y el equipo responsable.** La capa de red cambia poco y la gestiona el equipo de plataforma; la capa de cómputo cambia frecuentemente y la gestiona el equipo de aplicaciones. Esta división es natural y reduce la fricción.
+- **Usa outputs con `description` detallada.** Los outputs son la API pública de tu capa; documéntalos como si fueran un contrato de interfaz. Otras capas dependen de ellos y no deben necesitar leer tu código para entenderlos.
+- **No uses `terraform_remote_state` para pasar secretos.** Los valores leídos aparecen en el plan en texto plano. Para secretos, usa AWS Secrets Manager o Parameter Store y léelos con el data source correspondiente.
+- **Destruye siempre de hoja a raíz.** Las capas superiores (cómputo) referencian recursos de las capas inferiores (red). Si destruyes la red primero, dejarás recursos huérfanos que impedirán la eliminación de la VPC.
+- **Un único bucket S3 puede alojar los estados de varias capas usando claves distintas.** La convención `<proyecto>/<capa>/terraform.tfstate` mantiene el orden sin multiplicar los buckets.
+- **El data source `terraform_remote_state` es solo lectura.** Nunca puede modificar el estado que lee. Es seguro usarlo en pipelines de solo lectura (auditorías, dashboards) sin riesgo de alterar la infraestructura.
+- **Considera SSM Parameter Store o HCP Terraform como alternativas.** Para equipos grandes, pasar valores entre capas a través del estado S3 puede ser sustituido por almacenar los outputs clave en SSM Parameter Store, lo que desacopla aún más los proyectos y simplifica los permisos IAM.
 
 ---
 
 ## Recursos
 
-- [Terraform: When to use `refresh-only`](https://developer.hashicorp.com/terraform/tutorials/state/refresh)
-- [S3 Object Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
-- [Managing Drift in Terraform](https://developer.hashicorp.com/terraform/tutorials/state/resource-drift)
+- [Data source `terraform_remote_state`](https://developer.hashicorp.com/terraform/language/state/remote-state-data)
+- [Backend S3 - Documentación de Terraform](https://developer.hashicorp.com/terraform/language/backend/s3)
+- [Backend local - Documentación de Terraform](https://developer.hashicorp.com/terraform/language/backend/local)
+- [Outputs - Documentación de Terraform](https://developer.hashicorp.com/terraform/language/values/outputs)
+- [Recurso aws_vpc](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc)
+- [Recurso aws_subnet](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/subnet)
+- [Recurso aws_security_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group)
+- [Función `cidrsubnet()`](https://developer.hashicorp.com/terraform/language/functions/cidrsubnet)

@@ -1,44 +1,59 @@
-output "api_endpoint" {
-  description = "URL base de la HTTP API. Añade /items, /items/{id}, etc."
-  value       = aws_apigatewayv2_stage.default.invoke_url
-}
-
 output "function_name" {
   description = "Nombre de la función Lambda"
-  value       = aws_lambda_function.api.function_name
+  value       = aws_lambda_function.processor.function_name
 }
 
 output "function_arn" {
   description = "ARN de la función Lambda"
-  value       = aws_lambda_function.api.arn
+  value       = aws_lambda_function.processor.arn
 }
 
-output "layer_arn" {
-  description = "ARN versionado de la Lambda Layer 'utils'"
-  value       = aws_lambda_layer_version.utils.arn
+output "orders_queue_url" {
+  description = "URL de la cola SQS de entrada (órdenes)"
+  value       = aws_sqs_queue.orders.url
 }
 
-output "layer_version" {
-  description = "Número de versión de la Lambda Layer"
-  value       = aws_lambda_layer_version.utils.version
+output "orders_queue_arn" {
+  description = "ARN de la cola SQS de entrada"
+  value       = aws_sqs_queue.orders.arn
+}
+
+output "dlq_url" {
+  description = "URL de la Dead Letter Queue"
+  value       = aws_sqs_queue.dlq.url
+}
+
+output "success_queue_url" {
+  description = "URL de la cola de éxitos (Lambda Destination on_success)"
+  value       = aws_sqs_queue.success.url
+}
+
+output "failure_queue_url" {
+  description = "URL de la cola de fallos (Lambda Destination on_failure)"
+  value       = aws_sqs_queue.failure.url
 }
 
 output "log_group" {
-  description = "Nombre del log group de CloudWatch para la función Lambda"
+  description = "Nombre del log group de CloudWatch"
   value       = aws_cloudwatch_log_group.lambda.name
 }
 
-output "api_id" {
-  description = "ID de la HTTP API en API Gateway v2"
-  value       = aws_apigatewayv2_api.main.id
+output "send_premium_example" {
+  description = "Comando para enviar una orden premium a la cola de entrada"
+  value       = "aws sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"order_id\":\"ORD-001\",\"order_type\":\"premium\",\"amount\":299.99,\"customer\":\"cliente-test\"}'"
 }
 
-output "curl_get_items" {
-  description = "Comando curl de ejemplo para GET /items"
-  value       = "curl -s '${aws_apigatewayv2_stage.default.invoke_url}/items' | python3 -m json.tool"
+output "send_standard_example" {
+  description = "Comando para enviar una orden estándar (será filtrada por filter_criteria)"
+  value       = "aws sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"order_id\":\"ORD-002\",\"order_type\":\"standard\",\"amount\":49.99,\"customer\":\"cliente-test\"}'"
 }
 
-output "curl_post_item" {
-  description = "Comando curl de ejemplo para POST /items"
-  value       = "curl -s -X POST '${aws_apigatewayv2_stage.default.invoke_url}/items' -H 'Content-Type: application/json' -d '{\"nombre\":\"Nuevo Item\",\"precio\":49.99}' | python3 -m json.tool"
+output "invoke_async_success_example" {
+  description = "Invocación async que irá a success-queue via Lambda Destinations (amount ≤ 9999)"
+  value       = "aws lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-001\",\"order_type\":\"premium\",\"amount\":500.00}' --cli-binary-format raw-in-base64-out /dev/null"
+}
+
+output "invoke_async_failure_example" {
+  description = "Invocación async que irá a failure-queue via Lambda Destinations (amount > 9999)"
+  value       = "aws lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-002\",\"order_type\":\"premium\",\"amount\":99999.99}' --cli-binary-format raw-in-base64-out /dev/null"
 }

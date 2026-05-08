@@ -1,35 +1,43 @@
 variable "region" {
-  type        = string
-  description = "Región de AWS donde se despliega la infraestructura"
-  default     = "us-east-1"
+  type    = string
+  default = "us-east-1"
 }
 
-variable "project_name" {
+variable "project" {
   type        = string
-  description = "Nombre del proyecto, usado en tags y nombres de recursos"
+  description = "Prefijo que identifica todos los recursos del laboratorio"
   default     = "lab14"
 }
 
-variable "environment" {
-  type        = string
-  description = "Entorno de despliegue (lab, dev, staging, production)"
-  default     = "lab"
+variable "admin_principal_arns" {
+  type        = list(string)
+  description = <<-EOT
+    ARNs de los administradores de la CMK (usuarios o roles IAM).
+    Si se deja vacío, Terraform usará el ARN del caller actual.
+    Ejemplo: ["arn:aws:iam::123456789012:user/alice"]
+  EOT
+  default     = []
 }
 
-variable "vpc_cidr" {
-  type        = string
-  description = "CIDR block de la VPC donde se desplegará la base de datos"
-  default     = "10.14.0.0/16"
+variable "app_principal_arns" {
+  type        = list(string)
+  description = <<-EOT
+    ARNs de los usuarios/roles que pueden usar la CMK para cifrar y descifrar
+    (aplicaciones, servicios, instancias EC2...).
+    Si se deja vacío, el bloque de usuarios finales se omite de la Key Policy.
+    Ejemplo: ["arn:aws:iam::123456789012:role/my-app-role"]
+  EOT
+  default     = []
 }
 
-variable "db_name" {
-  type        = string
-  description = "Nombre de la base de datos inicial en la instancia RDS"
-  default     = "appdb"
+variable "ebs_volume_size_gb" {
+  type        = number
+  description = "Tamaño del volumen EBS en GiB"
+  default     = 10
 }
 
-variable "db_username" {
+variable "availability_zone" {
   type        = string
-  description = "Nombre del usuario maestro de la base de datos"
-  default     = "dbadmin"
+  description = "Zona de disponibilidad para el volumen EBS"
+  default     = "us-east-1a"
 }

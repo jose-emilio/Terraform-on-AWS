@@ -209,10 +209,10 @@ resource "aws_ecr_lifecycle_policy" "iac_runner" {
         rulePriority = 1
         description  = "Mantener las ultimas ${var.ecr_max_images} imagenes etiquetadas"
         selection = {
-          tagStatus   = "tagged"
+          tagStatus      = "tagged"
           tagPatternList = ["*"]
-          countType   = "imageCountMoreThan"
-          countNumber = var.ecr_max_images
+          countType      = "imageCountMoreThan"
+          countNumber    = var.ecr_max_images
         }
         action = {
           type = "expire"
@@ -222,9 +222,9 @@ resource "aws_ecr_lifecycle_policy" "iac_runner" {
         rulePriority = 2
         description  = "Eliminar imagenes sin etiquetar tras 1 dia"
         selection = {
-          tagStatus = "untagged"
-          countType = "sinceImagePushed"
-          countUnit = "days"
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
           countNumber = 1
         }
         action = {

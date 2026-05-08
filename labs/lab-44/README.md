@@ -16,7 +16,7 @@ usarás CodeDeploy para entregar dos versiones de una aplicación web mediante u
 **IN_PLACE rolling**: las instancias se actualizan por lotes manteniendo siempre al menos el
 75 % del fleet disponible bajo el ALB.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Separar la gestión de infraestructura (Terraform) de la gestión de software (CodeDeploy)
 - Configurar un Deployment Group de CodeDeploy IN_PLACE con control de tráfico ALB
@@ -157,6 +157,19 @@ lifecycle {
 El despliegue IN_PLACE con `FLEET_PERCENT: 75` es la opción más económica: no hay instancias
 adicionales en ningún momento y el rollback simplemente reinstala el artefacto anterior en las
 instancias afectadas.
+
+> **Decisión didáctica — por qué este lab implementa IN_PLACE y no Blue/Green**
+>
+> El [Módulo 10 — CI/CD y Automatización](../../modulos/modulo-10/README.md) presenta Blue/Green
+> como el patrón moderno de referencia (despliegue sin riesgo de instancias mutadas, swap atómico
+> del listener, ventana de validación previa al cutover). Este laboratorio elige deliberadamente
+> la estrategia **IN_PLACE rolling** para que ambos enfoques se cubran de forma complementaria:
+> Blue/Green se estudia teóricamente en el módulo y aquí se practican los aspectos de CodeDeploy
+> que solo son visibles en IN_PLACE: hooks del `appspec.yml` ejecutándose en instancias existentes,
+> coexistencia con el ASG mediante `lifecycle { ignore_changes }`, batching con
+> `MinimumHealthyHosts` y rollback por reinstalación del artefacto previo. Tras completar el lab,
+> el alumno dispone del modelo mental de las dos estrategias y puede razonar cuándo conviene cada
+> una según coste, riesgo y tiempo de cutover.
 
 ## Estructura del proyecto
 

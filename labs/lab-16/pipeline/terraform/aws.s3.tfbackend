@@ -1,0 +1,6 @@
+# Backend config para el ejemplo demo del pipeline de lab-16.
+# El bucket se pasa via -backend-config="bucket=..." en terraform init.
+region       = "us-east-1"
+key          = "lab16-pipeline-demo/terraform.tfstate"
+encrypt      = true
+use_lockfile = true

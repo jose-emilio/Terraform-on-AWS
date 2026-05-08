@@ -387,7 +387,7 @@ resource "aws_dynamodb_table" "main" {
 | DAX | Read-heavy, latencia < 1ms | Por nodo por hora |
 | CMK encryption | Datos sensibles/regulados | Por llamadas KMS |
 
-> **El profesor resume:** "DynamoDB escala infinitamente porque te obliga a pensar en los access patterns antes de escribir código. El costo del aprendizaje inicial — entender partition keys, hot partitions, GSI — se amortiza cuando llegas al millón de requests por segundo sin preocuparte por el tamaño del servidor."
+> **Nota importante:** "DynamoDB escala infinitamente porque te obliga a pensar en los access patterns antes de escribir código. El costo del aprendizaje inicial — entender partition keys, hot partitions, GSI — se amortiza cuando llegas al millón de requests por segundo sin preocuparte por el tamaño del servidor."
 
 ---
 

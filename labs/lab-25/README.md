@@ -1,4 +1,4 @@
-# Laboratorio 25 — Framework de Pruebas: Plan, Apply e Idempotencia
+# Laboratorio 25 — Composición de Módulos Públicos con Estándares Corporativos
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,791 +8,812 @@
 
 ## Visión general
 
-Validar la estabilidad y el comportamiento de un módulo Terraform mediante el **framework nativo de testing** (`terraform test`). Crear tests unitarios con `mock_provider` (sin conectar a AWS), tests de integración con `command = apply` (recursos reales), y tests de idempotencia que verifican que no hay cambios pendientes tras un despliegue. Complementar con análisis estático usando `checkov` o `trivy`.
+Crear un módulo "wrapper" que orqueste módulos públicos del Terraform Registry (VPC y RDS), inyectando estándares de seguridad obligatorios que los equipos de desarrollo **no pueden desactivar**. Encadenar los outputs del módulo de VPC como inputs del módulo de RDS. Usar bloques `moved {}` para renombrar recursos internos sin destruir infraestructura.
+
+## Arquitectura
+
+![Wrapper corporate-rds que compone los módulos públicos VPC y RDS del Registry con compliance hardcoded](arch/diagrama.svg)
+
+El wrapper contiene tres componentes:
+1. **Módulo público VPC**: crea la red completa (VPC, subredes, NAT Gateway, route tables)
+2. **Security group**: restringe el acceso a RDS solo desde las subredes privadas
+3. **Módulo público RDS**: crea la base de datos con parámetros de seguridad hardcoded
 
 ## Conceptos clave
 
 | Concepto | Descripción |
 |---|---|
-| **`terraform test`** | Comando nativo (Terraform 1.6+) que ejecuta archivos `.tftest.hcl`. Crea un entorno aislado, ejecuta los tests, y destruye los recursos automáticamente |
-| **`mock_provider`** | Bloque (Terraform 1.7+) que simula un proveedor sin conectar a AWS. Permite testear lógica de nombrado, tags y validaciones sin coste ni credenciales |
-| **`mock_data`** | Dentro de `mock_provider`, simula las respuestas de data sources. Ej: `mock_data "aws_caller_identity"` devuelve un `account_id` ficticio |
-| **`run` block** | Unidad de ejecución dentro de un test. Puede ser `command = plan` (solo planifica) o `command = apply` (crea recursos reales) |
-| **`assert`** | Bloque dentro de `run` que verifica una condición. Si `condition = false`, el test falla con `error_message` |
-| **Test de idempotencia** | Patrón de dos `run` consecutivos: primero `apply`, luego `plan`. Si el plan muestra cambios, el módulo no es idempotente (bug) |
-| **Análisis estático** | Herramientas como `checkov` o `trivy` que escanean el código HCL buscando vulnerabilidades de seguridad sin ejecutar nada |
+| **Módulo wrapper** | Módulo que encapsula otros módulos (públicos o privados) añadiendo políticas corporativas. El equipo de plataforma lo mantiene; los equipos de producto lo consumen |
+| **Terraform Registry** | Repositorio público de módulos reutilizables. Los módulos oficiales de AWS (`terraform-aws-modules/*`) son los más usados y están mantenidos por la comunidad |
+| **Composición de módulos** | Patrón de invocar múltiples módulos dentro de otro módulo, conectando sus outputs e inputs para crear una arquitectura completa |
+| **Encadenamiento de outputs** | Pasar la salida de un módulo como entrada de otro: `module.vpc.private_subnets` → `module.rds.subnet_ids` |
+| **Parámetros hardcoded** | Valores fijados dentro del wrapper que el usuario no puede sobreescribir. Garantizan cumplimiento de políticas sin depender de la disciplina del equipo |
+| **`moved {}`** | Bloque que indica a Terraform que un recurso fue renombrado, no eliminado. Evita destruir y recrear infraestructura al refactorizar código |
+| **`manage_master_user_password`** | Característica de RDS que genera y rota automáticamente la contraseña maestra en Secrets Manager, eliminando la necesidad de gestionarla manualmente |
 
-## Comparativa: Tipos de test en Terraform
+## Comparativa: Módulo directo vs. Wrapper corporativo
 
-| Tipo | Velocidad | Coste | Qué verifica | Herramienta |
-|---|---|---|---|---|
-| **Análisis estático** | ~1s | $0 | Patrones inseguros en el código | `checkov`, `trivy` |
-| **Unit test (mock)** | ~2s | $0 | Lógica de nombrado, tags, validaciones | `terraform test` + `mock_provider` + `apply` simulado |
-| **Integration test** | ~30s+ | Mínimo | Que los recursos se crean en AWS | `terraform test` + `command = apply` |
-| **Idempotencia** | ~60s+ | Mínimo | Que el apply es estable (sin drifts) | `terraform test` + apply/plan |
+| Aspecto | Módulo público directo | Wrapper corporativo |
+|---|---|---|
+| Cifrado | El equipo decide (puede olvidarlo) | `storage_encrypted = true` siempre |
+| Acceso público | El equipo decide | `publicly_accessible = false` siempre |
+| Protección borrado | El equipo decide | `deletion_protection = true` siempre |
+| Networking | El equipo configura VPC, subredes, SG | Todo incluido y conectado |
+| Complejidad para el usuario | Alta (muchos parámetros) | Baja (solo motor, clase, nombre) |
+| Flexibilidad | Total | Limitada por diseño |
+| Auditoría | Revisar cada equipo | Revisar un solo módulo |
 
 ## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas
-- **Terraform >= 1.10** (necesario para `use_lockfile` en el backend S3; `mock_provider` ya está disponible desde 1.7, así que también queda cubierto)
-- Opcional: `checkov` o `trivy` instalados para análisis estático
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3; los bloques `moved {}` requieren ≥ 1.1, así que ya está cubierto)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 echo "Bucket: $BUCKET"
-
-# Verificar versión de Terraform
-terraform version
-# Terraform v1.10.0+ requerido (backend `use_lockfile` + `mock_provider`)
 ```
+
+> **⚠️ Aviso de coste — desglose mensual aproximado en `us-east-1`:**
+>
+> | Componente | Tarifa | Coste/mes |
+> |---|---|---:|
+> | RDS `db.t4g.micro` (Single-AZ) | ~$0,016/h × 720 h | ~$11,50 |
+> | RDS storage 20 GB gp3 | ~$0,115/GB-mes | ~$2,30 |
+> | RDS backups (retention 7d, ≤storage gratis) | $0 hasta 100% storage | ~$0 |
+> | NAT Gateway (single, no por AZ) | ~$0,045/h × 720 h | ~$32 |
+> | Elastic IP del NAT | ~$0,005/h × 720 h | ~$3,60 |
+> | Secrets Manager (gestionado por RDS) | ~$0,40/secreto-mes | ~$0,40 |
+>
+> **Total base ≈ 50 USD/mes** sin contar tráfico procesado por NAT (~$0,045/GB) ni transferencia de datos. Si dejas el lab corriendo, la factura sube rápido. **Ejecuta `terraform destroy` (sección 8) en cuanto termines la práctica** — recuerda que primero hay que desactivar `deletion_protection`.
 
 ## Estructura del proyecto
 
 ```
 lab-25/
-├── README.md                                  <- Esta guía
+├── README.md                                <- Esta guía
+├── arch/
+│   └── diagrama.svg                         <- Diagrama de la arquitectura del lab
 ├── aws/
-│   ├── providers.tf                           <- Backend S3 parcial (>= 1.10)
-│   ├── variables.tf                           <- Variables del Root Module
-│   ├── main.tf                                <- Root Module: invoca tagged-bucket
-│   ├── outputs.tf                             <- Outputs delegados al módulo
-│   ├── aws.s3.tfbackend                       <- Parámetros del backend
-│   ├── modules/
-│   │   └── tagged-bucket/                     <- El módulo bajo test
-│   │       ├── main.tf                        <- Bucket + tags + public access block
-│   │       ├── variables.tf                   <- Entradas con validaciones
-│   │       └── outputs.tf                     <- bucket_id, bucket_arn, effective_tags
-│   └── tests/
-│       ├── unit_naming.tftest.hcl             <- Unit test: mock_provider + plan
-│       ├── integration.tftest.hcl             <- Integration test: apply real
-│       └── idempotency.tftest.hcl             <- Idempotencia: apply + plan
+│   ├── providers.tf                         <- Backend S3 parcial
+│   ├── variables.tf                         <- Variables del Root Module
+│   ├── main.tf                              <- Invocación del wrapper
+│   ├── outputs.tf                           <- Outputs delegados al wrapper
+│   ├── aws.s3.tfbackend                     <- Parámetros del backend
+│   └── modules/
+│       └── corporate-rds/                   <- El wrapper corporativo
+│           ├── main.tf                      <- VPC + SG + RDS (módulos públicos)
+│           ├── variables.tf                 <- Interfaz simplificada
+│           └── outputs.tf                   <- VPC, RDS, compliance
 └── localstack/
-    └── README.md                              <- Limitaciones de testing en LocalStack
+    └── README.md                            <- Explicación (RDS no disponible)
 ```
 
 ## Análisis del código
 
-### Arquitectura del laboratorio
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      terraform test                                 │
-│                                                                     │
-│  ┌──────────────────┐  ┌───────────────────┐  ┌─────────────────┐   │
-│  │ unit_naming      │  │ integration       │  │ idempotency     │   │
-│  │ .tftest.hcl      │  │ .tftest.hcl       │  │ .tftest.hcl     │   │
-│  │                  │  │                   │  │                 │   │
-│  │ mock_provider ── │  │ provider "aws" ── │  │ run 1: apply ── │   │
-│  │ command = plan   │  │ command = apply   │  │ run 2: plan  ── │   │
-│  │ 0 recursos reales│  │ recursos reales   │  │ 0 cambios?      │   │
-│  └────────┬─────────┘  └────────┬──────────┘  └────────┬────────┘   │
-│           │                     │                      │            │
-│           └─────────────────────┼──────────────────────┘            │
-│                                 ▼                                   │
-│                    modules/tagged-bucket/                           │
-│                    (el módulo bajo test)                            │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-Tres archivos de test que verifican el mismo módulo desde ángulos diferentes:
-1. **Unit**: ¿La lógica interna es correcta? (sin AWS)
-2. **Integration**: ¿El recurso se crea en AWS?
-3. **Idempotencia**: ¿El segundo plan está limpio?
-
-### El módulo bajo test: `tagged-bucket`
+### Composición de módulos — VPC del Registry
 
 ```hcl
-# modules/tagged-bucket/main.tf
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
 
-locals {
-  default_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Module      = "tagged-bucket"
-  }
+  name = "${var.project_name}-vpc"
+  cidr = var.vpc_cidr
 
-  effective_tags = merge(local.default_tags, var.tags)
-}
+  azs              = local.azs
+  private_subnets  = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, 10 + i)]
+  database_subnets = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, 20 + i)]
+  public_subnets   = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, i)]
 
-resource "aws_s3_bucket" "this" {
-  bucket        = var.bucket_name
-  force_destroy = true
+  enable_nat_gateway                 = true
+  single_nat_gateway                 = true
+  create_database_subnet_group       = true
+  create_database_subnet_route_table = true
 
-  tags = merge(local.effective_tags, {
-    Name = var.bucket_name
-  })
-}
-```
+  enable_dns_hostnames = true
+  enable_dns_support   = true
 
-El módulo tiene lógica testeable:
-- **Nombrado**: el bucket recibe un nombre compuesto desde el Root Module
-- **Etiquetado**: `merge()` combina tags por defecto con tags del llamador
-- **Validaciones**: `bucket_name` debe cumplir regex, `environment` debe estar en una lista
-
-### Unit test — `mock_provider` y `command = apply`
-
-```hcl
-# tests/unit_naming.tftest.hcl
-
-mock_provider "aws" {
-  mock_data "aws_caller_identity" {
-    defaults = {
-      account_id = "123456789012"
-      arn        = "arn:aws:iam::123456789012:root"
-      user_id    = "AIDACKCEVSQ6C2EXAMPLE"
-    }
-  }
-}
-```
-
-**`mock_provider "aws"`** reemplaza al proveedor real. Terraform no contacta con AWS. Los recursos se "crean" en memoria con valores simulados.
-
-**`mock_data "aws_caller_identity"`** simula la respuesta del data source. Sin esto, `data.aws_caller_identity.current.account_id` sería una cadena vacía, y el nombre del bucket no tendría el account ID.
-
-```hcl
-run "bucket_name_follows_convention" {
-  command = apply
-
-  variables {
-    project_name  = "myapp"
-    bucket_suffix = "logs"
-    environment   = "production"
-  }
-
-  assert {
-    condition     = output.bucket_id == "myapp-logs-123456789012"
-    error_message = "El nombre del bucket debe ser '{project}-{suffix}-{account_id}'"
-  }
+  tags = local.effective_tags
 }
 ```
 
 Puntos clave:
-- **`command = apply`** (no `plan`): con `mock_provider`, el apply es simulado — no crea recursos reales y se ejecuta en ~2 segundos. Usamos `apply` en vez de `plan` porque atributos computados como `bucket.id` solo están disponibles después del apply, incluso con mocks
-- **`variables {}`**: sobreescribe las variables del Root Module para este test
-- **`output.bucket_id`**: referencia un output del Root Module. Tras el apply simulado, los outputs ya están resueltos y se pueden usar en los `assert`
-- **`assert`**: si `condition` es `false`, el test falla con `error_message`
+- `source = "terraform-aws-modules/vpc/aws"` descarga el módulo del Registry público
+- `version = "~> 5.0"` permite versiones 5.x pero no 6.0 (semver pessimistic constraint)
+- Tres tipos de subredes: **public** (con IGW), **private** (con NAT), **database** (sin salida a Internet)
+- `create_database_subnet_group = true` crea automáticamente el subnet group que RDS necesita
+- Los CIDRs se calculan con `cidrsubnet()`: públicas en `x.x.0.0/24`, `x.x.1.0/24`; privadas en `x.x.10.0/24`, `x.x.11.0/24`; database en `x.x.20.0/24`, `x.x.21.0/24`
 
-Se pueden definir múltiples `assert` en el mismo `run` y múltiples `run` en el mismo archivo.
-
-### Integration test — `command = apply` real
+### Encadenamiento de outputs — VPC → RDS
 
 ```hcl
-# tests/integration.tftest.hcl
+module "rds" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "~> 6.0"
 
-variables {
-  project_name  = "lab25-inttest"
-  bucket_suffix = "integration"
-  environment   = "lab"
-}
+  # ...
 
-# --- Test 1: el bucket se crea correctamente (command = apply) ---
-
-run "bucket_is_created" {
-  command = apply
-
-  assert {
-    condition     = output.bucket_arn != ""
-    error_message = "El bucket debe tener un ARN tras el apply"
-  }
-
-  assert {
-    condition     = startswith(output.bucket_arn, "arn:aws:s3:::")
-    error_message = "El ARN debe ser un ARN de S3 válido"
-  }
-}
-
-# --- Test 2: las tags se aplicaron correctamente (command = plan) ---
-# Aprovecha el state que dejó `bucket_is_created` y verifica los outputs
-# sin volver a tocar AWS. El patrón "apply una vez + varios plan" es el
-# habitual cuando varios runs comprueban distintas facetas del MISMO
-# despliegue: ahorras 30+ segundos por run frente a un apply nuevo.
-
-run "tags_are_applied" {
-  command = plan
-
-  assert {
-    condition     = output.effective_tags["Project"] == "lab25-inttest"
-    error_message = "El tag Project no coincide tras el apply"
-  }
-
-  assert {
-    condition     = output.effective_tags["Environment"] == "lab"
-    error_message = "El tag Environment no coincide tras el apply"
-  }
+  # ─── OUTPUTS ENCADENADOS DEL MÓDULO VPC ───
+  db_subnet_group_name   = module.vpc.database_subnet_group_name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  subnet_ids             = module.vpc.database_subnets
 }
 ```
 
-Diferencias con el unit test:
-- **Sin `mock_provider`**: usa el proveedor real configurado en `providers.tf`.
-- **`command = apply` en el primer run**: crea el bucket **de verdad** en la cuenta de AWS.
-- **`command = plan` en runs posteriores**: leen los outputs del state generado por el `apply` anterior. No tocan AWS, son rápidos. Es el patrón recomendado cuando varios `assert` verifican distintas propiedades del mismo despliegue — apply una sola vez, varios `plan` después.
-- **Limpieza automática**: `terraform test` destruye los recursos al finalizar el archivo de test (no del run).
-- **`variables {}` a nivel de archivo**: se comparten entre todos los `run` del archivo (ojo: cada `run` puede sobreescribirlas con su propio bloque `variables {}`).
+El flujo de datos:
 
-### Test de idempotencia — Apply + Plan
+```
+module.vpc.database_subnet_group_name ──► module.rds.db_subnet_group_name
+module.vpc.database_subnets           ──► module.rds.subnet_ids
+module.vpc.private_subnets_cidr_blocks ──► aws_security_group.rds.ingress.cidr_blocks
+                                           ──► module.rds.vpc_security_group_ids
+```
+
+Terraform resuelve estas dependencias automáticamente: primero crea la VPC, luego el security group, y finalmente la instancia RDS. No se necesita `depends_on` explícito porque las referencias implican el orden.
+
+### Estandarización — Parámetros hardcoded
 
 ```hcl
-# tests/idempotency.tftest.hcl
+module "rds" {
+  # ...
 
-run "initial_deploy" {
-  command = apply
+  # ─── PARÁMETROS HARDCODED DE CUMPLIMIENTO ───
+  storage_encrypted   = true  # Cifrado en reposo obligatorio
+  deletion_protection = true  # Protección contra borrado accidental
+  publicly_accessible = false # Sin acceso público NUNCA
 
-  assert {
-    condition     = output.bucket_id != ""
-    error_message = "El bucket debe crearse en el primer apply"
-  }
-}
-
-run "no_changes_on_replan" {
-  command = plan
-
-  assert {
-    condition     = output.bucket_id == run.initial_deploy.bucket_id
-    error_message = "El bucket_id no debe cambiar entre apply y plan"
-  }
-
-  assert {
-    condition     = output.bucket_arn == run.initial_deploy.bucket_arn
-    error_message = "El bucket_arn no debe cambiar entre apply y plan"
-  }
+  # ─── OPERACIONALES, también hardcoded por política ───
+  backup_retention_period = 7    # Snapshots diarios automáticos durante 7 días
+  skip_final_snapshot     = true # ⚠ ver nota más abajo
 }
 ```
 
-El patrón de idempotencia:
-1. **`run "initial_deploy"`** con `command = apply`: crea los recursos
-2. **`run "no_changes_on_replan"`** con `command = plan`: planifica **sin cambios**
+> **Sobre `skip_final_snapshot = true`:** este flag dice a RDS **no crear** un snapshot final cuando se destruye la BD. Es práctico para un laboratorio (la BD es desechable), pero **en producción debería ser `false`** o, mejor, exponerse como variable con default `false` — perder datos al destruir sin querer es irrecuperable. Lo dejamos en `true` aquí solo para que `terraform destroy` funcione sin el paso adicional de proporcionar `final_snapshot_identifier`.
 
-Si el módulo es idempotente, el plan no mostrará cambios y los outputs serán idénticos. Si algún recurso tiene un atributo que cambia en cada plan (ej: un `timestamp()`), el test fallará — lo cual es el comportamiento deseado, ya que indica un bug de idempotencia.
-
-**`run.initial_deploy.bucket_id`** referencia el output del run anterior. Esto permite comparar valores entre ejecuciones.
-
-### `expect_failures` — Probar el camino fallido
-
-`assert` verifica que algo es **cierto**. Su contraparte es `expect_failures`, que verifica que **una validación o precondition falla** intencionalmente. Es la forma de testear el "camino infeliz" de un módulo: comprobar que las validaciones rechazan inputs malos.
+Estos parámetros están **dentro del wrapper**, no expuestos como variables. El equipo de producto que consume el módulo no puede hacer:
 
 ```hcl
-run "rejects_bad_input" {
-  command = plan
-
-  variables {
-    environment = "invalid"   # ← valor que la validación NO acepta
-  }
-
-  expect_failures = [var.environment]
+# ❌ IMPOSIBLE — no existe variable para sobreescribir
+module "corporate_rds" {
+  source            = "./modules/corporate-rds"
+  storage_encrypted = false   # No existe esta variable
 }
 ```
 
-`expect_failures` es una **lista** de referencias a las variables (o recursos) cuya validación se espera que falle. Si la validación **sí** falla → el test pasa. Si la validación **no** falla (es decir, si la regla está rota y acepta valores que no debería) → el test falla, alertándote.
+Si alguien intenta pasar `storage_encrypted`, Terraform dará error:
 
-Diferencias clave con `assert`:
+```
+Error: Unsupported argument
+  An argument named "storage_encrypted" is not expected here.
+```
 
-| Aspecto | `assert` | `expect_failures` |
-|---|---|---|
-| Espera... | que `condition = true` | que la validación de un input falle |
-| Comprueba... | el camino satisfactorio | el camino fallido |
-| Si la condición/validación pasa | el test pasa | el test **falla** |
+Este es el poder del patrón wrapper: **cumplimiento por diseño**, no por convención.
 
-El Reto 1 (más abajo) lo aplica para verificar que la validación de `environment` rechaza valores inválidos.
+### Contraseña gestionada por RDS
+
+```hcl
+manage_master_user_password = true
+```
+
+En vez de pasar una contraseña como variable (que acabaría en el estado en texto plano), RDS genera y rota automáticamente la contraseña en Secrets Manager. El ARN del secreto se expone como output:
+
+```hcl
+output "db_master_user_secret_arn" {
+  value = module.rds.db_instance_master_user_secret_arn
+}
+```
+
+Las aplicaciones pueden recuperar la contraseña desde Secrets Manager usando el SDK de AWS, sin que ningún humano necesite conocerla.
+
+### Root Module — Interfaz simplificada
+
+```hcl
+module "corporate_rds" {
+  source = "./modules/corporate-rds"
+
+  project_name = var.project_name
+  environment  = var.environment
+
+  vpc_cidr          = "10.20.0.0/16"
+  db_engine         = "mysql"
+  db_engine_version = "8.0"
+  db_instance_class = "db.t4g.micro"
+  db_name           = "appdb"
+  db_username       = "admin"
+
+  tags = local.common_tags
+}
+```
+
+El equipo de producto solo necesita decidir:
+- ¿Qué motor? (`mysql`, `postgres`, `mariadb`)
+- ¿Qué tamaño? (`db.t4g.micro`, `db.r6g.large`, etc.)
+- ¿Cómo se llama la BD?
+
+Todo lo demás (VPC, subredes, security groups, cifrado, protección, subnet groups) está resuelto por el wrapper. Compare esto con usar los módulos públicos directamente, que requieren decenas de parámetros.
 
 ---
 
-## Ejecución de los tests
-
-### Inicializar (sin backend)
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-25/aws
 
-# Para tests, inicializar sin backend (el state es efímero)
-terraform init -backend=false
+terraform init \
+  -backend-config=aws.s3.tfbackend \
+  -backend-config="bucket=$BUCKET"
 ```
 
-> **El state durante un test:** `terraform test` mantiene el state de cada archivo `.tftest.hcl` **en memoria, sin persistirlo en ningún backend** ni en disco. Cuando termina la ejecución del archivo, el state desaparece junto con los recursos que se hayan creado. Por eso usamos `-backend=false` durante el `init` — no hay nada que guardar.
->
-> **Tiempo del primer `init`:** la primera vez tarda 5–15 segundos descargando el provider AWS (`hashicorp/aws`). En ejecuciones posteriores se sirve desde la caché local (`.terraform/providers/`) y es prácticamente instantáneo.
-
-### Ejecutar todos los tests
+> **Nota:** `terraform init` descargará los módulos del Registry público (~30 segundos).
 
 ```bash
-terraform test
+terraform apply
 ```
 
-Salida esperada:
+Terraform creará ~30 recursos: VPC completa (subredes, route tables, NAT Gateway, IGW), security group, instancia RDS, parameter group, option group, y el secreto con la contraseña.
 
-```
-tests/idempotency.tftest.hcl... in progress
-  run "initial_deploy"... pass
-  run "no_changes_on_replan"... pass
-tests/idempotency.tftest.hcl... tearing down
-tests/idempotency.tftest.hcl... pass
-
-tests/integration.tftest.hcl... in progress
-  run "bucket_is_created"... pass
-  run "tags_are_applied"... pass
-tests/integration.tftest.hcl... tearing down
-tests/integration.tftest.hcl... pass
-
-tests/unit_naming.tftest.hcl... in progress
-  run "bucket_name_follows_convention"... pass
-  run "default_tags_are_present"... pass
-  run "different_project_changes_name"... pass
-tests/unit_naming.tftest.hcl... tearing down
-tests/unit_naming.tftest.hcl... pass
-
-Success! 7 passed, 0 failed.
-```
-
-### Ejecutar solo los tests unitarios (sin AWS)
+> **Tiempo estimado:** ~10-15 minutos (la instancia RDS tarda en aprovisionarse).
 
 ```bash
-# Filtrar por archivo de test
-terraform test -filter=tests/unit_naming.tftest.hcl
+terraform output
+# vpc_id               = "vpc-0abc..."
+# vpc_cidr             = "10.20.0.0/16"
+# db_endpoint          = "lab25-db.xxxx.us-east-1.rds.amazonaws.com:3306"
+# db_port              = 3306
+# db_name              = "appdb"
+# db_secret_arn        = "arn:aws:secretsmanager:...:rds!db-..."
+# db_storage_encrypted = true
+# db_deletion_protection = true
 ```
-
-Esto ejecuta **solo** el test con `mock_provider`. No necesita credenciales de AWS ni genera costes. Ideal para CI/CD en las primeras etapas del pipeline.
-
-### Modo verbose
-
-```bash
-terraform test -verbose
-```
-
-Muestra los detalles del plan/apply de cada `run`, incluyendo los outputs y los recursos creados.
 
 ---
 
-## Análisis estático
+## Verificación final
 
-El análisis estático complementa los tests de Terraform escaneando el código HCL en busca de vulnerabilidades **sin ejecutar nada**.
-
-### Instalación de checkov
+### Verificar la VPC y subredes
 
 ```bash
-pip install checkov
+VPC_ID=$(terraform output -raw vpc_id)
 
-# O con pipx (recomendado para no contaminar el entorno)
-pipx install checkov
+# Subredes por tipo
+aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'Subnets[].{ID: SubnetId, CIDR: CidrBlock, AZ: AvailabilityZone, Name: Tags[?Key==`Name`].Value | [0]}' \
+  --output table
 ```
 
-### Ejecutar checkov sobre el módulo
+Debe mostrar 6 subredes: 2 públicas, 2 privadas, 2 de base de datos.
+
+### Verificar parámetros de seguridad de RDS
 
 ```bash
-checkov -d modules/tagged-bucket/ --framework terraform
+aws rds describe-db-instances \
+  --db-instance-identifier lab25-db \
+  --query 'DBInstances[0].{
+    Engine: Engine,
+    StorageEncrypted: StorageEncrypted,
+    DeletionProtection: DeletionProtection,
+    PubliclyAccessible: PubliclyAccessible,
+    MultiAZ: MultiAZ,
+    Endpoint: Endpoint.Address
+  }' \
+  --output json
 ```
 
-Salida típica:
+Debe mostrar:
+- `StorageEncrypted: true` — hardcoded por el wrapper
+- `DeletionProtection: true` — hardcoded por el wrapper
+- `PubliclyAccessible: false` — hardcoded por el wrapper
 
-```
-Passed checks: 10, Failed checks: 5, Skipped checks: 0
-
-Check: CKV_AWS_19: "Ensure all data stored in the S3 bucket is securely encrypted at rest"
-        PASSED for resource: aws_s3_bucket.this
-Check: CKV_AWS_21: "Ensure all data stored in the S3 bucket have versioning enabled"
-        PASSED for resource: aws_s3_bucket.this
-Check: CKV_AWS_53: "Ensure S3 bucket has block public ACLS enabled"
-        PASSED for resource: aws_s3_bucket_public_access_block.this
-Check: CKV_AWS_54: "Ensure S3 bucket has block public policy enabled"
-        PASSED for resource: aws_s3_bucket_public_access_block.this
-Check: CKV2_AWS_6:  "Ensure that S3 bucket has a Public Access block"
-        PASSED for resource: aws_s3_bucket.this
-...
-
-Check: CKV_AWS_18:  "Ensure the S3 bucket has access logging enabled"
-        FAILED for resource: aws_s3_bucket.this
-Check: CKV_AWS_144: "Ensure that S3 bucket has cross-region replication enabled"
-        FAILED for resource: aws_s3_bucket.this
-Check: CKV_AWS_145: "Ensure that S3 buckets are encrypted with KMS by default"
-        FAILED for resource: aws_s3_bucket.this
-Check: CKV2_AWS_61: "Ensure that an S3 bucket has a lifecycle configuration"
-        FAILED for resource: aws_s3_bucket.this
-Check: CKV2_AWS_62: "Ensure S3 buckets should have event notifications enabled"
-        FAILED for resource: aws_s3_bucket.this
-```
-
-Las cinco comprobaciones que fallan corresponden a buenas prácticas que el módulo no implementa intencionadamente para mantener la docencia (`access logging`, `cross-region replication`, cifrado con `KMS`, `lifecycle` y `event notifications`). Es un buen ejemplo de cómo `checkov` complementa a los tests funcionales: los `.tftest.hcl` verifican el contrato del módulo, mientras que el análisis estático señala buenas prácticas adicionales que el equipo decide adoptar (o suprimir explícitamente con `--skip-check`).
-
-### Alternativa: Trivy
-
-Instalación oficial según el sistema operativo (ver [docs](https://trivy.dev/docs/latest/getting-started/installation/)):
+### Verificar security group
 
 ```bash
-# macOS (Homebrew)
-brew install trivy
+SG_ID=$(terraform output -raw security_group_id)
+
+aws ec2 describe-security-groups \
+  --group-ids $SG_ID \
+  --query 'SecurityGroups[0].IpPermissions[].{Port: FromPort, CIDR: IpRanges[].CidrIp}' \
+  --output json
 ```
+
+Debe mostrar que el ingreso solo está permitido desde los CIDRs de las subredes privadas (`10.20.10.0/24`, `10.20.11.0/24`).
+
+### Verificar la contraseña en Secrets Manager
 
 ```bash
-# Linux Debian/Ubuntu (repositorio APT)
-sudo apt-get install -y wget gnupg
-wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
-  | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
-  | sudo tee /etc/apt/sources.list.d/trivy.list
-sudo apt-get update && sudo apt-get install -y trivy
+SECRET_ARN=$(terraform output -raw db_secret_arn)
+
+# Ver metadatos (sin el valor)
+aws secretsmanager describe-secret \
+  --secret-id $SECRET_ARN \
+  --query '{Name: Name, Description: Description, RotationEnabled: RotationEnabled}'
+
+# Recuperar la contraseña (solo para verificación)
+aws secretsmanager get-secret-value \
+  --secret-id $SECRET_ARN \
+  --query 'SecretString' --output text | jq .
 ```
 
-```bash
-# Linux RHEL/CentOS/Fedora (repositorio YUM/DNF)
-cat <<EOF | sudo tee /etc/yum.repos.d/trivy.repo
-[trivy]
-name=Trivy repository
-baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/\$basearch/
-gpgcheck=1
-enabled=1
-gpgkey=https://aquasecurity.github.io/trivy-repo/rpm/public.key
-EOF
-sudo dnf install -y trivy
-```
-
-Si no quieres añadir un repositorio, puedes descargar el binario suelto desde [GitHub Releases](https://github.com/aquasecurity/trivy/releases) (paquete `.deb`/`.rpm` o tarball para extraer en `~/.local/bin`).
-
-Ejecución sobre el módulo:
-
-```bash
-trivy config modules/tagged-bucket/
-```
-
-Salida típica:
-
-```
-Report Summary
-
-┌─────────┬───────────┬───────────────────┐
-│ Target  │   Type    │ Misconfigurations │
-├─────────┼───────────┼───────────────────┤
-│ main.tf │ terraform │         2         │
-└─────────┴───────────┴───────────────────┘
-
-main.tf (terraform)
-===================
-Tests: 2 (SUCCESSES: 0, FAILURES: 2)
-Failures: 2 (UNKNOWN: 0, LOW: 1, MEDIUM: 0, HIGH: 1, CRITICAL: 0)
-
-AWS-0089 (LOW):  Bucket has logging disabled
-AWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key.
-```
-
-Trivy reporta menos hallazgos que `checkov` porque aplica un catálogo de reglas más reducido y centrado en severidad. Ambos son complementarios: `checkov` da más cobertura, `trivy` clasifica por severidad (`LOW`/`MEDIUM`/`HIGH`/`CRITICAL`), útil para fijar umbrales de fallo en CI (por ejemplo `--severity HIGH,CRITICAL`).
-
-### Pipeline recomendado
-
-```
-1. checkov/trivy     →  Análisis estático (0s, $0)
-2. terraform test -filter=tests/unit_naming.tftest.hcl
-                     →  Unit tests con mock_provider (~2s, $0)
-3. terraform test    →  Integration + idempotencia (~60s, coste mínimo)
-```
-
-Ejecutar en este orden permite detectar problemas lo antes posible ("shift left"), minimizando el tiempo de feedback y el coste.
+La contraseña fue generada automáticamente por RDS — ningún humano la eligió ni la vio durante el despliegue.
 
 ---
 
 ## Retos
 
-### Reto 1 — Test unitario que verifica que las validaciones rechazan inputs inválidos
+### Reto 1 — Refactorización con `moved {}` — Renombrar sin destruir
 
-**Situación**: El módulo `tagged-bucket` tiene validaciones en `bucket_name` y `environment`. Quieres escribir un test que verifique que Terraform **rechaza** valores inválidos, sin necesidad de conectarse a AWS.
-
-**Tu objetivo**:
-
-1. Crear un nuevo archivo `tests/unit_validations.tftest.hcl`
-2. Usar `mock_provider` para no necesitar AWS
-3. Crear un `run` que pase un `environment` inválido (ej: `"invalid"`) y verificar que Terraform falla con `expect_failures`
-4. Crear otro `run` que pase un `bucket_suffix` que genere un nombre con mayúsculas y verificar que la validación del módulo lo rechaza
-
-**Pistas**:
-- `expect_failures` es una lista de referencias a las variables/recursos que esperas que fallen
-- Para validaciones de variable: `expect_failures = [var.environment]` (a nivel de root module)
-- `command = plan` es suficiente — las validaciones se evalúan antes de contactar con AWS
-- El nombre del bucket se genera en el Root Module como `${project}-${suffix}-${account_id}`, pero la validación está en el módulo
-
-### Reto 2 — Test de integración que verifica el bloqueo de acceso público
-
-**Situación**: El módulo `tagged-bucket` incluye un `aws_s3_bucket_public_access_block`. Quieres verificar con un test de integración que el bucket realmente tiene bloqueado el acceso público en AWS, no solo en el código.
+**Situación**: El equipo de arquitectura ha decidido renombrar el módulo interno `module.vpc` a `module.network` dentro del wrapper para alinearse con la nomenclatura del resto de módulos corporativos. El cambio debe ser transparente: **la VPC existente no se destruye ni se recrea**.
 
 **Tu objetivo**:
 
-1. Añadir un output `public_access_block` al módulo `tagged-bucket` que exponga los 4 atributos del bloqueo de acceso público
-2. Propagar ese output a través del Root Module
-3. Crear un nuevo archivo `tests/integration_security.tftest.hcl`
-4. Usar `command = apply` para crear el bucket real y verificar con `assert` que las cuatro opciones de bloqueo están en `true`
+1. Dentro de `modules/corporate-rds/main.tf`, renombrar `module "vpc"` a `module "network"`
+2. Actualizar todas las referencias: `module.vpc.xxx` → `module.network.xxx`
+3. Añadir un bloque `moved {}` que indique a Terraform que el módulo fue renombrado
+4. Ejecutar `terraform plan` y verificar que muestra **0 cambios** (solo el moved)
 
 **Pistas**:
-- El output puede ser un objeto con los 4 campos: `block_public_acls`, `block_public_policy`, `ignore_public_acls`, `restrict_public_buckets`
-- Accede a los atributos del recurso: `aws_s3_bucket_public_access_block.this.block_public_acls`
-- En el test, referencia con `output.public_access_block["block_public_acls"]`
+- El bloque `moved {}` tiene `from` y `to` con las direcciones completas del recurso
+- Para un módulo: `from = module.vpc` y `to = module.network`
+- `terraform plan` debe mostrar algo como: `module.vpc has moved to module.network`
+- Si ves recursos marcados para destruir y recrear, algo está mal en las referencias
+
+### Reto 2 — Añadir parameter group con estándares de seguridad
+
+**Situación**: El equipo de seguridad requiere que todas las bases de datos MySQL tengan habilitado `require_secure_transport` (forzar conexiones SSL) y `log_bin_trust_function_creators` desactivado. Estos parámetros deben estar hardcoded en el wrapper, igual que el cifrado y la protección contra borrado.
+
+**Tu objetivo**:
+
+1. Crear un `aws_db_parameter_group` dentro del wrapper con los parámetros de seguridad
+2. Pasar el parameter group al módulo RDS usando `parameter_group_name`
+3. Desactivar la creación del parameter group interno del módulo RDS (`create_db_parameter_group = false`)
+4. Verificar con AWS CLI que los parámetros están aplicados
+
+**Pistas**:
+- El `family` del parameter group para MySQL 8.0 es `"mysql8.0"`
+- `require_secure_transport = "1"` fuerza SSL
+- `log_bin_trust_function_creators = "0"` desactiva la creación de funciones inseguras
+- El módulo RDS acepta `parameter_group_name` como input y `create_db_parameter_group = false` para no crear uno interno
+- Después de aplicar, verifica con: `aws rds describe-db-parameters --db-parameter-group-name <name> --query 'Parameters[?ParameterName==\`require_secure_transport\`]'`
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Test unitario que verifica que las validaciones rechazan inputs inválidos</strong></summary>
+<summary><strong>Solución al Reto 1 — Refactorización con `moved {}`</strong></summary>
 
-### Solución al Reto 1 — Test unitario que verifica que las validaciones rechazan inputs inválidos
+### Solución al Reto 1 — Refactorización con `moved {}`
 
-#### Archivo `tests/unit_validations.tftest.hcl`
+#### Paso 1: Renombrar el módulo y añadir `moved {}`
+
+En `modules/corporate-rds/main.tf`:
 
 ```hcl
-mock_provider "aws" {
-  mock_data "aws_caller_identity" {
-    defaults = {
-      account_id = "123456789012"
-      arn        = "arn:aws:iam::123456789012:root"
-      user_id    = "AIDACKCEVSQ6C2EXAMPLE"
-    }
-  }
+# ─── Bloque moved: indica que module.vpc ahora se llama module.network ───
+moved {
+  from = module.vpc
+  to   = module.network
 }
 
-# --- Test 1: Entorno inválido es rechazado ---
+# ─── Módulo renombrado ───
+module "network" {                           # Antes: module "vpc"
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
 
-run "rejects_invalid_environment" {
-  command = plan
-
-  variables {
-    project_name  = "myapp"
-    bucket_suffix = "data"
-    environment   = "invalid"
-  }
-
-  expect_failures = [var.environment]
-}
-
-# --- Test 2: bucket_suffix con mayúsculas es rechazado por el módulo ---
-
-run "rejects_uppercase_bucket_suffix" {
-  command = plan
-
-  variables {
-    project_name  = "myapp"
-    bucket_suffix = "DATA"   # genera "myapp-DATA-123456789012", inválido por la regex
-    environment   = "lab"
-  }
-
-  expect_failures = [module.bucket.var.bucket_name]
-}
-
-# --- Test 3: Entorno válido es aceptado ---
-
-run "accepts_valid_environment" {
-  command = apply
-
-  variables {
-    project_name  = "myapp"
-    bucket_suffix = "data"
-    environment   = "staging"
-  }
-
-  # Sin expect_failures = debe pasar sin errores
-  assert {
-    condition     = output.effective_tags["Environment"] == "staging"
-    error_message = "El entorno staging debe ser aceptado"
-  }
+  name = "${var.project_name}-vpc"
+  cidr = var.vpc_cidr
+  # ... (mismo contenido)
 }
 ```
 
-#### Verificar
+#### Paso 2: Actualizar todas las referencias en `main.tf`
+
+En `modules/corporate-rds/main.tf` hay **4 referencias** a `module.vpc.*` que hay que cambiar a `module.network.*`. Antes de empezar, lista las que tienes para no dejar ninguna olvidada:
 
 ```bash
-terraform test -filter=tests/unit_validations.tftest.hcl
+grep -nE "module\.vpc\." modules/corporate-rds/main.tf
+# 90:  vpc_id      = module.vpc.vpc_id
+# 96:    cidr_blocks = module.vpc.private_subnets_cidr_blocks
+# 164:  db_subnet_group_name   = module.vpc.database_subnet_group_name
+# 166:  subnet_ids             = module.vpc.database_subnets
 ```
 
+**Cambio 1 + 2** — bloque `resource "aws_security_group" "rds"`:
+
+```hcl
+resource "aws_security_group" "rds" {
+  name_prefix = "${var.project_name}-rds-"
+  description = "Acceso a RDS solo desde subredes privadas"
+  vpc_id      = module.network.vpc_id          # ← Cambio 1 (antes: module.vpc.vpc_id)
+
+  ingress {
+    from_port   = var.db_port
+    to_port     = var.db_port
+    protocol    = "tcp"
+    cidr_blocks = module.network.private_subnets_cidr_blocks  # ← Cambio 2
+    description = "Acceso desde subredes privadas"
+  }
+
+  # egress, tags, lifecycle (sin cambios — no usan module.vpc.*)
+}
 ```
-tests/unit_validations.tftest.hcl... in progress
-  run "rejects_invalid_environment"... pass
-  run "rejects_uppercase_bucket_suffix"... pass
-  run "accepts_valid_environment"... pass
-tests/unit_validations.tftest.hcl... tearing down
-tests/unit_validations.tftest.hcl... pass
 
-Success! 3 passed, 0 failed.
+**Cambio 3 + 4** — bloque `module "rds"`:
+
+```hcl
+module "rds" {
+  source  = "terraform-aws-modules/rds/aws"
+  version = "~> 6.0"
+
+  # ... (parámetros del motor, hardcoded de cumplimiento, etc., sin cambios)
+
+  # ─── OUTPUTS ENCADENADOS DEL MÓDULO VPC ───
+  db_subnet_group_name   = module.network.database_subnet_group_name  # ← Cambio 3
+  vpc_security_group_ids = [aws_security_group.rds.id]                # (sin cambios — referencia local)
+  subnet_ids             = module.network.database_subnets            # ← Cambio 4
+
+  # ... (multi_az, skip_final_snapshot, family, etc., sin cambios)
+}
 ```
 
-El test `rejects_invalid_environment` **pasa** porque `expect_failures = [var.environment]` le dice a Terraform: "espero que esta variable falle su validación". Si la validación NO fallara (es decir, si aceptara `"invalid"`), **el test fallaría** — alertándonos de que la validación está rota.
+**Verificación**: tras los 4 cambios, no debería quedar ninguna referencia a `module.vpc.*` en `main.tf`:
 
-#### Reflexión: testear el camino satisfactorio y el fallido
+```bash
+grep -nE "module\.vpc\." modules/corporate-rds/main.tf
+# (sin salida = todas las referencias migradas)
+```
 
-| Tipo de test | Qué verifica | Sin `expect_failures` |
+> **Nota:** las referencias a `aws_security_group.rds.id`, `var.db_*`, `local.*` y `data.aws_availability_zones` **no cambian** — solo se renombra el módulo VPC, no los demás recursos.
+
+#### Paso 3: Actualizar los outputs en `outputs.tf`
+
+En `modules/corporate-rds/outputs.tf` hay **5 referencias** más a `module.vpc.*` que también hay que migrar (los outputs `db_*` apuntan a `module.rds`, no a la VPC, y NO se tocan):
+
+```bash
+grep -nE "module\.vpc\." modules/corporate-rds/outputs.tf
+# 5:  value       = module.vpc.vpc_id
+# 10: value       = module.vpc.vpc_cidr_block
+# 15: value       = module.vpc.private_subnets
+# 20: value       = module.vpc.database_subnets
+# 25: value       = module.vpc.database_subnet_group_name
+```
+
+Cambia cada una a `module.network.*`:
+
+```hcl
+output "vpc_id" {
+  value = module.network.vpc_id            # Antes: module.vpc.vpc_id
+}
+
+output "vpc_cidr" {
+  value = module.network.vpc_cidr_block    # Antes: module.vpc.vpc_cidr_block
+}
+
+output "private_subnet_ids" {
+  value = module.network.private_subnets   # Antes: module.vpc.private_subnets
+}
+
+output "database_subnet_ids" {
+  value = module.network.database_subnets  # Antes: module.vpc.database_subnets
+}
+
+output "database_subnet_group_name" {
+  value = module.network.database_subnet_group_name  # Antes: module.vpc...
+}
+```
+
+**Verificación final** — combinada para `main.tf` + `outputs.tf`:
+
+```bash
+grep -rnE "module\.vpc\." modules/corporate-rds/
+# (sin salida = las 9 referencias totales migradas: 4 en main.tf + 5 en outputs.tf)
+```
+
+#### Paso 4: Re-ejecutar `terraform init`
+
+Al renombrar un módulo que usa `source` del Registry, Terraform **necesita re-registrar el módulo con su nuevo nombre local**: el código fuente descargado del Registry se cachea en `.terraform/modules/<nombre-local>/`, así que el path cambia de `.terraform/modules/vpc/` a `.terraform/modules/network/`. Si saltas este paso, el siguiente `plan` falla inmediatamente con:
+
+```
+Error: Module not installed
+  on modules/corporate-rds/main.tf line N:
+   N: module "network" {
+This module is not yet installed. Run "terraform init" to install all
+modules required by this configuration.
+```
+
+Ejecuta:
+
+```bash
+terraform init \
+  -backend-config=aws.s3.tfbackend \
+  -backend-config="bucket=$BUCKET"
+```
+
+> **`init` es obligatorio aquí.** El cambio que hiciste en Paso 1 (renombrar `module "vpc"` → `module "network"`) toca la **interfaz de carga de módulos**, no solo el código. Sin `init` el plan ni siquiera arranca; con `init` Terraform descarga (o más bien, copia desde la caché) el módulo bajo el nuevo nombre y queda listo para evaluar el `moved {}`.
+
+#### Paso 5: Verificar el `moved {}` con `plan`
+
+Ahora sí, comprueba que el rename se traduce en un `moved` y no en una destrucción:
+
+```bash
+# Tip opcional: -refresh=false acelera el plan saltándose la consulta a
+# AWS para ver si la infraestructura ha cambiado fuera de Terraform.
+# Útil cuando solo quieres validar el rename, no diff con AWS.
+terraform plan -refresh=false
+```
+
+Debe mostrar algo como:
+
+```
+  # module.corporate_rds.module.vpc has moved to module.corporate_rds.module.network
+    resource "aws_vpc" "this" {
+        # (no changes)
+    }
+
+  # module.corporate_rds.module.vpc.aws_subnet.private["..."] has moved to
+  # module.corporate_rds.module.network.aws_subnet.private["..."]
+    resource "aws_subnet" "private" {
+        # (no changes)
+    }
+
+  # ... (más moves sin cambios)
+
+Plan: 0 to add, 0 to change, 0 to destroy.
+```
+
+**Cero destrucciones.** Terraform entiende que los recursos son los mismos, solo con un nombre diferente en el código.
+
+> **⚠️ DETÉNTE antes del apply si ves esto:**
+>
+> ```
+> # module.corporate_rds.module.vpc.aws_vpc.this will be destroyed
+> - resource "aws_vpc" "this" { ... }
+>
+> # module.corporate_rds.module.network.aws_vpc.this will be created
+> + resource "aws_vpc" "this" { ... }
+>
+> Plan: N to add, 0 to change, N to destroy.
+> ```
+>
+> Eso significa que **Terraform no reconoció el rename como un `moved`** y va a destruir y recrear toda la infraestructura (VPC, subnets, NAT GW, RDS — todo). **NO ejecutes `apply`**. Cancela con `Ctrl+C` o responde `no`.
+>
+> Causas posibles, en orden de probabilidad:
+>
+> 1. **Falta el bloque `moved {}`** (Paso 1 incompleto). Verifica que existe en `modules/corporate-rds/main.tf`:
+>
+> 2. **Direcciones del `moved` mal escritas**. Las direcciones son **relativas** al módulo donde está el bloque. Como el `moved {}` vive dentro de `corporate-rds`, debe decir `from = module.vpc` y `to = module.network` — **NO** `module.corporate_rds.module.vpc`. Terraform añade el prefijo `module.corporate_rds.` automáticamente al evaluar.
+>
+> 3. **Falta `terraform init` tras el rename**. El módulo Registry se cachea bajo el nombre local; sin `init` el path nuevo no existe. Repite el `init` (ver inicio de este Paso 4).
+>
+> 4. **Quedan referencias huérfanas a `module.vpc.*`**. Aunque Terraform debería avisar con `Reference to undeclared module`, conviene verificar:
+>
+> Tras corregir lo que aplique, **vuelve a ejecutar `terraform plan`**. Solo cuando veas `has moved to` (no `destroyed`/`created`) está seguro continuar al apply.
+
+#### Paso 6: Aplicar y eliminar el bloque `moved {}` después
+
+Una vez que el `plan` muestra solo `has moved to` sin cambios reales, ejecuta el `apply` para que Terraform **persista las nuevas direcciones en el state**:
+
+```bash
+terraform apply
+# Plan: 0 to add, 0 to change, 0 to destroy.
+# (los "moved" se aplican silenciosamente — solo reorganizan el state)
+```
+
+Tras este `apply`, el state ya tiene los recursos bajo `module.network.*` y **el bloque `moved {}` ha cumplido su función**. Lo correcto es **eliminarlo** del código:
+
+```hcl
+# ELIMINAR de modules/corporate-rds/main.tf:
+# moved {
+#   from = module.vpc
+#   to   = module.network
+# }
+```
+
+**¿Por qué eliminarlo?** Cuatro razones:
+
+1. **Ya es ruido**: el rename está consolidado en el state, así que el bloque ya no hace nada — Terraform lo evalúa pero no produce efecto.
+2. **Confunde al lector**: alguien que abra el código en seis meses verá un `moved {}` apuntando a un `module.vpc` que **no existe** y se preguntará si falta algo o si es código muerto.
+3. **Acumulación**: si dejas todos los `moved {}` históricos en el código, en pocos años tendrás decenas inútiles que ofuscan el `main.tf`.
+4. **Verificable**: tras eliminar el bloque, un `terraform plan` debe seguir mostrando `Plan: 0 to add, 0 to change, 0 to destroy.` — confirma que el `moved` ya cumplió su papel y se puede borrar sin riesgo.
+
+```bash
+# Tras eliminar el moved {} y guardar el archivo:
+terraform plan
+# Plan: 0 to add, 0 to change, 0 to destroy.   ← OK, el state ya estaba migrado
+```
+
+> **Política de equipo recomendada:** mantener el `moved {}` durante **al menos un ciclo de despliegue completo** en todos los entornos (dev → staging → prod) para que cada uno aplique el rename. Una vez el último entorno haya hecho `apply`, abrir un PR de limpieza que elimine el bloque. Documenta la fecha del PR en el commit message para tener trazabilidad.
+
+### Reflexión: ¿cuándo usar `moved {}`?
+
+| Escenario | ¿Usar `moved`? | Alternativa |
 |---|---|---|
-| Camino satisfactorio | Inputs válidos producen outputs correctos | `assert { condition = ... }` |
-| Camino fallido       | Inputs inválidos son rechazados | `expect_failures = [...]` |
+| Renombrar un módulo | Sí | `terraform state mv` (manual, arriesgado) |
+| Renombrar un recurso | Sí | `terraform state mv` |
+| Mover recurso a un módulo hijo | Sí | `terraform state mv` |
+| Cambiar el `source` de un módulo | No (no aplica) | Recrear o importar |
+| Cambiar `for_each` key | Sí (1.7+) | `terraform state mv` por cada recurso |
 
-Ambos son necesarios:
-- Sin tests de camino feliz, no sabes si el módulo funciona
-- Sin tests de camino infeliz, no sabes si las validaciones protegen contra errores
-
----
+`moved {}` es preferible a `terraform state mv` porque:
+1. Es **declarativo** — queda documentado en el código
+2. Es **revisable** — se ve en el PR
+3. Es **reproducible** — funciona en todos los entornos (dev, staging, prod)
+4. Es **seguro** — `terraform plan` muestra el resultado antes de aplicar
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Test de integración que verifica el bloqueo de acceso público</strong></summary>
+<summary><strong>Solución al Reto 2 — Añadir parameter group con estándares de seguridad</strong></summary>
 
-### Solución al Reto 2 — Test de integración que verifica el bloqueo de acceso público
+### Solución al Reto 2 — Añadir parameter group con estándares de seguridad
 
-#### Paso 1: Añadir output al módulo `tagged-bucket`
+#### Paso 1: Parameter group en el wrapper
 
-En `modules/tagged-bucket/outputs.tf` — añadir el bloque sin tocar los outputs existentes:
+En `modules/corporate-rds/main.tf`, añadir antes del módulo RDS:
 
 ```hcl
-output "public_access_block" {
-  description = "Configuración de bloqueo de acceso público"
-  value = {
-    block_public_acls       = aws_s3_bucket_public_access_block.this.block_public_acls
-    block_public_policy     = aws_s3_bucket_public_access_block.this.block_public_policy
-    ignore_public_acls      = aws_s3_bucket_public_access_block.this.ignore_public_acls
-    restrict_public_buckets = aws_s3_bucket_public_access_block.this.restrict_public_buckets
+resource "aws_db_parameter_group" "corporate" {
+  name_prefix = "${var.project_name}-corporate-"
+  family      = "${var.db_engine}${var.db_engine_version}"
+  description = "Parámetros de seguridad corporativos para ${var.db_engine}"
+
+  # ─── PARÁMETROS HARDCODED DE SEGURIDAD ───
+  # Cada parámetro de RDS se clasifica como "dinámico" o "estático" según
+  # si el motor puede aplicarlo en caliente o necesita reinicio:
+  #   - dinámico → apply_method = "immediate" (default), se aplica al instante
+  #   - estático → apply_method = "pending-reboot" obligatorio, se aplica
+  #                en el siguiente reinicio de la BD
+  parameter {
+    # Dinámico — se aplica de inmediato sin reinicio.
+    name  = "require_secure_transport"
+    value = "1"
+  }
+
+  parameter {
+    # Estático — siempre requiere reboot. Si omites apply_method o pones
+    # "immediate", terraform apply falla con un error de RDS API.
+    name         = "log_bin_trust_function_creators"
+    value        = "0"
+    apply_method = "pending-reboot"
+  }
+
+  tags = merge(local.effective_tags, {
+    Name = "${var.project_name}-corporate-pg"
+  })
+
+  lifecycle {
+    create_before_destroy = true
   }
 }
 ```
 
-> **Cambio retro-compatible:** este Paso solo **añade** un output nuevo, no modifica ni elimina los existentes (`bucket_id`, `bucket_arn`, `effective_tags`). Los consumidores del módulo que ya usan los outputs anteriores no se ven afectados, así que se puede mergear sin ciclo de migración.
-
-#### Paso 2: Propagar en el Root Module
-
-En `outputs.tf`:
+#### Paso 2: Pasar al módulo RDS
 
 ```hcl
-output "public_access_block" {
-  description = "Configuración de bloqueo de acceso público"
-  value       = module.bucket.public_access_block
+module "rds" {
+  # ...
+
+  # Parameter group corporativo (en lugar del generado por el módulo)
+  create_db_parameter_group = false
+  parameter_group_name      = aws_db_parameter_group.corporate.name
+
+  # ...
 }
 ```
 
-#### Paso 3: Archivo de test
-
-```hcl
-# tests/integration_security.tftest.hcl
-
-variables {
-  project_name  = "lab25-sectest"
-  bucket_suffix = "security"
-  environment   = "lab"
-}
-
-run "deploy_and_verify_public_access" {
-  command = apply
-
-  assert {
-    condition     = output.bucket_id != ""
-    error_message = "El bucket debe existir"
-  }
-
-  assert {
-    condition     = output.public_access_block["block_public_acls"] == true
-    error_message = "block_public_acls debe estar activado"
-  }
-
-  assert {
-    condition     = output.public_access_block["block_public_policy"] == true
-    error_message = "block_public_policy debe estar activado"
-  }
-
-  assert {
-    condition     = output.public_access_block["ignore_public_acls"] == true
-    error_message = "ignore_public_acls debe estar activado"
-  }
-
-  assert {
-    condition     = output.public_access_block["restrict_public_buckets"] == true
-    error_message = "restrict_public_buckets debe estar activado"
-  }
-}
-```
-
-#### Paso 4: Verificar
+#### Paso 3: Verificar
 
 ```bash
-terraform test -filter=tests/integration_security.tftest.hcl
+terraform apply
+
+# Listar parámetros del parameter group
+PG_NAME=$(aws rds describe-db-instances \
+  --db-instance-identifier lab25-db \
+  --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' \
+  --output text)
+
+aws rds describe-db-parameters \
+  --db-parameter-group-name $PG_NAME \
+  --query 'Parameters[?ParameterName==`require_secure_transport`].{Name: ParameterName, Value: ParameterValue}' \
+  --output table
+# require_secure_transport = 1
+
+aws rds describe-db-parameters \
+  --db-parameter-group-name $PG_NAME \
+  --query 'Parameters[?ParameterName==`log_bin_trust_function_creators`].{Name: ParameterName, Value: ParameterValue}' \
+  --output table
+# log_bin_trust_function_creators = 0
 ```
 
-```
-tests/integration_security.tftest.hcl... in progress
-  run "deploy_and_verify_public_access"... pass
-tests/integration_security.tftest.hcl... tearing down
-tests/integration_security.tftest.hcl... pass
+#### Reflexión: capas de seguridad en el wrapper
 
-Success! 1 passed, 0 failed.
-```
+Después de los dos retos, el wrapper corporativo impone 6 estándares de seguridad:
 
-#### Reflexión: outputs como contrato testeable
+| Capa | Estándar | Mecanismo |
+|---|---|---|
+| Red | Sin acceso público | `publicly_accessible = false` hardcoded |
+| Red | Acceso solo desde subredes privadas | Security group en el wrapper |
+| Almacenamiento | Cifrado en reposo | `storage_encrypted = true` hardcoded |
+| Disponibilidad | Protección contra borrado | `deletion_protection = true` hardcoded |
+| Conexión | SSL obligatorio | Parameter group: `require_secure_transport = 1` |
+| Credenciales | Contraseña auto-gestionada | `manage_master_user_password = true` |
 
-En vez de usar un data source auxiliar para consultar el estado real, exponemos los atributos de seguridad como **outputs del módulo**. Esto tiene ventajas:
-
-- **Sin módulos auxiliares**: todo se verifica en un solo `run`
-- **Contrato explícito**: el output `public_access_block` documenta que el módulo garantiza estas propiedades
-- **Reutilizable**: cualquier consumidor del módulo puede verificar programáticamente que el bloqueo está activo
-- **Funciona con mock**: el output también está disponible en tests unitarios con `mock_provider`
+Ninguno de estos puede ser desactivado por los equipos de producto. Si necesitan una excepción, deben solicitarla al equipo de plataforma, que puede crear una variante del wrapper o añadir un flag controlado.
 
 </details>
-
----
-
-## Resumen de comandos
-
-```bash
-# Ejecutar los tests unitarios (sin AWS)
-cd labs/lab-25/aws
-terraform test -filter=tests/unit_naming.tftest.hcl
-# Esperado: 0 errors, X tests passed
-
-# Ejecutar los tests de idempotencia
-terraform test -filter=tests/idempotency.tftest.hcl
-# Esperado: 0 changes pending tras el apply
-
-# Ejecutar todos los tests de integración
-terraform test
-# Esperado: All tests passed
-
-# Análisis estático con checkov
-checkov -d . --quiet
-
-# Análisis estático con trivy (alternativa, ordena por severidad)
-trivy config modules/tagged-bucket/
-```
 
 ---
 
 ## Limpieza
 
-`terraform test` destruye automáticamente los recursos que crea. **No necesitas hacer limpieza manual** de los tests.
+El wrapper tiene **`deletion_protection = true`** hardcoded ([`modules/corporate-rds/main.tf`](aws/modules/corporate-rds/main.tf), bloque `module "rds"`). Si intentas `terraform destroy` directamente, AWS rechaza la operación con `Cannot delete protected DB instance`. Es **intencional** — borrar una base de datos requiere un paso deliberado, no un `terraform destroy` accidental.
 
-Si desplegaste el Root Module directamente (con `terraform apply`, no con `terraform test`):
+### Paso 1: Desactivar protección temporalmente
+
+Edita `modules/corporate-rds/main.tf` y localiza el bloque `module "rds"`. Cambia la línea:
+
+```hcl
+  deletion_protection = true  # Protección contra borrado accidental
+```
+
+a:
+
+```hcl
+  deletion_protection = false # Temporal: SOLO durante el destroy del lab
+```
+
+Aplica el cambio para que AWS desactive la protección en la instancia RDS existente (este `apply` no destruye nada, solo modifica un atributo de la BD):
+
+```bash
+terraform apply
+# Plan: 0 to add, 1 to change, 0 to destroy.
+#   ~ deletion_protection = true -> false
+```
+
+### Paso 2: Destruir
 
 ```bash
 terraform destroy
 ```
 
-> **Nota:** `terraform test` crea un bucket S3 temporal y lo destruye automáticamente al final de cada archivo de test. **No destruyas el bucket de tfstate del lab-02** (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
+> **Nota:** la destrucción tarda ~5-10 minutos (RDS hace shutdown ordenado).
+
+### Paso 3: Restaurar la protección si vas a redesplegar
+
+Si después de destruir vas a volver a desplegar el lab (o reutilizar el wrapper en otro proyecto), **revierte el cambio** a `deletion_protection = true` en el código. Dejar el wrapper con `false` rompería su contrato corporativo.
+
+> **Nota:** En producción, este paso manual es **intencional** — destruir una base de datos requiere una acción deliberada, no un `terraform destroy` accidental. El laboratorio sí crea recursos propios (VPC, RDS, secret) que se destruyen aquí; no destruyas el bucket de tfstate del lab02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
 ## LocalStack
 
-Los tests unitarios con `mock_provider` **no necesitan LocalStack ni AWS** — funcionan en cualquier entorno.
+RDS **no está disponible** en LocalStack Community Edition. Este laboratorio requiere una cuenta de AWS real.
 
-Para los tests de integración, consulta [localstack/README.md](localstack/README.md).
+Consulta [localstack/README.md](localstack/README.md) para más detalles.
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Tests unitarios con `mock_provider`**: validar la lógica de naming y tagging sin desplegar recursos reales acelera el ciclo de desarrollo y permite ejecutar los tests en cualquier entorno sin credenciales AWS.
-- **Tests de idempotencia**: verificar que un segundo `terraform apply` no produce cambios es la prueba definitiva de que el módulo está correctamente diseñado y no tiene side effects.
-- **Filtrado de tests por archivo**: usar `-filter` permite ejecutar solo los tests relevantes durante el desarrollo sin esperar a que corran todos los tests de integración.
-- **Análisis estático complementario**: `checkov` y `trivy` detectan problemas de seguridad que los tests funcionales no cubren (cifrado, logging, acceso público).
-- **Tests como documentación ejecutable**: los archivos `.tftest.hcl` documentan el comportamiento esperado del módulo de forma verificable, complementando el README.
+- **Módulos wrapper como capa de control corporativo**: el wrapper impone estándares de seguridad (cifrado, deletion protection, backup) que los equipos de desarrollo no pueden desactivar, garantizando cumplimiento sin fricción.
+- **Encadenamiento de outputs entre módulos**: pasar `module.vpc.vpc_id` y `module.vpc.private_subnets` como inputs del módulo RDS demuestra el patrón de composición modular, la base de la reutilización en Terraform.
+- **`moved {}` para refactorizar sin destruir**: los bloques `moved` permiten renombrar recursos o moverlos entre módulos manteniendo el estado intacto. Son preferibles a `terraform state mv` porque el cambio queda documentado en código.
+- **Defaults razonables en el wrapper, obligatorios solo lo crítico**: un wrapper corporativo sirve para **reducir fricción** al consumidor, así que la mayoría de variables (`db_engine`, `db_engine_version`, `db_instance_class`, etc.) tienen defaults sensatos (`mysql 8.0`, `db.t4g.micro`) — el equipo de producto solo decide lo que de verdad varía. Lo único realmente obligatorio (sin `default`) es `project_name`, porque sin nombre no hay aislamiento de recursos. Este patrón es opuesto al de un módulo low-level (donde cada variable suele ser obligatoria para forzar elección consciente): un wrapper opina por defecto y el consumidor solo sobreescribe lo que necesita.
+- **`manage_master_user_password = true`**: delegar la gestión de credenciales a Secrets Manager elimina la necesidad de pasar contraseñas como variables de Terraform, que pueden quedar en el estado en texto claro.
+- **Módulos del Registry versionados con `~>`**: fijar la versión mínima con el operador pessimistic constraint `~>` permite actualizaciones de patch automáticas pero evita cambios de minor o major inesperados.
 
 ---
 
 ## Recursos
 
-- [Terraform: Tests](https://developer.hashicorp.com/terraform/language/tests)
-- [Terraform: Mock Providers](https://developer.hashicorp.com/terraform/language/tests/mocking)
-- [Terraform: `terraform test` command](https://developer.hashicorp.com/terraform/cli/commands/test)
-- [Terraform: Test assertions](https://developer.hashicorp.com/terraform/language/tests#assertions)
-- [checkov: Documentación](https://www.checkov.io/)
-- [Trivy: Documentación](https://trivy.dev/)
-- [HashiCorp Blog: Testing Terraform](https://www.hashicorp.com/blog/testing-hashicorp-terraform)
+- [Terraform: Module Composition](https://developer.hashicorp.com/terraform/language/modules/develop/composition)
+- [Terraform: `moved` blocks](https://developer.hashicorp.com/terraform/language/modules/develop/refactoring)
+- [Terraform Registry: VPC Module](https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/latest)
+- [Terraform Registry: RDS Module](https://registry.terraform.io/modules/terraform-aws-modules/rds/aws/latest)
+- [AWS: RDS Encryption](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.Encryption.html)
+- [AWS: RDS Deletion Protection](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_DeleteInstance.html)
+- [AWS: Managing Master User Password with Secrets Manager](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-secrets-manager.html)
+- [AWS: RDS Parameter Groups](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithParamGroups.html)

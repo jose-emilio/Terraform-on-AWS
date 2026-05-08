@@ -237,9 +237,9 @@ resource "aws_cloudwatch_dashboard" "main" {
           period  = 300
           metrics = [
             ["AWS/EC2", "CPUUtilization", "InstanceId", aws_instance.app.id,
-              { id = "m1", stat = "Average", label = "CPU real (%)", color = "#2196F3" }],
+            { id = "m1", stat = "Average", label = "CPU real (%)", color = "#2196F3" }],
             [{ expression = "ANOMALY_DETECTION_BAND(m1, ${var.anomaly_band_width})",
-               id = "e1", label = "Rango normal (ML)", color = "#95A5A6" }]
+            id = "e1", label = "Rango normal (ML)", color = "#95A5A6" }]
           ]
         }
       },
@@ -251,13 +251,13 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title   = "Errores de aplicacion (log metric filter)"
-          view    = "timeSeries"
-          region  = var.region
-          period  = 60
+          title  = "Errores de aplicacion (log metric filter)"
+          view   = "timeSeries"
+          region = var.region
+          period = 60
           metrics = [
             ["${var.project}/Application", "ErrorCount",
-              { stat = "Sum", label = "Errores/min", color = "#F44336" }]
+            { stat = "Sum", label = "Errores/min", color = "#F44336" }]
           ]
         }
       },
@@ -269,7 +269,7 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 24
         height = 3
         properties = {
-          title  = "Estado de alarmas"
+          title = "Estado de alarmas"
           alarms = [
             aws_cloudwatch_metric_alarm.cpu_anomaly.arn,
             aws_cloudwatch_metric_alarm.status_check.arn,
@@ -286,17 +286,17 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title   = "Health Check de instancia EC2"
-          view    = "timeSeries"
-          region  = var.region
-          period  = 60
+          title  = "Health Check de instancia EC2"
+          view   = "timeSeries"
+          region = var.region
+          period = 60
           metrics = [
             ["AWS/EC2", "StatusCheckFailed", "InstanceId", aws_instance.app.id,
-              { stat = "Maximum", label = "Total", color = "#FF5722" }],
+            { stat = "Maximum", label = "Total", color = "#FF5722" }],
             ["AWS/EC2", "StatusCheckFailed_Instance", "InstanceId", aws_instance.app.id,
-              { stat = "Maximum", label = "Instancia", color = "#FF9800" }],
+            { stat = "Maximum", label = "Instancia", color = "#FF9800" }],
             ["AWS/EC2", "StatusCheckFailed_System", "InstanceId", aws_instance.app.id,
-              { stat = "Maximum", label = "Sistema (hardware AWS)", color = "#FFC107" }]
+            { stat = "Maximum", label = "Sistema (hardware AWS)", color = "#FFC107" }]
           ]
         }
       },
@@ -308,13 +308,13 @@ resource "aws_cloudwatch_dashboard" "main" {
         width  = 12
         height = 6
         properties = {
-          title   = "Eventos entrantes al log group"
-          view    = "timeSeries"
-          region  = var.region
-          period  = 60
+          title  = "Eventos entrantes al log group"
+          view   = "timeSeries"
+          region = var.region
+          period = 60
           metrics = [
             ["AWS/Logs", "IncomingLogEvents", "LogGroupName", aws_cloudwatch_log_group.app.name,
-              { stat = "Sum", label = "Eventos/min", color = "#4CAF50" }]
+            { stat = "Sum", label = "Eventos/min", color = "#4CAF50" }]
           ]
         }
       }

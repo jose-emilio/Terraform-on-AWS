@@ -1,81 +1,171 @@
-# Laboratorio 12 — LocalStack: Gestión de Identidades y Acceso Seguro para EC2
+# Laboratorio 12 — LocalStack: Gestión de Drift y Disaster Recovery
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Entorno local con LocalStack para practicar los recursos IAM del laboratorio
-sin necesidad de una cuenta de AWS.
-
-> Para la guía completa (conceptos, arquitectura, retos y buenas prácticas)
-> consulta el [README principal](../README.md).
-
-## Limitaciones respecto a AWS real
-
-| Aspecto | LocalStack Community |
-|---------|---------------------|
-| Recursos IAM (grupo, usuario, rol, profile) | Soportados |
-| Instancia EC2 | **Omitida** — LocalStack Community no propaga el Instance Profile antes de `RunInstances` (error 404) |
-| Ejecución de `user_data.sh` | **No soportada** |
-| IMDSv2 y credenciales temporales en IMDS | **No disponible** |
-| SSM Session Manager | **No disponible** |
-
-La verificación de credenciales temporales requiere AWS real.
-Este entorno cubre únicamente la creación y validación de los recursos IAM.
+Esta guía adapta el lab12 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia reside en cómo se simula el drift y cómo se accede al bucket S3 de estado.
 
 ## Requisitos previos
 
-- LocalStack CLI instalado y Docker en ejecución.
-- **Terraform >= 1.10**.
-
-## Despliegue
+- LocalStack corriendo: `localstack start -d`
+- lab02/localstack desplegado (crea bucket `terraform-state-labs`)
+- AWS CLI configurado para LocalStack:
 
 ```bash
-# Arrancar LocalStack
-localstack start -d
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+alias awslocal='aws --endpoint-url=http://localhost.localstack.cloud:4566'
+```
 
+## Despliegue inicial
+
+```bash
 cd labs/lab-12/localstack
-terraform init
-terraform plan
+
+terraform init -backend-config=localstack.s3.tfbackend
+
 terraform apply
 ```
 
-## Verificación en LocalStack
-
-### Confirmar recursos IAM creados
-
-```bash
-# Usar el endpoint local de LocalStack
-export AWS_ENDPOINT_URL=http://localhost.localstack.cloud:4566
-
-aws iam get-group --group-name lab12-developers
-aws iam get-user --user-name lab12-dev-01
-aws iam get-role --role-name lab12-ec2-role
-aws iam get-instance-profile --instance-profile-name lab12-ec2-profile
-```
-
-### Verificar la Trust Policy del rol
-
-```bash
-aws iam get-role --role-name lab12-ec2-role \
-  --query 'Role.AssumeRolePolicyDocument' --output json
-```
-
-### Verificar membresía del grupo
-
-```bash
-aws iam list-groups-for-user --user-name lab12-dev-01 \
-  --query 'Groups[].GroupName'
-```
-
-### Ver outputs de Terraform
+Anota los outputs:
 
 ```bash
 terraform output
+# vpc_id           = "vpc-xxxxxxxxx"
+# security_group_id = "sg-xxxxxxxxx"
+```
+
+## Fase 1 — Simulación de Drift con awslocal
+
+En LocalStack no hay consola web, por lo que el drift se simula directamente con la CLI.
+
+### Modificar un tag (cambio legítimo)
+
+```bash
+SG_ID=$(terraform output -raw security_group_id)
+
+awslocal ec2 create-tags \
+  --resources $SG_ID \
+  --tags Key=Environment,Value=production
+```
+
+### Abrir un puerto (cambio accidental)
+
+```bash
+awslocal ec2 authorize-security-group-ingress \
+  --group-id $SG_ID \
+  --protocol tcp \
+  --port 22 \
+  --cidr 0.0.0.0/0
+```
+
+### Detectar el drift
+
+```bash
+terraform plan
+```
+
+El plan muestra **únicamente el cambio del tag**. La regla de ingreso del puerto 22 no aparece porque `aws_security_group` sin bloques `ingress` en el código no gestiona las reglas de ingreso.
+
+## Fase 2 — Reconciliación
+
+### Opción A: Terraform gana (revertir el tag al estado deseado)
+
+```bash
+terraform apply
+```
+
+Terraform revierte el tag `Environment` a `"lab"`. La regla del puerto 22 permanece en AWS (no es gestionada por Terraform). Para eliminarla:
+
+```bash
+awslocal ec2 revoke-security-group-ingress \
+  --group-id $SG_ID \
+  --protocol tcp \
+  --port 22 \
+  --cidr 0.0.0.0/0
+```
+
+### Opción B: La realidad gana (actualizar el código para conservar el tag)
+
+```bash
+# Captura el estado real (tag "production" y regla puerto 22)
+terraform apply -refresh-only
+```
+
+Edita `main.tf` para incorporar el tag actualizado:
+
+```hcl
+tags = {
+  Name        = "app-lab12"
+  Environment = "production"   # ← conservamos el cambio válido
+  ManagedBy   = "terraform"
+}
+```
+
+```bash
+terraform apply
+# No changes. Your infrastructure matches the configuration.
+```
+
+La regla del puerto 22 sigue en AWS. Para eliminarla usa CLI (ver Opción A).
+
+## Fase 3 — Disaster Recovery desde S3
+
+### Listar versiones del estado
+
+```bash
+awslocal s3api list-object-versions \
+  --bucket terraform-state-labs \
+  --prefix lab12/terraform.tfstate \
+  --query 'Versions[*].[VersionId,LastModified]' \
+  --output table
+```
+
+### Simular corrupción del estado
+
+```bash
+# Guardar VersionId de la versión sana
+GOOD_VERSION="<VersionId de la versión anterior>"
+
+# Corromper el estado actual (payload no-JSON para que Terraform falle al cargarlo)
+echo 'CORRUPTED' | awslocal s3 cp - s3://terraform-state-labs/lab12/terraform.tfstate
+```
+
+Verifica que el estado está corrupto:
+
+```bash
+terraform plan
+# ╷
+# │ Error: Unsupported state file format
+# │
+# │ The state file could not be parsed as JSON: syntax error at byte offset 1.
+# ╵
+# ╷
+# │ Error: Unsupported state file format
+# │
+# │ The state file does not have a "version" attribute, which is required to identify the format version.
+# ╵
+```
+
+### Restaurar el estado sano
+
+```bash
+awslocal s3api copy-object \
+  --bucket terraform-state-labs \
+  --copy-source "terraform-state-labs/lab12/terraform.tfstate?versionId=$GOOD_VERSION" \
+  --key lab12/terraform.tfstate
+```
+
+Verifica la restauración:
+
+```bash
+terraform plan
+# No changes. Infrastructure matches configuration.
 ```
 
 ## Limpieza
 
 ```bash
 terraform destroy
-localstack stop   # opcional
 ```

@@ -1,4 +1,4 @@
-# Laboratorio 23 — Diseño de Interfaz Robusta y "Fail-Safe"
+# Laboratorio 23 — Refactorización Avanzada de S3 (De Monolítico a Modular)
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,38 +8,39 @@
 
 ## Visión general
 
-Crear módulos que validen los datos antes de intentar crear infraestructura en AWS. Aplicar cuatro técnicas de diseño defensivo dentro de módulos reutilizables: validación con regex para nombres de bucket, tipos complejos (`object`) para configuración de base de datos, variables sensibles para contraseñas, y postcondiciones que verifican el estado real del recurso creado.
+Transformar un recurso S3 "hardcoded" en un componente flexible y profesional mediante un **módulo reutilizable**. Aplicar buenas prácticas de modularización: tríada estándar (`main.tf`, `variables.tf`, `outputs.tf`), combinación inteligente de etiquetas con `merge()`, protección contra destrucción accidental con `lifecycle`, e invocación múltiple desde el Root Module con diferentes configuraciones.
 
 ## Arquitectura
 
-![Root Module orquesta 3 módulos con tres técnicas distintas de validación: validation, object+sensitive, postcondition](arch/diagrama.svg)
+![Comparación lado a lado: enfoque monolítico (recursos hardcoded) vs módulo s3-bucket reutilizable invocado N veces](arch/diagrama.svg)
 
-Cada módulo encapsula una técnica de validación diferente. El Root Module los orquesta pasando variables y etiquetas comunes:
+El diagrama contrasta los dos enfoques que estudiamos en este lab:
 
-- **`safe-network`** — `lifecycle.postcondition` con regex RFC 1918 sobre `self.cidr_block` (validación **después** del create, sobre el atributo real que devolvió AWS).
-- **`validated-bucket`** — `validation` en la variable `bucket_name` con `can(regex(...))` que exige el prefijo `empresa-` (validación **antes** del plan, sin tocar la API de AWS).
-- **`db-config`** — `variable "db_config"` de tipo `object({})` con `optional(...)` para campos con default + `db_password` marcada como `sensitive` (oculta en logs / plan / apply pero sí en state).
+- **Izquierda (antes):** dos `aws_s3_bucket` declarados inline en el root, con tags inconsistentes (`Env` vs `Environment`), sin `lifecycle.prevent_destroy`, sin `aws_s3_bucket_public_access_block` y sin versionado. Cada bucket nuevo obliga a duplicar y editar el bloque entero.
+- **Derecha (después):** un único módulo `s3-bucket` (tríada `main.tf` + `variables.tf` + `outputs.tf`) con valores por defecto seguros (`enable_versioning = true`, `force_destroy = false`, `prevent_destroy`, public access block). El root invoca el módulo dos veces con parámetros distintos para `logs_bucket` y `data_bucket`. Cambios al módulo se propagan automáticamente a todas las invocaciones.
 
 ## Conceptos clave
 
 | Concepto | Descripción |
 |---|---|
-| **`validation`** | Bloque dentro de una variable que define reglas de validación. Si la condición es `false`, Terraform rechaza el valor **antes** de crear ningún recurso, ahorrando tiempo y evitando estados inconsistentes |
-| **`can()` + `regex()`** | `can()` envuelve una expresión que podría fallar y devuelve `true`/`false`. Combinada con `regex()`, permite validar patrones como prefijos, formatos de nombre, o estructuras de CIDR |
-| **`object({})`** | Tipo compuesto que define una estructura con campos tipados. Permite agrupar configuraciones relacionadas en una sola variable en vez de tener decenas de variables sueltas |
-| **`optional(type, default)`** | Marca un campo de un `object` como opcional con un valor por defecto. Disponible desde Terraform 1.3. Reduce la carga del usuario al invocar el módulo |
-| **`sensitive = true`** | Marca una variable para que su valor no aparezca en la salida de `terraform plan` ni `terraform apply`. El valor **sí** se almacena en el archivo de estado — por eso el estado debe estar cifrado |
-| **`postcondition`** | Bloque dentro de `lifecycle` que valida el estado **después** de crear o actualizar un recurso. Usa `self` para referenciar los atributos reales del recurso. Ideal para validaciones que dependen de datos calculados por AWS |
-| **`precondition`** | Similar a `postcondition`, pero se evalúa **antes** de crear el recurso. Útil para validar relaciones entre variables o datos externos |
+| **Módulo Terraform** | Contenedor reutilizable de recursos. Cualquier directorio con archivos `.tf` es un módulo. El Root Module llama a Child Modules con el bloque `module {}` |
+| **Root Module** | El directorio donde ejecutas `terraform apply`. Orquesta la infraestructura llamando a módulos hijos y pasando variables |
+| **Tríada estándar** | Convención de organizar cada módulo con tres archivos: `main.tf` (recursos), `variables.tf` (entradas) y `outputs.tf` (salidas) |
+| **`merge()`** | Función de Terraform que combina dos o más mapas. Las claves del mapa posterior sobreescriben las del anterior. Ideal para combinar etiquetas globales con específicas |
+| **`locals`** | Bloque que define valores intermedios calculados. Útil para construir mapas de tags, nombres compuestos o valores derivados que se usan en múltiples recursos |
+| **`lifecycle`** | Meta-argumento que controla el comportamiento del ciclo de vida de un recurso. `prevent_destroy = true` impide que `terraform destroy` elimine el recurso |
+| **Bloqueo de acceso público** | `aws_s3_bucket_public_access_block` con las cuatro opciones en `true` garantiza que ningún objeto del bucket sea accesible públicamente, incluso si alguien añade una policy permisiva |
 
-## Comparativa: Donde validar
+## Comparativa: Monolítico vs. Modular
 
-| Mecanismo | Cuándo se evalúa | Tiene acceso a | Caso de uso |
-|---|---|---|---|
-| `validation` en variable | Al asignar el valor | Solo la propia variable | Formato, rango, patrón de un solo campo |
-| `precondition` en recurso | Antes del plan/apply | Variables, data sources, otros recursos | Relaciones entre múltiples valores |
-| `postcondition` en recurso | Después del apply | `self` (atributos reales del recurso) | Verificar lo que AWS realmente asignó |
-| `check` block (Terraform 1.5+) | Después del apply | Todo | Validaciones no bloqueantes (warnings) |
+| Aspecto | Enfoque monolítico | Enfoque modular |
+|---|---|---|
+| Reutilización | Copiar y pegar bloques | Invocar el módulo con `source = "..."` |
+| Consistencia | Fácil divergencia entre recursos | Una sola definición, múltiples instancias |
+| Mantenimiento | Cambiar en N sitios | Cambiar una vez, se propaga |
+| Etiquetado | Tags duplicados o inconsistentes | `merge()` centralizado en el módulo |
+| Protección | Olvidar `lifecycle` en alguna copia | Incluido por defecto en el módulo |
+| Testing | Difícil de probar aislado | Se puede testear el módulo por separado |
 
 ## Requisitos previos
 
@@ -57,299 +58,282 @@ echo "Bucket: $BUCKET"
 
 ```
 lab-23/
-├── README.md                                <- Esta guía
+├── README.md                          <- Esta guía
 ├── arch/
-│   └── diagrama.svg                         <- Diagrama de la arquitectura del lab
+│   └── diagrama.svg                   <- Diagrama de la arquitectura del lab
 ├── aws/
-│   ├── providers.tf                         <- Backend S3 parcial
-│   ├── variables.tf                         <- Variables del Root Module
-│   ├── main.tf                              <- Root Module: invoca 3 módulos
-│   ├── outputs.tf                           <- Outputs delegados a los módulos
-│   ├── aws.s3.tfbackend                     <- Parámetros del backend (sin bucket)
+│   ├── providers.tf                   <- Backend S3 parcial
+│   ├── variables.tf                   <- Variables: región, proyecto, entorno
+│   ├── main.tf                        <- Root Module: invoca s3-bucket 2 veces
+│   ├── outputs.tf                     <- ARN y nombres de ambos buckets
+│   ├── aws.s3.tfbackend               <- Parámetros del backend (sin bucket)
 │   └── modules/
-│       ├── validated-bucket/                <- Módulo S3 con regex en el nombre
-│       │   ├── main.tf
-│       │   ├── variables.tf
-│       │   └── outputs.tf
-│       ├── db-config/                       <- Módulo DB con object, sensitive y SSM
-│       │   ├── main.tf
-│       │   ├── variables.tf
-│       │   └── outputs.tf
-│       └── safe-network/                    <- Módulo VPC con postcondition RFC 1918
-│           ├── main.tf
-│           ├── variables.tf
-│           └── outputs.tf
+│       └── s3-bucket/
+│           ├── main.tf                <- Bucket + versionado + bloqueo público + lifecycle
+│           ├── variables.tf           <- Entradas: nombre, versionado, tags, force_destroy
+│           └── outputs.tf             <- Salidas: id, arn, domain_name
 └── localstack/
-    ├── README.md                            <- Guía específica para LocalStack
+    ├── README.md                      <- Guía específica para LocalStack
     ├── providers.tf
     ├── variables.tf
-    ├── main.tf                              <- Root Module adaptado
+    ├── main.tf                        <- Root Module adaptado a LocalStack
     ├── outputs.tf
-    ├── localstack.s3.tfbackend
-    └── modules/                             <- Mismos módulos adaptados
-        ├── validated-bucket/
-        ├── db-config/
-        └── safe-network/
+    ├── localstack.s3.tfbackend        <- Backend completo para LocalStack
+    └── modules/
+        └── s3-bucket/
+            ├── main.tf               <- Módulo sin prevent_destroy ni public_access_block
+            ├── variables.tf
+            └── outputs.tf
 ```
 
 ## Análisis del código
 
-### Módulo `validated-bucket` — Regex en la interfaz del módulo
+### El problema: enfoque monolítico
+
+Antes de modularizar, el código típico para crear dos buckets S3 se ve así:
 
 ```hcl
-# modules/validated-bucket/variables.tf
+# ❌ Enfoque monolítico — código duplicado, tags inconsistentes, sin protección
 
+resource "aws_s3_bucket" "logs" {
+  bucket = "mi-proyecto-logs-123456789012"
+  tags = {
+    Name        = "mi-proyecto-logs"
+    Environment = "lab"
+    Project     = "mi-proyecto"
+  }
+}
+
+resource "aws_s3_bucket" "data" {
+  bucket = "mi-proyecto-data-123456789012"
+  tags = {
+    Name        = "mi-proyecto-data"
+    Env         = "lab"          # <-- inconsistencia: "Env" vs "Environment"
+    Project     = "mi-proyecto"
+    # Falta ManagedBy = "terraform"
+  }
+}
+```
+
+Problemas evidentes:
+- **Tags inconsistentes**: un bucket usa `Environment`, otro `Env`
+- **Sin protección**: ningún `lifecycle` previene la destrucción accidental del bucket de datos críticos
+- **Sin bloqueo público**: el bucket queda expuesto si alguien añade una policy permisiva
+- **Sin versionado**: no hay forma de recuperar objetos eliminados accidentalmente
+- **Copia-pega**: cada nuevo bucket requiere duplicar y adaptar todo el bloque
+
+### La solución: módulo `s3-bucket`
+
+#### Estructura del módulo
+
+```
+modules/s3-bucket/
+├── main.tf         <- Recursos: bucket, versionado, bloqueo público, lifecycle
+├── variables.tf    <- Entradas: bucket_name, enable_versioning, tags, force_destroy
+└── outputs.tf      <- Salidas: bucket_id, bucket_arn, bucket_domain_name
+```
+
+#### Variables del módulo (`variables.tf`)
+
+```hcl
 variable "bucket_name" {
   type        = string
-  description = "Nombre del bucket S3. Debe comenzar con el prefijo corporativo 'empresa-'"
+  description = "Nombre del bucket S3. Debe ser globalmente único"
+}
 
-  validation {
-    condition     = can(regex("^empresa-[a-z0-9][a-z0-9.-]{1,53}[a-z0-9]$", var.bucket_name))
-    error_message = "El nombre del bucket debe comenzar con 'empresa-', contener solo minúsculas, números, puntos y guiones, y tener entre 11 y 63 caracteres en total."
-  }
+variable "enable_versioning" {
+  type        = bool
+  description = "Habilitar versionado en el bucket"
+  default     = true
+}
+
+variable "force_destroy" {
+  type        = bool
+  description = "Permitir destruir el bucket aunque contenga objetos"
+  default     = false
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "Etiquetas adicionales que se combinan con las etiquetas por defecto del módulo"
+  default     = {}
 }
 ```
 
-Desglose de la regex `^empresa-[a-z0-9][a-z0-9.-]{1,53}[a-z0-9]$`:
+Puntos clave:
+- `bucket_name` no tiene `default` → es **obligatorio** al invocar el módulo
+- `enable_versioning` tiene `default = true` → activo por defecto (buena práctica)
+- `force_destroy` tiene `default = false` → protección por defecto contra eliminación de objetos
+- `tags` es un mapa abierto → el Root Module puede pasar cualquier etiqueta
 
-| Parte | Caracteres | Significado |
-|---|---:|---|
-| `^empresa-` | 8 | Debe empezar con el prefijo corporativo `empresa-` |
-| `[a-z0-9]` | 1 | Primer carácter del sufijo: letra minúscula o número (no punto ni guión al inicio) |
-| `[a-z0-9.-]{1,53}` | 1–53 | Cuerpo: letras, números, puntos o guiones |
-| `[a-z0-9]$` | 1 | Último carácter: letra minúscula o número (no punto ni guión al final) |
-| **Total** | **11–63** | Ajustado al límite de naming de S3 (3–63 chars). |
-
-La función `can()` envuelve `regex()` para que devuelva `true`/`false` en vez de lanzar un error si la regex no coincide. Sin `can()`, una regex que no coincide haría fallar Terraform con un error críptico en lugar del `error_message` personalizado.
-
-**¿Qué pasa si el nombre es inválido?**
-
-```bash
-terraform apply -var='bucket_name=MiBucket' -var='db_password=MiPassword123Seguro'
-# Error: Invalid value for variable
-#   El nombre del bucket debe comenzar con 'empresa-', contener solo
-#   minúsculas, números, puntos y guiones, y tener entre 11 y 63 caracteres
-#   en total.
-```
-
-Terraform rechaza el valor **antes** de contactar con AWS. No se crea ningún recurso, no se gasta dinero, no hay estado inconsistente.
-
-La validación está **dentro del módulo**, no en el Root Module. Esto significa que cualquier equipo que reutilice `validated-bucket` obtendrá la validación gratis, sin necesidad de recordar añadirla.
-
-### Módulo `db-config` — Tipos complejos y secretos
-
-#### Variable `object` con campos opcionales
+#### Lógica de tags con `merge()` (`main.tf`)
 
 ```hcl
-# modules/db-config/variables.tf
+locals {
+  default_tags = {
+    ManagedBy = "terraform"
+    Module    = "s3-bucket"
+  }
 
-variable "db_config" {
-  type = object({
-    engine            = string
-    engine_version    = string
-    instance_class    = string
-    allocated_storage = number
-    port              = optional(number, 3306)
-    multi_az          = optional(bool, false)
-    backup_retention_days = optional(number, 7)
+  effective_tags = merge(local.default_tags, var.tags)
+}
+```
+
+La función `merge()` opera en cascada:
+
+```
+default_tags:     { ManagedBy = "terraform", Module = "s3-bucket" }
+      +
+var.tags:         { Environment = "lab", Project = "lab23", Purpose = "logs" }
+      =
+effective_tags:   { ManagedBy = "terraform", Module = "s3-bucket",
+                    Environment = "lab", Project = "lab23", Purpose = "logs" }
+```
+
+Si `var.tags` contiene una clave que ya existe en `default_tags`, el valor de `var.tags` gana (el mapa posterior tiene prioridad). Esto permite que el Root Module sobreescriba valores por defecto cuando sea necesario.
+
+Luego, al crear el bucket, se aplica un segundo `merge()` para añadir el tag `Name`:
+
+```hcl
+resource "aws_s3_bucket" "this" {
+  bucket        = var.bucket_name
+  force_destroy = var.force_destroy
+
+  tags = merge(local.effective_tags, {
+    Name = var.bucket_name
   })
-  ...
-}
-```
-
-| Campo | Tipo | ¿Obligatorio? | Default |
-|---|---|---|---|
-| `engine` | `string` | Sí | — |
-| `engine_version` | `string` | Sí | — |
-| `instance_class` | `string` | Sí | — |
-| `allocated_storage` | `number` | Sí | — |
-| `port` | `number` | No | `3306` |
-| `multi_az` | `bool` | No | `false` |
-| `backup_retention_days` | `number` | No | `7` |
-
-`optional(number, 3306)` significa: "si el usuario no proporciona este campo, usa `3306`". El Root Module solo necesita especificar lo esencial:
-
-```hcl
-# Mínimo requerido (los opcionales usan sus defaults)
-db_config = {
-  engine            = "mysql"
-  engine_version    = "8.0"
-  instance_class    = "db.t4g.micro"
-  allocated_storage = 20
-}
-```
-
-**Validaciones múltiples en la misma variable:**
-
-```hcl
-validation {
-  condition     = contains(["mysql", "postgres", "mariadb"], var.db_config.engine)
-  error_message = "El motor de base de datos debe ser uno de: mysql, postgres, mariadb."
-}
-
-validation {
-  condition     = var.db_config.allocated_storage >= 20 && var.db_config.allocated_storage <= 1000
-  error_message = "El almacenamiento debe estar entre 20 y 1000 GB."
-}
-```
-
-Terraform evalúa todos los bloques `validation` y reporta **todos** los errores a la vez, no solo el primero.
-
-#### Variable sensible — `db_password`
-
-```hcl
-variable "db_password" {
-  type        = string
-  sensitive   = true
-
-  validation {
-    condition     = length(var.db_password) >= 12
-    error_message = "La contraseña debe tener al menos 12 caracteres."
-  }
-
-  validation {
-    condition     = can(regex("[A-Z]", var.db_password))
-    error_message = "La contraseña debe contener al menos una letra mayúscula (A-Z)."
-  }
-
-  validation {
-    condition     = can(regex("[a-z]", var.db_password))
-    error_message = "La contraseña debe contener al menos una letra minúscula (a-z)."
-  }
-
-  validation {
-    condition     = can(regex("[0-9]", var.db_password))
-    error_message = "La contraseña debe contener al menos un dígito (0-9)."
-  }
-}
-```
-
-> **Por qué cuatro `validation` separadas y no una compuesta:** Terraform evalúa **todos** los bloques `validation` y reporta cada error que falla. Si fusionáramos las cuatro reglas en una sola condición (`length(...) >= 12 && can(regex(...))[A-Z] && ...`), un fallo solo daría un mensaje genérico ("la contraseña no cumple los requisitos") y el alumno tendría que adivinar **qué** falta. Con bloques separados, el output dice exactamente "falta una letra mayúscula" o "es demasiado corta" — y si fallan varias reglas a la vez, las muestra todas.
-
-**¿Qué hace `sensitive = true`?**
-
-| Aspecto | Sin `sensitive` | Con `sensitive = true` |
-|---|---|---|
-| `terraform plan` | Muestra el valor en texto plano | Muestra `(sensitive value)` |
-| `terraform apply` | Muestra el valor en texto plano | Muestra `(sensitive value)` |
-| `terraform output` | Muestra el valor | Error: requiere `-json` o `-raw` |
-| Archivo de estado | Texto plano | **Texto plano (idéntico — `sensitive` NO cifra)** |
-| Logs de CI/CD | Visible | Oculto |
-
-> **Advertencia crítica:** `sensitive = true` oculta el valor de la **interfaz**, pero **no lo cifra** en el archivo de estado (`terraform.tfstate`). Por eso el backend S3 debe tener `encrypt = true` y el acceso al bucket debe estar restringido con IAM.
-
-El módulo almacena la contraseña en AWS Secrets Manager:
-
-```hcl
-resource "aws_secretsmanager_secret_version" "db_password" {
-  secret_id     = aws_secretsmanager_secret.db_password.id
-  secret_string = var.db_password
-}
-```
-
-Y la configuración se desestructura en SSM Parameter Store:
-
-```hcl
-resource "aws_ssm_parameter" "db_engine" {
-  name  = "/${var.project_name}/db/engine"
-  value = var.db_config.engine      # Accede al campo 'engine' del objeto
-}
-
-resource "aws_ssm_parameter" "db_config_json" {
-  name  = "/${var.project_name}/db/config"
-  value = jsonencode(var.db_config)  # Serializa el objeto completo a JSON
-}
-```
-
-### Módulo `safe-network` — Postcondición RFC 1918
-
-```hcl
-# modules/safe-network/main.tf
-
-resource "aws_vpc" "this" {
-  cidr_block = var.vpc_cidr
-  ...
 
   lifecycle {
-    postcondition {
-      condition = anytrue([
-        can(regex("^10\\.", self.cidr_block)),
-        can(regex("^172\\.(1[6-9]|2[0-9]|3[01])\\.", self.cidr_block)),
-        can(regex("^192\\.168\\.", self.cidr_block)),
-      ])
-      error_message = "El CIDR ${self.cidr_block} no es un rango privado RFC 1918."
-    }
+    prevent_destroy = true
   }
 }
 ```
 
-**¿Por qué postcondition y no validation?**
-
-- `validation` solo accede a la propia variable → podría validar `var.vpc_cidr`
-- `postcondition` accede a `self` → valida el CIDR **real** que AWS asignó al recurso
-
-En este caso, el CIDR proviene directamente de la variable, pero en escenarios reales AWS podría modificar o normalizar valores. La postcondición garantiza que el **resultado real** cumple los requisitos, no solo la intención.
-
-**Rangos RFC 1918 (IPs privadas):**
-
-| Rango | CIDR | Regex |
-|---|---|---|
-| Clase A | `10.0.0.0/8` | `^10\\.` |
-| Clase B | `172.16.0.0/12` | `^172\.(1[6-9]\|2[0-9]\|3[01])\.` |
-| Clase C | `192.168.0.0/16` | `^192\.168\.` |
-
-`anytrue()` devuelve `true` si **cualquiera** de las regex coincide. Si el CIDR es `52.0.0.0/16` (IP pública), ninguna regex coincide y la postcondición falla:
-
-```
-Error: Resource postcondition failed
-  on modules/safe-network/main.tf line XX:
-  El CIDR 52.0.0.0/16 no es un rango privado RFC 1918.
-```
-
-### Root Module — Orquestación de módulos
+#### Control de destrucción: `lifecycle`
 
 ```hcl
-# main.tf (Root Module)
+lifecycle {
+  prevent_destroy = true
+}
+```
 
+Con `prevent_destroy = true`, Terraform **rechaza** cualquier plan que intente destruir el bucket:
+
+```
+Error: Instance cannot be destroyed
+  on modules/s3-bucket/main.tf line XX:
+  Resource module.data_bucket.aws_s3_bucket.this has lifecycle.prevent_destroy
+  set, but the plan calls for this resource to be destroyed.
+```
+
+Esto protege buckets de datos críticos contra:
+- Un `terraform destroy` accidental
+- Eliminar el bloque `module` del código sin pensar en las consecuencias
+- Cambiar un parámetro que fuerza la recreación del recurso (como el nombre del bucket)
+
+> **Importante:** `prevent_destroy` no acepta variables — debe ser un literal `true` o `false`. Esta es una limitación intencional de Terraform para evitar que la protección dependa de un valor dinámico que podría cambiar.
+
+#### Bloqueo de acceso público
+
+```hcl
+resource "aws_s3_bucket_public_access_block" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+
+Las cuatro opciones en `true` crean una defensa en profundidad:
+
+| Opción | Protege contra |
+|---|---|
+| `block_public_acls` | Subir objetos con ACL pública |
+| `block_public_policy` | Aplicar bucket policies que concedan acceso público |
+| `ignore_public_acls` | ACLs públicas existentes (las ignora) |
+| `restrict_public_buckets` | Acceso público a través de cross-account policies |
+
+### Root Module — Invocación múltiple
+
+```hcl
 locals {
+  account_id = data.aws_caller_identity.current.account_id
+
   common_tags = {
     Environment = var.environment
     ManagedBy   = "terraform"
     Project     = var.project_name
   }
 }
+```
 
-module "network" {
-  source       = "./modules/safe-network"
-  vpc_cidr     = var.vpc_cidr
-  project_name = var.project_name
-  environment  = var.environment
-  tags         = local.common_tags
-}
+El Root Module define `common_tags` que se pasan a ambos módulos. Cada invocación añade tags específicas:
 
-module "corporate_bucket" {
-  source        = "./modules/validated-bucket"
-  bucket_name   = var.bucket_name
-  force_destroy = true
+```hcl
+# Bucket de logs: sin versionado, destruible
+module "logs_bucket" {
+  source = "./modules/s3-bucket"
+
+  bucket_name       = "${var.project_name}-logs-${local.account_id}"
+  enable_versioning = false
+  force_destroy     = true
+
   tags = merge(local.common_tags, {
-    Purpose = "corporate-data"
+    Purpose            = "logs"
+    DataClassification = "internal"
   })
 }
 
-module "database" {
-  source       = "./modules/db-config"
-  project_name = var.project_name
-  db_config    = var.db_config
-  db_password  = var.db_password
-  tags         = local.common_tags
+# Bucket de datos: con versionado, NO destruible
+module "data_bucket" {
+  source = "./modules/s3-bucket"
+
+  bucket_name       = "${var.project_name}-data-${local.account_id}"
+  enable_versioning = true
+  force_destroy     = false
+
+  tags = merge(local.common_tags, {
+    Purpose            = "data"
+    DataClassification = "confidential"
+  })
 }
 ```
 
-El Root Module es limpio y declarativo: define **qué** quiere (una red segura, un bucket validado, una configuración de DB) y delega el **cómo** a cada módulo. Las validaciones están encapsuladas — el Root Module no necesita saber los detalles de la regex o la postcondición.
+La cascada completa de tags para el bucket de datos:
+
+```
+Módulo default_tags:   { ManagedBy = "terraform", Module = "s3-bucket" }
+      +
+Root common_tags:      { Environment = "lab", ManagedBy = "terraform", Project = "lab23" }
+  + específicas:       { Purpose = "data", DataClassification = "confidential" }
+      +
+Bucket Name:           { Name = "lab23-data-123456789012" }
+      =
+Tags finales:          { ManagedBy = "terraform", Module = "s3-bucket",
+                         Environment = "lab", Project = "lab23",
+                         Purpose = "data", DataClassification = "confidential",
+                         Name = "lab23-data-123456789012" }
+```
+
+Nota que `ManagedBy` aparece en `default_tags` y en `common_tags` con el mismo valor. Si tuvieran valores diferentes, el de `common_tags` ganaría (último merge tiene prioridad).
+
+### Diferencias entre ambas instancias
+
+| Parámetro | `logs_bucket` | `data_bucket` |
+|---|---|---|
+| Versionado | Desactivado | Activado |
+| `force_destroy` | `true` (se puede vaciar y destruir) | `false` (protegido) |
+| `Purpose` | `logs` | `data` |
+| `DataClassification` | `internal` | `confidential` |
+| Caso de uso | Logs temporales, rotables | Datos críticos del negocio |
+
+Ambos buckets comparten: bloqueo de acceso público, tags de proyecto, y protección `prevent_destroy`.
 
 ---
 
-## Despliegue
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-23/aws
@@ -357,367 +341,360 @@ cd labs/lab-23/aws
 terraform init \
   -backend-config=aws.s3.tfbackend \
   -backend-config="bucket=$BUCKET"
+
+terraform apply
 ```
 
-El `apply` requiere dos valores sin default: `bucket_name` y `db_password`:
+Terraform creará **6 recursos** en la versión `aws/`:
+- 2 × `aws_s3_bucket` (logs y data)
+- 2 × `aws_s3_bucket_versioning` (uno Enabled, otro Suspended)
+- 2 × `aws_s3_bucket_public_access_block`
 
-```bash
-terraform apply \
-  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro'
-```
-
-> **Importante — el prefijo `empresa-`:** el módulo `validated-bucket` exige que el nombre empiece por `empresa-` (sección 1.2). Si lo pasas sin el prefijo (`lab23-data-${ACCOUNT_ID}`), Terraform aborta el `apply` antes de crear nada con `Error: Invalid value for variable`. Ese fallo es la prueba operativa de que la validación funciona — pero para el despliegue del lab base usa el nombre con prefijo como se muestra arriba.
-
-Terraform creará **12 recursos** en la versión `aws/`: 1 VPC, 2 subredes privadas, 1 bucket S3 + 1 bloqueo público, 1 `aws_secretsmanager_secret` + 1 `aws_secretsmanager_secret_version`, y 5 `aws_ssm_parameter` (engine, engine-version, instance-class, port y un JSON con toda la config).
-
-> **Nota — versión LocalStack:** sustituye Secrets Manager por un `aws_ssm_parameter` SecureString adicional, así que crea **11 recursos** (1 SSM password + 5 SSM config = 6 SSM en total, más VPC, subnets, bucket y public_access_block).
+> **Nota — versión LocalStack:** el módulo de LocalStack omite `aws_s3_bucket_public_access_block` (LocalStack Community no emula esa API completamente), así que `terraform apply` en `localstack/` crea **4 recursos** (2 buckets + 2 versionings). El resto del comportamiento es idéntico.
 
 ```bash
 terraform output
-# vpc_id            = "vpc-0abc..."
-# vpc_cidr          = "10.19.0.0/16"
-# private_subnet_ids = ["subnet-...", "subnet-..."]
-# bucket_id         = "empresa-lab23-data-123456789012"
-# bucket_arn        = "arn:aws:s3:::empresa-lab23-data-123456789012"
-# db_config_summary = {
-#   engine         = "mysql"
-#   engine_version = "8.0"
-#   instance_class = "db.t4g.micro"
-#   port           = 3306
-#   multi_az       = false
-#   storage_gb     = 20
-#   backup_days    = 7
-# }
-# secret_arn        = "arn:aws:secretsmanager:us-east-1:...:secret:lab23/db-password-AbCdEf"
-# ssm_prefix        = "/lab23/db/"
+# logs_bucket_id           = "lab23-logs-123456789012"
+# logs_bucket_arn          = "arn:aws:s3:::lab23-logs-123456789012"
+# logs_bucket_domain_name  = "lab23-logs-123456789012.s3.amazonaws.com"
+# data_bucket_id           = "lab23-data-123456789012"
+# data_bucket_arn          = "arn:aws:s3:::lab23-data-123456789012"
+# data_bucket_domain_name  = "lab23-data-123456789012.s3.amazonaws.com"
 ```
-
-Nota que la contraseña **no aparece** en los outputs gracias a `sensitive = true`.
 
 ---
 
 ## Verificación final
 
-### Probar que las validaciones rechazan valores inválidos
+### Verificar los buckets creados
 
 ```bash
-# Bucket sin prefijo corporativo → debe fallar
-terraform plan -var="bucket_name=mi-bucket" -var='db_password=MiPassword123Seguro'
-# Error: Invalid value for variable
-#   El nombre del bucket debe comenzar con 'empresa-'...
+LOGS_BUCKET=$(terraform output -raw logs_bucket_id)
+DATA_BUCKET=$(terraform output -raw data_bucket_id)
 
-# Motor de DB inválido → debe fallar
-terraform plan \
-  -var="bucket_name=empresa-test-bucket" \
-  -var='db_password=MiPassword123Seguro' \
-  -var='db_config={"engine":"oracle","engine_version":"19c","instance_class":"db.m5.large","allocated_storage":50}'
-# Error: Invalid value for variable
-#   El motor de base de datos debe ser uno de: mysql, postgres, mariadb.
-
-# Contraseña corta → falla la validación de longitud
-terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=corta'
-# Error: Invalid value for variable
-#   La contraseña debe tener al menos 12 caracteres.
-
-# Contraseña suficientemente larga y con dígito pero sin mayúsculas → falla
-# solo la regla de mayúscula:
-terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=todoenlowercase123'
-# Error: Invalid value for variable
-#   La contraseña debe contener al menos una letra mayúscula (A-Z).
-
-# Contraseña sin dígitos → falla solo la regla del dígito
-terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=PasswordSinNumeros'
-# Error: Invalid value for variable
-#   La contraseña debe contener al menos un dígito (0-9).
+# Listar ambos buckets
+aws s3 ls | grep lab23
+# 2026-xx-xx lab23-logs-123456789012
+# 2026-xx-xx lab23-data-123456789012
 ```
 
-Las cuatro reglas (`length`, mayúscula, minúscula, dígito) están en `validation` blocks separados — Terraform reporta **cada** una que falle, así que el alumno ve exactamente qué corregir en lugar de un mensaje genérico.
-
-### Verificar el bucket S3
+### Verificar etiquetas
 
 ```bash
-BUCKET_NAME=$(terraform output -raw bucket_id)
-
-aws s3api head-bucket --bucket $BUCKET_NAME
-# (sin error = el bucket existe)
-
-aws s3api get-bucket-tagging --bucket $BUCKET_NAME \
-  --query 'TagSet[].{Key: Key, Value: Value}' --output table
-```
-
-### Verificar la configuración en SSM
-
-```bash
-SSM_PREFIX=$(terraform output -raw ssm_prefix)
-
-aws ssm get-parameters-by-path \
-  --path "$SSM_PREFIX" \
-  --query 'Parameters[].{Name: Name, Value: Value}' \
+# Tags del bucket de logs
+aws s3api get-bucket-tagging \
+  --bucket $LOGS_BUCKET \
+  --query 'TagSet[].{Key: Key, Value: Value}' \
   --output table
 ```
 
-Debe mostrar los parámetros individuales: engine, engine-version, instance-class, port, y el JSON completo de config.
-
-### Verificar el secreto (sin exponer la contraseña)
+Debe mostrar las etiquetas combinadas: `ManagedBy=terraform`, `Module=s3-bucket`, `Environment=lab`, `Project=lab23`, `Purpose=logs`, `DataClassification=internal`, `Name=lab23-logs-...`.
 
 ```bash
-SECRET_ARN=$(terraform output -raw secret_arn)
-
-# Ver metadatos del secreto (sin el valor)
-aws secretsmanager describe-secret \
-  --secret-id $SECRET_ARN \
-  --query '{Name: Name, Description: Description}' \
-  --output json
-
-# Recuperar el valor (solo si necesitas verificar)
-aws secretsmanager get-secret-value \
-  --secret-id $SECRET_ARN \
-  --query 'SecretString' \
-  --output text
+# Tags del bucket de datos
+aws s3api get-bucket-tagging \
+  --bucket $DATA_BUCKET \
+  --query 'TagSet[].{Key: Key, Value: Value}' \
+  --output table
 ```
 
-### Probar la postcondición RFC 1918
+Debe mostrar `Purpose=data` y `DataClassification=confidential` en lugar de los valores del bucket de logs.
+
+### Verificar versionado
 
 ```bash
-# CIDR público → la postcondición debe fallar
-terraform plan \
-  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro' \
-  -var="vpc_cidr=52.0.0.0/16"
+# Logs: versionado desactivado
+aws s3api get-bucket-versioning --bucket $LOGS_BUCKET
+# { "Status": "Suspended" }
+
+# Data: versionado activado
+aws s3api get-bucket-versioning --bucket $DATA_BUCKET
+# { "Status": "Enabled" }
 ```
 
-> **Nota técnica — cuándo se evalúa una `postcondition`:** las postcondiciones se evalúan **después** de crear o actualizar el recurso (durante el apply). Sin embargo, desde Terraform 1.4+ el motor también las evalúa **al final del plan** cuando todos los valores referenciados (`self.*`) son ya conocidos en ese momento — es lo que ocurre aquí, porque `self.cidr_block` viene literalmente de la variable y no requiere creación previa para conocerse. Por eso este caso falla durante el `plan` y no llega al `apply`. En escenarios donde los atributos son **computados por AWS** (por ejemplo, `self.id` de un recurso recién creado), la postcondición solo puede evaluarse durante el `apply`, después de que AWS responda con el valor real.
+### Verificar bloqueo de acceso público
+
+```bash
+aws s3api get-public-access-block --bucket $DATA_BUCKET \
+  --query 'PublicAccessBlockConfiguration'
+# {
+#   "BlockPublicAcls": true,
+#   "IgnorePublicAcls": true,
+#   "BlockPublicPolicy": true,
+#   "RestrictPublicBuckets": true
+# }
+```
+
+### Verificar protección contra destrucción
+
+```bash
+# Intentar destruir — debe fallar por prevent_destroy
+terraform destroy
+# Error: Instance cannot be destroyed
+```
+
+Terraform se negará a destruir los buckets porque el módulo tiene `prevent_destroy = true`. Este es el comportamiento esperado.
 
 ---
 
 ## Retos
 
-### Reto 1 — Precondición que valide el puerto según el motor
+### Reto 1 — Añadir regla de ciclo de vida para expiración de logs
 
-**Situación**: El equipo de DBA ha reportado errores de conexión porque los desarrolladores configuran motores de base de datos con puertos incorrectos (por ejemplo, MySQL en el puerto 5432 de PostgreSQL). Quieren que el módulo `db-config` rechace configuraciones donde el puerto no coincida con el motor.
-
-**Tu objetivo**:
-
-1. Añadir una `precondition` en el recurso `aws_ssm_parameter.db_port` del módulo `db-config` que valide la coherencia entre `var.db_config.engine` y `var.db_config.port`
-2. Las reglas son:
-   - `mysql` o `mariadb` → puerto debe ser `3306`
-   - `postgres` → puerto debe ser `5432`
-3. Probar con una configuración incoherente (MySQL en puerto 5432) y verificar que Terraform la rechaza
-4. Probar con una configuración correcta (PostgreSQL en puerto 5432) y verificar que se acepta
-
-**Pistas**:
-- `precondition` va dentro del bloque `lifecycle {}` del recurso
-- Puedes usar una expresión condicional: `var.db_config.engine == "postgres" ? 5432 : 3306`
-- El `error_message` puede interpolar variables para ser más descriptivo
-- Recuerda que `precondition` se evalúa **antes** de crear/actualizar el recurso
-
-### Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados
-
-**Situación**: El equipo de plataforma quiere crear varios buckets corporativos de una sola vez usando el módulo `validated-bucket`, cada uno con su propia configuración. En lugar de duplicar bloques `module`, quieren definir todos los buckets en una sola variable de tipo `map(object)` y usar `for_each` sobre el módulo.
+**Situación**: El equipo de operaciones quiere que los objetos del bucket de logs se eliminen automáticamente después de 90 días para reducir costes de almacenamiento. El bucket de datos debe retener los objetos indefinidamente.
 
 **Tu objetivo**:
 
-1. Añadir una variable `extra_buckets` de tipo `map(object({...}))` en el Root Module con campos: `purpose` (string) y `force_destroy` (optional, bool, default true)
-2. Añadir una `validation` que verifique que **todas** las claves del mapa comienzan con el prefijo `empresa-` (ya que serán los nombres de los buckets)
-3. Invocar el módulo `validated-bucket` con `for_each` sobre la variable, pasando cada clave como `bucket_name`
-4. Probar con un mapa de 2 buckets: `empresa-logs-<ACCOUNT_ID>` y `empresa-backups-<ACCOUNT_ID>`
+1. Añadir una variable `expiration_days` al módulo `s3-bucket` con valor por defecto `0` (desactivado)
+2. Crear un recurso `aws_s3_bucket_lifecycle_configuration` dentro del módulo que aplique una regla de expiración **solo cuando** `expiration_days > 0`
+3. En el Root Module, pasar `expiration_days = 90` al bucket de logs y no pasarlo al de datos (usará el default de 0)
+4. Verificar con AWS CLI que la regla solo existe en el bucket de logs
 
 **Pistas**:
-- `alltrue()` combinada con `[for k, v in var.extra_buckets : can(regex("^empresa-", k))]` valida todas las claves
-- `for_each = var.extra_buckets` en el bloque `module` itera sobre el mapa
-- `each.key` es el nombre del bucket, `each.value` es el objeto con la configuración
-- El módulo ya tiene su propia validación de regex, así que la del Root Module es una capa adicional
+- Usa un bloque `dynamic` o `count` para crear la regla condicionalmente
+- El recurso `aws_s3_bucket_lifecycle_configuration` necesita un bloque `rule` con `expiration { days = ... }` y `status = "Enabled"`
+- `filter {}` vacío aplica la regla a todos los objetos del bucket
+- Verifica con: `aws s3api get-bucket-lifecycle-configuration --bucket <bucket>`
+
+### Reto 2 — Cifrado con SSE-KMS para datos confidenciales
+
+**Situación**: El equipo de seguridad requiere que el bucket de datos críticos use cifrado **SSE-KMS** con una clave gestionada por el cliente (CMK), mientras que el bucket de logs puede usar el cifrado por defecto **SSE-S3** (más económico). El módulo debe soportar ambos escenarios de forma configurable.
+
+**Tu objetivo**:
+
+1. Crear una clave KMS (`aws_kms_key`) en el Root Module, dedicada al cifrado del bucket de datos
+2. Añadir una variable `kms_key_arn` al módulo `s3-bucket` con valor por defecto `null` (sin KMS)
+3. Crear un recurso `aws_s3_bucket_server_side_encryption_configuration` dentro del módulo que:
+   - Use `aws:kms` con la clave proporcionada si `kms_key_arn != null`
+   - Use `AES256` (SSE-S3) si `kms_key_arn` es null
+4. Pasar la clave KMS solo al bucket de datos
+5. Verificar con AWS CLI que cada bucket usa el tipo de cifrado correcto
+
+**Pistas**:
+- `aws_kms_key` necesita una `description` y opcionalmente `enable_key_rotation = true`
+- El recurso de cifrado usa un bloque `rule { apply_server_side_encryption_by_default { ... } }`
+- La clave de `sse_algorithm` es `"aws:kms"` o `"AES256"`
+- `kms_master_key_id` solo se necesita cuando `sse_algorithm = "aws:kms"`
+- Verifica con: `aws s3api get-bucket-encryption --bucket <bucket>`
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Precondición que valide el puerto según el motor</strong></summary>
+<summary><strong>Solución al Reto 1 — Añadir regla de ciclo de vida para expiración de logs</strong></summary>
 
-### Solución al Reto 1 — Precondición que valide el puerto según el motor
+### Solución al Reto 1 — Añadir regla de ciclo de vida para expiración de logs
 
-#### Paso 1: Precondición en el recurso del módulo
-
-En `modules/db-config/main.tf`:
+#### Paso 1: Nueva variable en `modules/s3-bucket/variables.tf`
 
 ```hcl
-locals {
-  # Mapa engine → puerto estandar. Mas legible y escalable que un ternario
-  # encadenado: añadir "oracle" = 1521 es trivial.
-  default_db_ports = {
-    mysql    = 3306
-    mariadb  = 3306
-    postgres = 5432
-  }
+variable "expiration_days" {
+  type        = number
+  description = "Días tras los cuales los objetos expiran automáticamente. 0 = desactivado"
+  default     = 0
 }
+```
 
-resource "aws_ssm_parameter" "db_port" {
-  name  = "/${var.project_name}/db/port"
-  type  = "String"
-  value = tostring(var.db_config.port)
+#### Paso 2: Recurso condicional en `modules/s3-bucket/main.tf`
 
-  tags = var.tags
+```hcl
+resource "aws_s3_bucket_lifecycle_configuration" "this" {
+  count  = var.expiration_days > 0 ? 1 : 0
+  bucket = aws_s3_bucket.this.id
 
-  lifecycle {
-    precondition {
-      condition     = var.db_config.port == local.default_db_ports[var.db_config.engine]
-      error_message = "El puerto ${var.db_config.port} no es el estándar para el motor '${var.db_config.engine}'. Esperado: ${local.default_db_ports[var.db_config.engine]} (3306 para mysql/mariadb, 5432 para postgres)."
+  rule {
+    id     = "auto-expire"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      days = var.expiration_days
     }
   }
 }
 ```
 
-> **Alternativa más concisa:** la versión con un mapa `local` es más mantenible que un `if/else` encadenado. Para añadir un nuevo motor (`oracle = 1521`, `mssql = 1433`), basta con extender el mapa — no hay que tocar la condición. La validación con `contains([...], engine)` ya cubrió en `variables.tf` que `engine` esté en la lista permitida, así que el lookup `local.default_db_ports[engine]` es seguro.
+`count = var.expiration_days > 0 ? 1 : 0` crea el recurso solo cuando se especifica un valor mayor que 0. Si `expiration_days` es 0 (default), el recurso no se crea en absoluto.
 
-#### Paso 2: Probar configuración incoherente
+#### Paso 3: Invocar desde el Root Module
 
-```bash
-terraform plan \
-  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro' \
-  -var='db_config={"engine":"mysql","engine_version":"8.0","instance_class":"db.t4g.micro","allocated_storage":20,"port":5432}'
-# Error: Resource precondition failed
-#   El puerto 5432 no es el estándar para el motor 'mysql'.
-#   Usa 3306 para mysql/mariadb o 5432 para postgres.
+```hcl
+module "logs_bucket" {
+  source = "./modules/s3-bucket"
+
+  bucket_name       = "${var.project_name}-logs-${local.account_id}"
+  enable_versioning = false
+  force_destroy     = true
+  expiration_days   = 90
+
+  tags = merge(local.common_tags, {
+    Purpose            = "logs"
+    DataClassification = "internal"
+  })
+}
+
+# data_bucket no pasa expiration_days → usa default = 0 → sin regla
 ```
 
-#### Paso 3: Probar configuración correcta
+#### Paso 4: Verificar
 
 ```bash
-terraform apply \
-  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro' \
-  -var='db_config={"engine":"postgres","engine_version":"15.4","instance_class":"db.t4g.micro","allocated_storage":20,"port":5432}'
-# Apply complete! Resources: ... added
+terraform apply
+
+# Bucket de logs: debe tener regla de expiración
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket $(terraform output -raw logs_bucket_id)
+# {
+#   "Rules": [
+#     {
+#       "Expiration": { "Days": 90 },
+#       "ID": "auto-expire",
+#       "Filter": { "Prefix": "" },   ← AWS normaliza filter {} a Prefix: ""
+#       "Status": "Enabled"
+#     }
+#   ]
+# }
+# Nota: aunque en HCL declaramos `filter {}` (sin atributos, "todos los
+# objetos"), AWS lo persiste como `Filter: { "Prefix": "" }` — un prefix
+# vacío que matchea cualquier key. Es semánticamente equivalente.
+
+# Bucket de datos: no debe tener regla
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket $(terraform output -raw data_bucket_id)
+# An error occurred (NoSuchLifecycleConfiguration) when calling the
+# GetBucketLifecycleConfiguration operation: The lifecycle configuration
+# does not exist
+# (esto es correcto — count = 0 en el módulo, no se creó ninguna regla)
 ```
-
-#### Reflexión: ¿validation, precondition o postcondition?
-
-| Escenario | Mecanismo | Razón |
-|---|---|---|
-| Formato de un solo campo (regex, rango) | `validation` | Solo depende de la propia variable |
-| Coherencia entre campos de la misma variable | `validation` | Accede a `var.x.campo_a` y `var.x.campo_b` |
-| Coherencia entre diferentes variables | `precondition` | `validation` solo accede a su propia variable |
-| Verificar lo que AWS realmente creó | `postcondition` | Solo `self` tiene los valores reales post-apply |
-| Advertencia no bloqueante | `check` block | No detiene el apply, solo muestra un warning |
 
 ---
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados</strong></summary>
+<summary><strong>Solución al Reto 2 — Cifrado con SSE-KMS para datos confidenciales</strong></summary>
 
-### Solución al Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados
+### Solución al Reto 2 — Cifrado con SSE-KMS para datos confidenciales
 
-#### Paso 1: Variable con validación en el Root Module (`variables.tf`)
+#### Paso 1: Clave KMS en el Root Module (`main.tf`)
 
 ```hcl
-variable "extra_buckets" {
-  type = map(object({
-    purpose       = string
-    force_destroy = optional(bool, true)
-  }))
+resource "aws_kms_key" "data" {
+  description         = "Clave KMS para cifrado del bucket de datos - ${var.project_name}"
+  enable_key_rotation = true
 
-  description = "Mapa de buckets adicionales. La clave es el nombre (debe empezar con 'empresa-')."
-  default     = {}
+  tags = merge(local.common_tags, {
+    Purpose = "s3-data-encryption"
+  })
+}
 
-  validation {
-    condition     = alltrue([for k, _ in var.extra_buckets : can(regex("^empresa-", k))])
-    error_message = "Todos los nombres de bucket deben comenzar con el prefijo 'empresa-'."
+resource "aws_kms_alias" "data" {
+  name          = "alias/${var.project_name}-data-key"
+  target_key_id = aws_kms_key.data.key_id
+}
+```
+
+#### Paso 2: Nueva variable en `modules/s3-bucket/variables.tf`
+
+```hcl
+variable "kms_key_arn" {
+  type        = string
+  description = "ARN de la clave KMS para cifrado SSE-KMS. null = usar SSE-S3 (AES256)"
+  default     = null
+}
+```
+
+#### Paso 3: Recurso de cifrado en `modules/s3-bucket/main.tf`
+
+```hcl
+resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = var.kms_key_arn != null ? "aws:kms" : "AES256"
+      kms_master_key_id = var.kms_key_arn
+    }
+    bucket_key_enabled = var.kms_key_arn != null
   }
 }
 ```
 
-`alltrue()` evalúa una lista de booleanos y devuelve `true` solo si **todos** son `true`. La comprensión `[for k, _ in var.extra_buckets : ...]` itera sobre las claves del mapa.
+`bucket_key_enabled = true` reduce costes de KMS al cachear la clave de datos a nivel de bucket en vez de generar una por cada objeto. Solo tiene sentido con SSE-KMS.
 
-#### Paso 2: Módulo con `for_each` en el Root Module (`main.tf`)
+> **Nota — qué cambia para cada bucket tras este Reto:**
+>
+> - **logs_bucket** (`kms_key_arn = null`): el módulo aplica `sse_algorithm = "AES256"`, lo que es **funcionalmente equivalente** al cifrado SSE-S3 que AWS ya aplica por defecto en cualquier bucket nuevo desde 2023. Lo que cambia es que ahora el cifrado es **explícito en el state**: `terraform plan` lo enseña, los auditores lo ven, y queda blindado frente a un futuro cambio del comportamiento por defecto de AWS.
+> - **data_bucket** (`kms_key_arn = aws_kms_key.data.arn`): cambia el cifrado **real**, pasa de SSE-S3 (default implícito) a SSE-KMS con una CMK gestionada por el cliente. Esto **sí** modifica el comportamiento — cada `GET` y `PUT` requiere ahora permisos `kms:Decrypt` / `kms:GenerateDataKey` además de los permisos S3.
+
+#### Paso 4: Invocar desde el Root Module
 
 ```hcl
-module "extra_buckets" {
-  source   = "./modules/validated-bucket"
-  for_each = var.extra_buckets
+module "data_bucket" {
+  source = "./modules/s3-bucket"
 
-  bucket_name   = each.key
-  force_destroy = each.value.force_destroy
+  bucket_name       = "${var.project_name}-data-${local.account_id}"
+  enable_versioning = true
+  force_destroy     = false
+  kms_key_arn       = aws_kms_key.data.arn
 
   tags = merge(local.common_tags, {
-    Purpose = each.value.purpose
+    Purpose            = "data"
+    DataClassification = "confidential"
   })
 }
+
+# logs_bucket no pasa kms_key_arn → usa default = null → SSE-S3 (AES256)
 ```
-
-#### Paso 3: Output en el Root Module (`outputs.tf`)
-
-```hcl
-output "extra_bucket_ids" {
-  description = "IDs de los buckets adicionales"
-  value       = { for k, m in module.extra_buckets : k => m.bucket_id }
-}
-```
-
-#### Paso 4: Invocar con 2 buckets
-
-`-var` interpreta su valor como **HCL**, no como JSON. La sintaxis correcta para un `map(object)` con claves dinámicas (que contienen `${ACCOUNT_ID}`) es más legible si se pasa por archivo `.tfvars` o se construye con `printf`:
-
-**Opción A — con archivo `extra_buckets.auto.tfvars`** (recomendado):
-
-```hcl
-# extra_buckets.auto.tfvars
-extra_buckets = {
-  "empresa-logs-123456789012"    = { purpose = "logs" }
-  "empresa-backups-123456789012" = { purpose = "backups" }
-}
-```
-
-```bash
-terraform apply \
-  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro'
-# (extra_buckets.auto.tfvars se carga automáticamente)
-```
-
-**Opción B — inline con `printf`** (útil para CI/CD donde no quieres archivos extra):
-
-```bash
-EXTRA_BUCKETS=$(printf '{"empresa-logs-%s"={purpose="logs"},"empresa-backups-%s"={purpose="backups"}}' \
-  "$ACCOUNT_ID" "$ACCOUNT_ID")
-
-terraform apply \
-  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro' \
-  -var="extra_buckets=$EXTRA_BUCKETS"
-```
-
-> **Nota:** la sintaxis HCL para mapas usa `=` (no `:`), claves entre comillas dobles y valores object con `{ campo = "valor" }`. No mezclar con sintaxis JSON (`":"`) — Terraform rechazará el `-var` con un error de parseo.
 
 #### Paso 5: Verificar
 
 ```bash
-# Listar todos los buckets empresa-
-aws s3 ls | grep empresa
+terraform apply
 
-# Verificar tags de cada uno
-for BUCKET in $(aws s3 ls | grep empresa | awk '{print $3}'); do
-  echo "=== $BUCKET ==="
-  aws s3api get-bucket-tagging --bucket $BUCKET \
-    --query 'TagSet[?Key==`Purpose`].Value' --output text
-done
+# Bucket de datos: cifrado SSE-KMS
+aws s3api get-bucket-encryption \
+  --bucket $(terraform output -raw data_bucket_id) \
+  --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault'
+# {
+#   "SSEAlgorithm": "aws:kms",
+#   "KMSMasterKeyID": "arn:aws:kms:us-east-1:123456789012:key/..."
+# }
+
+# Bucket de logs: cifrado SSE-S3
+aws s3api get-bucket-encryption \
+  --bucket $(terraform output -raw logs_bucket_id) \
+  --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault'
+# {
+#   "SSEAlgorithm": "AES256"
+# }
 ```
 
-### Reflexión: doble capa de validación
+### Reflexión: ¿SSE-S3 o SSE-KMS?
 
-En esta solución, la validación ocurre en dos niveles:
+| Aspecto | SSE-S3 (AES256) | SSE-KMS |
+|---|---|---|
+| Coste | Incluido en S3 | ~$1/mes por clave + $0.03/10K requests |
+| Gestión de claves | Automática (AWS) | Controlada (puedes rotar, revocar, auditar) |
+| Auditoría | Solo acceso a objetos | Cada uso de la clave aparece en CloudTrail |
+| Permisos | Solo permisos S3 | Requiere permisos S3 + KMS |
+| Caso de uso | Datos internos, logs | Datos regulados, PII, financieros |
 
-1. **Root Module** (`extra_buckets` validation): verifica que las claves empiecen con `empresa-` antes de invocar el módulo
-2. **Módulo** (`bucket_name` validation): verifica la regex completa del nombre del bucket
+En general: SSE-S3 es suficiente para la mayoría de casos. SSE-KMS es necesario cuando se requiere control granular sobre quién puede descifrar los datos o cuando hay requisitos de compliance que exigen claves gestionadas por el cliente.
 
-¿Es redundante? No necesariamente:
-- La validación del Root Module detecta errores temprano y da un mensaje genérico del mapa
-- La validación del módulo es más estricta (regex completa) y protege contra invocaciones desde otros Root Modules
-- En producción, el módulo puede publicarse en un registry y ser usado por equipos que **no** tienen la validación del Root Module
+> **⚠️ Aviso al destruir — periodo de eliminación de claves KMS:** cuando ejecutas `terraform destroy` con un `aws_kms_key`, AWS **no la borra inmediatamente** sino que la pone en estado `PendingDeletion` durante un periodo configurable (default 30 días, mínimo 7). Durante ese tiempo la clave se sigue cobrando (~$1/mes). Si vas a crear y destruir el lab varias veces, acumularás claves "pending deletion" cada una con su factura. Dos formas de mitigarlo:
+>
+> ```hcl
+> resource "aws_kms_key" "data" {
+>   description             = "..."
+>   enable_key_rotation     = true
+>   deletion_window_in_days = 7    # mínimo permitido
+> }
+> ```
+>
+> O bien cancelar la eliminación pendiente desde la consola y reutilizar la clave (más complejo). Para entornos de laboratorio, `deletion_window_in_days = 7` es lo razonable.
 
 </details>
 
@@ -725,13 +702,31 @@ En esta solución, la validación ocurre en dos niveles:
 
 ## Limpieza
 
-```bash
-terraform destroy \
-  -var="bucket_name=empresa-lab23-data-${ACCOUNT_ID}" \
-  -var='db_password=MiPassword123Seguro'
+Dado que el módulo tiene `prevent_destroy = true`, antes de destruir debes desactivar la protección temporalmente:
+
+### Paso 1: Editar `modules/s3-bucket/main.tf`
+
+Cambiar `prevent_destroy = true` a `prevent_destroy = false`:
+
+```hcl
+lifecycle {
+  prevent_destroy = false
+}
 ```
 
-> **Nota:** Debes pasar las mismas variables obligatorias (`bucket_name` y `db_password`) en el `destroy` porque Terraform necesita evaluarlas para calcular el plan. El laboratorio sí crea un bucket S3 propio (`empresa-lab23-data-…`) que se destruirá; no destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
+> **Nota:** `prevent_destroy` es un meta-argumento del bloque `lifecycle`, **no se guarda en el state** de Terraform. Por eso cambiarlo no requiere un `apply` previo — basta con guardar el cambio en el `.tf` y el siguiente `plan` / `destroy` ya lo respeta. (Si ejecutas `terraform plan` después del cambio, verás `No changes. Your infrastructure matches the configuration.`).
+
+### Paso 2: Destruir
+
+```bash
+terraform destroy
+```
+
+### Paso 3: Restaurar la protección
+
+Si vas a seguir usando el módulo, revierte el cambio a `prevent_destroy = true`.
+
+> **Nota:** En producción, este paso manual es **intencional** — obliga a pensar dos veces antes de destruir datos críticos. El laboratorio no crea ningún bucket S3 propio aparte de los dos del módulo: no destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
@@ -739,30 +734,29 @@ terraform destroy \
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-LocalStack emula S3 y SSM Parameter Store en Community. Las validaciones, precondiciones y postcondiciones funcionan idénticamente porque son evaluadas por el motor de Terraform, no por el proveedor. La versión localstack usa SSM SecureString en lugar de Secrets Manager para la contraseña.
+LocalStack emula S3 completamente en Community Edition. La versión localstack usa `prevent_destroy = false` para facilitar la limpieza en entorno local.
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Validación early-fail**: detectar errores en `terraform plan` (antes de cualquier llamada a AWS) es preferible a descubrirlos en mitad de un `terraform apply`. Las validaciones de variables permiten dar mensajes de error claros al desarrollador.
-- **Variables sensibles para secretos**: marcar contraseñas como `sensitive = true` evita que aparezcan en el output de `plan`/`apply` y en los logs de CI/CD. **Importante:** `sensitive = true` **NO cifra** el valor en `terraform.tfstate` — el secreto se almacena ahí en texto plano. Por eso es **obligatorio** que el backend cifre el state (`encrypt = true` en S3, KMS para tfstate, o un backend con cifrado en reposo) y que el bucket / repositorio del state esté restringido por IAM. La directiva `sensitive` resuelve la fuga **por output**, no la fuga **por acceso al state**.
-- **Postcondiciones para invariantes de estado**: verificar el estado real del recurso después de su creación (por ejemplo, que el bucket tiene public access bloqueado) detecta inconsistencias entre la configuración Terraform y el estado real de AWS.
-- **Tipos complejos `object` para configuraciones relacionadas**: agrupar parámetros relacionados en un objeto en lugar de variables individuales previene configuraciones parcialmente incorrectas (por ejemplo, motor de BD y puerto inconsistentes).
-- **`can()` para detección de errores sin fallo**: usar `can(regex(..., var.name))` permite evaluar si una expresión produce error sin que el plan falle, útil para validaciones condicionales.
-- **`optional()` con defaults en tipos `object`**: proporcionar valores por defecto para atributos opcionales de un objeto hace que el módulo sea más ergonómico sin sacrificar seguridad.
+- **Tríada estándar de módulo (`main.tf`, `variables.tf`, `outputs.tf`)**: separar la declaración de recursos, la interfaz de entrada y la de salida en ficheros independientes facilita la lectura y el mantenimiento del módulo.
+- **`merge()` para etiquetado en capas**: combinar tags del módulo con tags del llamador permite que el consumidor añada contexto sin perder los tags obligatorios impuestos por el módulo.
+- **`prevent_destroy = true` en buckets de datos**: proteger los buckets de borrado accidental durante un `terraform destroy` mal ejecutado evita pérdida de datos irreversible.
+- **Outputs con `value` y `description`**: documentar el propósito de cada output hace que el módulo sea autoexplicativo para los consumidores que solo leen la interfaz.
+- **Invocación múltiple del mismo módulo**: usar el mismo módulo para crear el bucket de aplicación y el de logs demuestra la reutilización real y garantiza que ambos tienen los mismos estándares de seguridad.
+- **Cifrado declarativo y opción de SSE-KMS para datos confidenciales** (Reto 2): el módulo base de este lab no declara explícitamente el cifrado — confía en el cifrado SSE-S3 que AWS aplica automáticamente desde 2023 a todo bucket nuevo. El Reto 2 añade `aws_s3_bucket_server_side_encryption_configuration` al módulo, lo que (a) hace el cifrado **explícito en el state** (visible en `plan` y auditable) y (b) permite **escalar a SSE-KMS** con una clave gestionada por el cliente cuando hace falta control granular o compliance. Como recomendación general: declarar el cifrado en Terraform (incluso si AWS lo aplicaría igual por defecto) hace el código autoexplicativo y resistente a cambios futuros de comportamiento por defecto del proveedor.
 
 ---
 
 ## Recursos
 
-- [Terraform: Input Variable Validation](https://developer.hashicorp.com/terraform/language/values/variables#custom-validation-rules)
-- [Terraform: Preconditions and Postconditions](https://developer.hashicorp.com/terraform/language/validate)
-- [Terraform: Type Constraints — `object`](https://developer.hashicorp.com/terraform/language/expressions/type-constraints#object)
-- [Terraform: `optional()` modifier](https://developer.hashicorp.com/terraform/language/expressions/type-constraints#optional-object-type-attributes)
-- [Terraform: Sensitive Variables](https://developer.hashicorp.com/terraform/language/values/variables#suppressing-values-in-cli-output)
-- [Terraform: `can()` function](https://developer.hashicorp.com/terraform/language/functions/can)
-- [Terraform: `regex()` function](https://developer.hashicorp.com/terraform/language/functions/regex)
+- [Terraform: Modules Overview](https://developer.hashicorp.com/terraform/language/modules)
+- [Terraform: Module Structure](https://developer.hashicorp.com/terraform/language/modules/develop/structure)
+- [Terraform: `merge()` function](https://developer.hashicorp.com/terraform/language/functions/merge)
+- [Terraform: `lifecycle` meta-argument](https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle)
 - [AWS: S3 Bucket Naming Rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html)
-- [AWS: Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html)
-- [RFC 1918: Address Allocation for Private Internets](https://datatracker.ietf.org/doc/html/rfc1918)
+- [AWS: S3 Default Encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-encryption.html)
+- [AWS: S3 Block Public Access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
+- [Terraform: `aws_s3_bucket`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket)
+- [Terraform: `aws_s3_bucket_lifecycle_configuration`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_lifecycle_configuration)

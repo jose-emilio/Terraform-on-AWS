@@ -27,9 +27,9 @@ locals {
       ]
     },
     {
-      Sid    = "ArtifactsKms"
-      Effect = "Allow"
-      Action = ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+      Sid      = "ArtifactsKms"
+      Effect   = "Allow"
+      Action   = ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
       Resource = [aws_kms_key.artifacts.arn]
     }
   ]
@@ -73,9 +73,9 @@ resource "aws_iam_role_policy" "pipeline" {
         ]
       },
       {
-        Sid    = "ArtifactsKms"
-        Effect = "Allow"
-        Action = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Sid      = "ArtifactsKms"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
         Resource = [aws_kms_key.artifacts.arn]
       },
       {
@@ -213,15 +213,15 @@ resource "aws_iam_role_policy" "codebuild_plan" {
     Version = "2012-10-17"
     Statement = concat(local.codebuild_pipeline_statements, [
       {
-        Sid    = "CloudWatchLogs"
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Sid      = "CloudWatchLogs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:*:${data.aws_caller_identity.current.account_id}:log-group:/aws/codebuild/${var.project}-plan*"
       },
       {
-        Sid    = "TerraformStateBackend"
-        Effect = "Allow"
-        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"]
+        Sid      = "TerraformStateBackend"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"]
         Resource = [aws_s3_bucket.artifacts.arn, "${aws_s3_bucket.artifacts.arn}/tfstate/*"]
       },
       {
@@ -303,15 +303,15 @@ resource "aws_iam_role_policy" "codebuild_smoketest" {
     Version = "2012-10-17"
     Statement = concat(local.codebuild_pipeline_statements, [
       {
-        Sid    = "CloudWatchLogs"
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Sid      = "CloudWatchLogs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:*:${data.aws_caller_identity.current.account_id}:log-group:/aws/codebuild/${var.project}-smoketest*"
       },
       {
-        Sid    = "TerraformStateBackend"
-        Effect = "Allow"
-        Action = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+        Sid      = "TerraformStateBackend"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
         Resource = [aws_s3_bucket.artifacts.arn, "${aws_s3_bucket.artifacts.arn}/tfstate/*"]
       },
       {
@@ -354,9 +354,9 @@ resource "aws_iam_role_policy" "lambda_plan_inspector" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "CloudWatchLogs"
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Sid      = "CloudWatchLogs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.lambda_plan_inspector.arn}:*"
       },
       {
@@ -372,9 +372,9 @@ resource "aws_iam_role_policy" "lambda_plan_inspector" {
         Resource = [aws_kms_key.artifacts.arn]
       },
       {
-        Sid    = "CodePipelineJobResult"
-        Effect = "Allow"
-        Action = ["codepipeline:PutJobSuccessResult", "codepipeline:PutJobFailureResult"]
+        Sid      = "CodePipelineJobResult"
+        Effect   = "Allow"
+        Action   = ["codepipeline:PutJobSuccessResult", "codepipeline:PutJobFailureResult"]
         Resource = "*"
       }
     ]

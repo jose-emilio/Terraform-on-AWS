@@ -28,7 +28,7 @@ La arquitectura tiene cuatro capas:
    descuento para el resto, diversificando en cuatro tipos de instancia para minimizar
    el riesgo de interrupción.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Comprender el bloque `default_tags` del provider AWS y cómo elimina la repetición de etiquetas
 - Identificar la regla de precedencia entre `default_tags` y tags definidas en el recurso
@@ -393,7 +393,7 @@ la aplicación permite a un atacante robar las credenciales del rol IAM de la in
 con una simple petición HTTP. IMDSv2 es obligatorio en entornos de producción y una
 buena práctica desde el día uno.
 
-## Estructura
+## Estructura del proyecto
 
 ```
 lab-48/
@@ -1839,7 +1839,7 @@ política. Con ABAC, la condición `aws:ResourceTag/Component = "compute"` actú
 un selector dinámico: cualquier instancia que tenga esa etiqueta queda automáticamente
 dentro del alcance del rol, sin tocar IAM.
 
-**Nueva política ABAC** → [aws/abac.tf](aws/abac.tf):
+**Nueva política ABAC** → `aws/abac.tf`:
 
 ```hcl
 resource "aws_iam_policy" "abac_compute" {
@@ -1997,7 +1997,7 @@ El `schedule_expression` repite la ejecución periódicamente, lo que garantiza 
 las instancias nuevas lanzadas por el ASG (scale-out, reemplazo de Spot interrumpida)
 también ejecuten el documento sin intervención manual.
 
-**Terraform** → [aws/ssm.tf](aws/ssm.tf):
+**Terraform** → `aws/ssm.tf`:
 
 ```hcl
 resource "aws_ssm_document" "instance_info" {
@@ -2267,3 +2267,16 @@ aws iam list-attached-role-policies \
   --role-name "$(terraform output -json naming_examples | python3 -c "import sys,json; print(json.load(sys.stdin))")" \
   --query 'AttachedPolicies[].PolicyName' --output table
 ```
+
+## Recursos
+
+- [AWS Budgets — Tipos de presupuesto y notificaciones](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html)
+- [Cost Anomaly Detection — Detección automática de desviaciones](https://docs.aws.amazon.com/cost-management/latest/userguide/manage-ad.html)
+- [Cost Allocation Tags — Activación y reportes](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/cost-alloc-tags.html)
+- [EC2 Spot Instances — Comportamiento y mejores prácticas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-instances.html)
+- [ASG Mixed Instances Policy — Combinación On-Demand y Spot](https://docs.aws.amazon.com/autoscaling/ec2/userguide/asg-purchase-options.html)
+- [Capacity-Optimized — Estrategias de asignación Spot](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-capacity-rebalancing.html)
+- [ABAC en AWS — Tags como dimensión de autorización](https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction_attribute-based-access-control.html)
+- [Tag Policies — Gobernanza centralizada de tagging](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_tag-policies.html)
+- [`default_tags` en el AWS Provider de Terraform](https://registry.terraform.io/providers/hashicorp/aws/latest/docs#default_tags)
+- [SSM State Manager — Asociaciones y documentos](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-state.html)

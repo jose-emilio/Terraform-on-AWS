@@ -1,59 +1,54 @@
-output "function_name" {
-  description = "Nombre de la función Lambda"
-  value       = aws_lambda_function.processor.function_name
+output "ecr_repository_url" {
+  description = "URL del repositorio ECR (usarla como prefijo para docker push)"
+  value       = aws_ecr_repository.app.repository_url
 }
 
-output "function_arn" {
-  description = "ARN de la función Lambda"
-  value       = aws_lambda_function.processor.arn
+output "docker_login_cmd" {
+  description = "Comando para autenticarse en ECR antes de hacer docker push"
+  value       = "aws ecr get-login-password --region ${var.region} | docker login --username AWS --password-stdin ${aws_ecr_repository.app.repository_url}"
 }
 
-output "orders_queue_url" {
-  description = "URL de la cola SQS de entrada (órdenes)"
-  value       = aws_sqs_queue.orders.url
+output "ecs_cluster_name" {
+  description = "Nombre del cluster ECS"
+  value       = aws_ecs_cluster.main.name
 }
 
-output "orders_queue_arn" {
-  description = "ARN de la cola SQS de entrada"
-  value       = aws_sqs_queue.orders.arn
+output "web_service_name" {
+  description = "Nombre del servicio ECS Web (acceso desde el navegador en puerto 80)"
+  value       = aws_ecs_service.web.name
 }
 
-output "dlq_url" {
-  description = "URL de la Dead Letter Queue"
-  value       = aws_sqs_queue.dlq.url
+output "api_service_name" {
+  description = "Nombre del servicio ECS API (accesible internamente en api:8080 via Service Connect)"
+  value       = aws_ecs_service.api.name
 }
 
-output "success_queue_url" {
-  description = "URL de la cola de éxitos (Lambda Destination on_success)"
-  value       = aws_sqs_queue.success.url
+output "web_task_definition_arn" {
+  description = "ARN de la revisión activa de la task definition del servicio Web"
+  value       = aws_ecs_task_definition.web.arn
 }
 
-output "failure_queue_url" {
-  description = "URL de la cola de fallos (Lambda Destination on_failure)"
-  value       = aws_sqs_queue.failure.url
+output "api_task_definition_arn" {
+  description = "ARN de la revisión activa de la task definition del servicio API"
+  value       = aws_ecs_task_definition.api.arn
 }
 
-output "log_group" {
-  description = "Nombre del log group de CloudWatch"
-  value       = aws_cloudwatch_log_group.lambda.name
+output "ssm_parameter_name" {
+  description = "Nombre del parámetro SSM compartido entre ambos microservicios"
+  value       = aws_ssm_parameter.api_key.name
 }
 
-output "send_premium_example" {
-  description = "Comando para enviar una orden premium a la cola de entrada"
-  value       = "aws sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"order_id\":\"ORD-001\",\"order_type\":\"premium\",\"amount\":299.99,\"customer\":\"cliente-test\"}'"
+output "service_connect_namespace" {
+  description = "Namespace de Service Connect (DNS interno: web:80 y api:8080)"
+  value       = aws_service_discovery_http_namespace.main.name
 }
 
-output "send_standard_example" {
-  description = "Comando para enviar una orden estándar (será filtrada por filter_criteria)"
-  value       = "aws sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"order_id\":\"ORD-002\",\"order_type\":\"standard\",\"amount\":49.99,\"customer\":\"cliente-test\"}'"
+output "web_log_group" {
+  description = "Grupo de logs CloudWatch del servicio Web"
+  value       = aws_cloudwatch_log_group.web.name
 }
 
-output "invoke_async_success_example" {
-  description = "Invocación async que irá a success-queue via Lambda Destinations (amount ≤ 9999)"
-  value       = "aws lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-001\",\"order_type\":\"premium\",\"amount\":500.00}' --cli-binary-format raw-in-base64-out /dev/null"
-}
-
-output "invoke_async_failure_example" {
-  description = "Invocación async que irá a failure-queue via Lambda Destinations (amount > 9999)"
-  value       = "aws lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-002\",\"order_type\":\"premium\",\"amount\":99999.99}' --cli-binary-format raw-in-base64-out /dev/null"
+output "api_log_group" {
+  description = "Grupo de logs CloudWatch del servicio API"
+  value       = aws_cloudwatch_log_group.api.name
 }

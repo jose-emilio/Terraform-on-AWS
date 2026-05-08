@@ -21,10 +21,8 @@ provider "aws" {
   s3_use_path_style = true
 
   endpoints {
-    autoscaling        = "http://localhost.localstack.cloud:4566"
-    ec2                = "http://localhost.localstack.cloud:4566"
-    elasticloadbalancing = "http://localhost.localstack.cloud:4566"
-    iam                = "http://localhost.localstack.cloud:4566"
-    sts                = "http://localhost.localstack.cloud:4566"
+    ec2 = "http://localhost.localstack.cloud:4566"
+    iam = "http://localhost.localstack.cloud:4566"
+    sts = "http://localhost.localstack.cloud:4566"
   }
 }

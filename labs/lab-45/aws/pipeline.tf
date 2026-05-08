@@ -206,8 +206,8 @@ resource "aws_codepipeline" "main" {
       run_order       = 1
 
       configuration = {
-        ProjectName          = aws_codebuild_project.apply.name
-        PrimarySource        = "source_output"
+        ProjectName   = aws_codebuild_project.apply.name
+        PrimarySource = "source_output"
       }
     }
 

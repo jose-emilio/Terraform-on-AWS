@@ -1,4 +1,4 @@
-# Laboratorio 28 — Escalabilidad y Alta Disponibilidad con Zero Downtime
+# Laboratorio 28 — Cimientos de EC2: Despliegue Dinámico y Seguro
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,107 +8,115 @@
 
 ## Visión general
 
-En este laboratorio desplegarás una arquitectura web tolerante a fallos de zona de disponibilidad que se actualiza sin interrupciones de servicio. Combinarás un Launch Template versionado, un Application Load Balancer, un Auto Scaling Group Multi-AZ, una política de Target Tracking y un mecanismo de rolling update mediante `instance_refresh`.
+En este laboratorio aprovisionarás un servidor web EC2 profesional utilizando búsquedas dinámicas de AMI, un IAM Instance Profile para evitar credenciales estáticas, IMDSv2 obligatorio para prevenir ataques SSRF y un script de bootstrap dinámico generado con `templatefile()`. El resultado es una instancia que sigue las mejores prácticas de seguridad de AWS desde su creación.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Crear un `aws_launch_template` versionado que encapsule la configuración de red, seguridad y `user_data` de la flota
-- Desplegar un ALB con un `aws_lb_listener` que redirija el tráfico HTTP (puerto 80) al puerto de aplicación 8080 de las instancias
-- Configurar un ASG que distribuya instancias en todas las subredes privadas disponibles mediante `vpc_zone_identifier`
-- Aplicar una política de Target Tracking basada en CPU media al 50% para escalar automáticamente
-- Implementar un bloque `instance_refresh` con `min_healthy_percentage = 90` para actualizar la flota sin caída de servicio
+- Usar el data source `aws_ami` con filtros para obtener la AMI más reciente de Amazon Linux 2023 de forma agnóstica a la región
+- Crear un IAM Instance Profile con un rol que permita gestión via SSM Session Manager, eliminando la necesidad de Access Keys estáticas
+- Forzar el uso de IMDSv2 (`http_tokens = "required"`) para blindar la instancia contra ataques SSRF
+- Implementar un script de bootstrap dinámico usando `templatefile()` para inyectar variables de Terraform en el `user_data` de la instancia
+- Crear Security Groups granulares usando los recursos individuales de reglas
 
 ## Requisitos previos
 
-- **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre EC2, VPC, ELB, Auto Scaling e IAM
-- LocalStack en ejecución (para la sección de LocalStack)
-
+- **Terraform >= 1.10** (necesario para `use_lockfile` en el backend S3)
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### Launch Template versionado
+### Data Source `aws_ami`
 
-`aws_launch_template` es la forma moderna de definir la configuración de las instancias de un ASG. Sustituye a los `aws_launch_configuration` (deprecados). Cada vez que Terraform detecta un cambio en el recurso, genera una nueva versión numerada automáticamente.
+Un **data source** en Terraform permite consultar información de la infraestructura existente sin crear recursos nuevos. `aws_ami` busca AMIs en el registro de EC2 según los filtros proporcionados:
 
 ```hcl
-resource "aws_launch_template" "web" {
-  name_prefix   = "lab28-web-"
-  image_id      = data.aws_ami.al2023.id
-  instance_type = var.instance_type
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
 
-  lifecycle {
-    create_before_destroy = true
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-arm64"]
   }
 }
 ```
 
-La política `create_before_destroy = true` garantiza que la nueva versión del template existe antes de que el ASG empiece a sustituir instancias.
+- `most_recent = true`: de todas las AMIs que coincidan con los filtros, selecciona la más reciente.
+- `owners = ["amazon"]`: restringe la búsqueda a AMIs oficiales de Amazon, evitando imágenes de terceros potencialmente inseguras.
+- `filter`: cada bloque `filter` aplica un criterio adicional. Los filtros son acumulativos (AND lógico).
 
-### Application Load Balancer (ALB)
+La referencia `data.aws_ami.al2023.id` devuelve el ID de la AMI seleccionada, que puede variar entre regiones y con el tiempo conforme Amazon publica nuevas versiones.
 
-El ALB opera en capa 7 (HTTP/HTTPS) e inspecciona el contenido de las peticiones para enrutarlas. Sus componentes principales son:
+### IAM Instance Profile
 
-| Componente | Recurso Terraform | Función |
-|---|---|---|
-| Load Balancer | `aws_lb` | Punto de entrada público; vive en subredes públicas |
-| Target Group | `aws_lb_target_group` | Agrupa instancias y ejecuta health checks al puerto 8080 |
-| Listener | `aws_lb_listener` | Escucha en el puerto 80 y reenvía al target group |
-
-El ASG se registra en el target group mediante `target_group_arns`. Cuando el ASG añade o elimina instancias, el ALB las incorpora o retira del balanceo automáticamente.
-
-### Auto Scaling Group Multi-AZ
-
-El parámetro `vpc_zone_identifier` recibe una lista de subnets. El ASG distribuye instancias entre ellas de forma equilibrada. Si una AZ cae, el ASG lanza nuevas instancias en las AZs disponibles para mantener la capacidad deseada.
+Un **Instance Profile** es el contenedor que permite asociar un rol IAM a una instancia EC2. Sin él, la instancia no tiene identidad IAM y cualquier operación con la API de AWS requeriría Access Keys estáticas (una mala práctica de seguridad).
 
 ```hcl
-resource "aws_autoscaling_group" "web" {
-  vpc_zone_identifier = aws_subnet.private[*].id
-  # ...
+resource "aws_iam_instance_profile" "ec2" {
+  name = "mi-perfil"
+  role = aws_iam_role.ec2.name
 }
 ```
 
-Usando `health_check_type = "ELB"`, el ASG delega la comprobación de salud al ALB: una instancia solo se considera sana si supera los health checks del target group.
+La instancia obtiene credenciales temporales automáticamente a través del Instance Metadata Service. Estas credenciales rotan de forma transparente sin intervención manual.
 
-### Target Tracking Scaling
+### IMDSv2 (Instance Metadata Service v2)
 
-La política de Target Tracking es la forma más simple de escalar automáticamente. El ASG añade o elimina instancias para mantener una métrica en torno a un valor objetivo, sin necesidad de definir alarmas de CloudWatch manualmente.
+El **Instance Metadata Service** (IMDS) permite a la instancia consultar información sobre sí misma (ID, región, credenciales del rol IAM) mediante peticiones HTTP a `http://169.254.169.254`. La versión 1 (IMDSv1) acepta peticiones GET simples, lo que la hace vulnerable a ataques **SSRF** (Server-Side Request Forgery): si un atacante consigue que la aplicación haga una petición HTTP a esa IP, obtiene las credenciales del rol.
+
+**IMDSv2** mitiga este riesgo exigiendo un flujo de dos pasos:
+
+1. Una petición `PUT` para obtener un **token de sesión** (con TTL configurable)
+2. Las peticiones subsiguientes deben incluir el token en el header `X-aws-ec2-metadata-token`
+
+Al configurar `http_tokens = "required"`, se desactiva IMDSv1 y solo se acepta el flujo seguro con token:
 
 ```hcl
-resource "aws_autoscaling_policy" "cpu" {
-  policy_type = "TargetTrackingScaling"
+metadata_options {
+  http_endpoint = "enabled"
+  http_tokens   = "required"
+}
+```
 
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ASGAverageCPUUtilization"
+### Función `templatefile()`
+
+Lee un archivo externo `.tftpl` y sustituye las variables declaradas por los valores proporcionados en un map. Esto permite generar scripts de bootstrap dinámicos que incorporan datos de Terraform (endpoints de bases de datos, nombres de entorno, etc.) sin hardcodear valores:
+
+```hcl
+locals {
+  user_data = templatefile("${path.module}/../user_data.tftpl", {
+    env         = var.env
+    app_name    = var.app_name
+    db_endpoint = var.db_endpoint
+  })
+}
+```
+
+Dentro del archivo `.tftpl`:
+- `${variable}` para interpolación simple
+- `%{ if condicion }...%{ endif }` para condicionales
+- `%{ for item in lista }...%{ endfor }` para iteraciones
+
+### Data Source `aws_iam_policy_document`
+
+Genera políticas IAM en formato JSON de forma programática. Es más seguro y legible que escribir el JSON manualmente:
+
+```hcl
+data "aws_iam_policy_document" "ec2_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
     }
-    target_value = 50.0
   }
 }
 ```
 
-El ASG escala hacia arriba cuando la CPU media supera el 50% y escala hacia abajo cuando cae por debajo, respetando los tiempos de estabilización para evitar oscilaciones.
-
-### Instance Refresh (Rolling Update)
-
-`instance_refresh` permite reemplazar las instancias de un ASG de forma gradual cuando cambia el Launch Template. Con `min_healthy_percentage = 90`, el ASG garantiza que al menos el 90% de la capacidad deseada está sana en todo momento durante la sustitución.
-
-```hcl
-instance_refresh {
-  strategy = "Rolling"
-  preferences {
-    min_healthy_percentage = 90
-    instance_warmup        = 60
-  }
-  triggers = ["launch_template"]
-}
-```
-
-El campo `triggers = ["launch_template"]` le indica a Terraform que debe iniciar un refresh cuando cambie el bloque `launch_template` del ASG. Usando `version = aws_launch_template.web.latest_version` (en lugar de `"$Latest"`), cualquier cambio en el Launch Template provoca un cambio en ese campo y activa el mecanismo.
+El resultado (`data.aws_iam_policy_document.ec2_assume_role.json`) se pasa directamente al argumento `assume_role_policy` del rol IAM.
 
 ---
 
@@ -117,399 +125,629 @@ El campo `triggers = ["launch_template"]` le indica a Terraform que debe iniciar
 ```
 lab-28/
 ├── arch/
-│   └── diagrama.svg      # Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg     # Diagrama de arquitectura (referenciado en este README)
+├── user_data.tftpl      # Plantilla de bash compartida por ambos entornos
 ├── aws/
-│   ├── aws.s3.tfbackend  # Parámetros del backend S3 (sin bucket)
-│   ├── providers.tf      # Backend S3, Terraform >= 1.10, provider AWS
-│   ├── variables.tf      # region, project, vpc_cidr, instance_type, sizes, app_version
-│   ├── main.tf           # VPC, ALB, Launch Template, ASG, scaling policy
-│   ├── outputs.tf        # URL del ALB, nombre del ASG, versión del Launch Template
-│   └── user_data.sh      # Script de arranque; templatefile() inyecta app_version
+│   ├── aws.s3.tfbackend # Parámetros del backend S3 (sin bucket)
+│   ├── providers.tf     # Bloque terraform{} con backend S3 y provider{}
+│   ├── variables.tf     # env, app_name, db_endpoint, instance_type
+│   ├── main.tf          # data aws_ami, IAM role/profile, SG, instancia EC2
+│   └── outputs.tf       # AMI, instancia, IAM, SG, user_data renderizado
 └── localstack/
-    ├── providers.tf      # Endpoints apuntando a LocalStack
-    ├── variables.tf      # Mismas variables, valores por defecto para entorno local
-    ├── main.tf           # Idéntico a aws/main.tf
-    ├── outputs.tf
-    └── user_data.sh      # Versión simplificada del script (sin IMDSv2)
+    ├── README.md        # Instrucciones de despliegue local
+    ├── providers.tf     # Endpoints apuntando a LocalStack
+    ├── variables.tf     # Idéntico al de aws/
+    ├── main.tf          # Idéntico al de aws/
+    └── outputs.tf       # Idéntico al de aws/
 ```
+
+La plantilla `user_data.tftpl` vive en la raíz de `lab28/` y es compartida por ambos entornos mediante `path.module/../user_data.tftpl`.
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Arquitectura
 
-![ALB en 2 subredes públicas → ASG con Launch Template versionado en 2 subredes privadas, NAT GW por AZ, instance_refresh Rolling y Target Tracking CPU=50%](arch/diagrama.svg)
+![EC2 segura: AMI dinámica + Instance Profile (SSM) + IMDSv2 obligatorio + templatefile() user_data + SG con reglas separadas](arch/diagrama.svg)
 
-Cada AZ tiene su propio NAT Gateway: si una zona cae, las instancias de las otras AZs conservan conectividad de salida. Las instancias del ASG nunca reciben tráfico directo de Internet; todo el tráfico entrante pasa por el ALB en el puerto 80, que lo reenvía al puerto 8080 de las instancias. El SG de las instancias usa `security_groups = [aws_security_group.alb.id]` (no CIDR) — solo aceptan tráfico del ALB. El ASG apunta a `aws_launch_template.web.latest_version`, así cualquier cambio (p.ej. `app_version`) dispara un `instance_refresh` Rolling con `min_healthy_percentage = 90`.
+Cinco controles combinados sobre una EC2 ARM en la VPC default: (1) `data "aws_ami" "al2023"` con triple filtro (`name = "al2023-ami-2023.*-arm64"` + `architecture = arm64` + `virtualization-type = hvm`) resuelve la AMI más reciente sin hardcoding. (2) `aws_iam_instance_profile` con un rol cuya Trust Policy permite asumir solo a `ec2.amazonaws.com` y `AmazonSSMManagedInstanceCore` adjunta — acceso por Session Manager, sin SSH ni Access Keys. (3) `metadata_options.http_tokens = "required"` activa IMDSv2 obligatorio (bloquea exfiltración SSRF de credenciales). (4) `local.user_data = templatefile(...)` inyecta `{env, app_name, db_endpoint}`; `user_data_replace_on_change = true` recrea la instancia ante cualquier cambio. (5) Reglas del SG en recursos `aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule` separados (drift-resistant). Sumado a `lifecycle.create_before_destroy = true` en la instancia, el reemplazo es zero-downtime.
 
 ### Código Terraform
 
-**`aws/main.tf`** — Fragmentos clave:
-
-El Launch Template usa `latest_version` para que cada cambio de configuración genere una nueva versión y active el instance_refresh:
-
-```hcl
-launch_template {
-  id      = aws_launch_template.web.id
-  version = aws_launch_template.web.latest_version
-}
-```
-
-El script de arranque vive en `user_data.sh` y se carga con `templatefile()`, que inyecta `app_version` antes de enviarlo a la instancia. Las variables bash (`$TOKEN`, `$AZ`, `$ID`) no usan llaves y no son afectadas por la interpolación de Terraform:
-
-```hcl
-user_data = base64encode(templatefile("${path.module}/user_data.sh", {
-  app_version = var.app_version
-}))
-```
-
-El script `aws/user_data.sh` instala Apache (`httpd`), lo configura para escuchar en el puerto 8080 y añade la cabecera `Connection: close` para que el navegador cierre la conexión TCP tras cada respuesta — lo que obliga al ALB a balancear en la siguiente recarga. `templatefile()` inyecta `${app_version}` antes de enviar el script; el resto de variables (`$AZ`, `$ID`, `$TYPE`) las resuelve bash en tiempo de ejecución consultando el servicio de metadatos IMDSv2:
+**`user_data.tftpl`**
 
 ```bash
 #!/bin/bash
+# Generado por Terraform — entorno: ${env}
+set -euo pipefail
+
+# Configuración del entorno
+echo "ENV=${env}" >> /etc/environment
+echo "APP_NAME=${app_name}" >> /etc/environment
+echo "DB_ENDPOINT=${db_endpoint}" >> /etc/environment
+
+# Actualización del sistema
+dnf update -y
+
+# Instalación de servidor web
 dnf install -y httpd
-sed -i 's/^Listen 80$/Listen 8080/' /etc/httpd/conf/httpd.conf
 
-# Connection: close → el navegador abre una conexión nueva en cada recarga
-echo 'Header always set Connection "close"' > /etc/httpd/conf.d/lab28.conf
+# Página de verificación con datos inyectados desde Terraform
+cat <<'INNEREOF' > /var/www/html/index.html
+<!DOCTYPE html>
+<html>
+<head><title>${app_name}</title></head>
+<body>
+  <h1>${app_name} — ${env}</h1>
+  <p>Instancia aprovisionada con Terraform</p>
+  <p>Backend DB: ${db_endpoint}</p>
+</body>
+</html>
+INNEREOF
 
-# Genera /var/www/html/index.html con versión, AZ, ID, tipo y timestamp
-# ... (templatefile inyecta ${app_version}; bash resuelve $AZ, $ID, $TYPE)
-
+# Arranque del servidor web
 systemctl enable --now httpd
+
+%{ if env == "prod" ~}
+# Hardening adicional solo en producción
+sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+systemctl restart sshd
+%{ endif ~}
+
+echo "Bootstrap completado para ${app_name} en ${env}"
 ```
 
-### Inicialización y despliegue
+**`aws/providers.tf`**
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+```
+
+**`aws/variables.tf`**
+
+```hcl
+variable "env" {
+  type    = string
+  default = "dev"
+
+  validation {
+    condition     = contains(["dev", "prod"], var.env)
+    error_message = "El entorno debe ser 'dev' o 'prod'."
+  }
+}
+
+variable "app_name" {
+  type    = string
+  default = "corp-lab28"
+}
+
+variable "db_endpoint" {
+  type    = string
+  default = "db.corp-lab28.internal:5432"
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t4g.small"
+}
+```
+
+**`aws/main.tf`**
+
+```hcl
+# ─── Data Source: AMI dinámica ───────────────────────────────────────────────
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-arm64"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# ─── IAM Instance Profile ───────────────────────────────────────────────────
+data "aws_iam_policy_document" "ec2_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ec2" {
+  name               = "${var.app_name}-ec2-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+
+  tags = {
+    Name = "${var.app_name}-ec2-role"
+    Env  = var.env
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.app_name}-ec2-profile"
+  role = aws_iam_role.ec2.name
+
+  tags = {
+    Name = "${var.app_name}-ec2-profile"
+    Env  = var.env
+  }
+}
+
+# ─── Security Group ─────────────────────────────────────────────────────────
+resource "aws_security_group" "web" {
+  name        = "${var.app_name}-web-sg"
+  description = "Permite HTTP entrante y todo el trafico saliente"
+
+  tags = {
+    Name = "${var.app_name}-web-sg"
+    Env  = var.env
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "http" {
+  security_group_id = aws_security_group.web.id
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "HTTP desde cualquier origen"
+}
+
+resource "aws_vpc_security_group_egress_rule" "all" {
+  security_group_id = aws_security_group.web.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "Todo el trafico saliente"
+}
+
+# ─── User Data dinámico ─────────────────────────────────────────────────────
+locals {
+  user_data = templatefile("${path.module}/../user_data.tftpl", {
+    env         = var.env
+    app_name    = var.app_name
+    db_endpoint = var.db_endpoint
+  })
+}
+
+# ─── Instancia EC2 ──────────────────────────────────────────────────────────
+resource "aws_instance" "web" {
+  ami                  = data.aws_ami.al2023.id
+  instance_type        = var.instance_type
+  iam_instance_profile = aws_iam_instance_profile.ec2.name
+
+  vpc_security_group_ids = [aws_security_group.web.id]
+
+  user_data                   = local.user_data
+  user_data_replace_on_change = true
+
+  # IMDSv2 obligatorio: bloquea ataques SSRF al metadata service
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  tags = {
+    Name = "${var.app_name}-web"
+    Env  = var.env
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+**`aws/outputs.tf`**
+
+```hcl
+output "ami_id" {
+  description = "ID de la AMI de Amazon Linux 2023 seleccionada"
+  value       = data.aws_ami.al2023.id
+}
+
+output "ami_name" {
+  description = "Nombre de la AMI seleccionada"
+  value       = data.aws_ami.al2023.name
+}
+
+output "instance_id" {
+  description = "ID de la instancia EC2"
+  value       = aws_instance.web.id
+}
+
+output "public_ip" {
+  description = "IP pública de la instancia (si tiene)"
+  value       = aws_instance.web.public_ip
+}
+
+output "instance_profile_arn" {
+  description = "ARN del Instance Profile asociado a la instancia"
+  value       = aws_iam_instance_profile.ec2.arn
+}
+
+output "iam_role_name" {
+  description = "Nombre del rol IAM de la instancia"
+  value       = aws_iam_role.ec2.name
+}
+
+output "user_data_rendered" {
+  description = "Script de bootstrap generado por templatefile()"
+  value       = local.user_data
+}
+
+output "security_group_id" {
+  description = "ID del security group de la instancia"
+  value       = aws_security_group.web.id
+}
+```
+
+### Despliegue
+
+Desde el directorio `lab28/aws/`:
 
 ```bash
-export BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
+# Obtener el ID de tu cuenta AWS
+BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
 
-# Desde lab28/aws/
 terraform fmt
 terraform init \
   -backend-config=aws.s3.tfbackend \
   -backend-config="bucket=$BUCKET"
-
 terraform plan
 terraform apply
 ```
 
-El despliegue completo tarda entre 3 y 5 minutos. El NAT Gateway es el recurso más lento en aprovisionarse.
+El estado se almacena en `s3://<BUCKET>/lab28/terraform.tfstate` usando el bucket creado en el lab02.
 
-Al finalizar, los outputs mostrarán:
+Durante el `plan`, presta atención a:
+
+- **`data.aws_ami.al2023`**: Terraform consulta la API de EC2 y muestra la AMI seleccionada. Esto ocurre en la fase de plan, no durante el apply.
+- **`user_data_rendered`**: el output muestra el script ya renderizado con los valores reales, permitiendo verificar que `templatefile()` inyectó las variables correctamente.
+
+### Verificación
+
+Al finalizar `terraform apply`:
 
 ```
-alb_url                        = "http://lab28-alb-123456789.us-east-1.elb.amazonaws.com"
-asg_name                       = "lab28-asg"
-launch_template_id             = "lt-0a1b2c3d4e5f"
-launch_template_latest_version = 1
-private_subnet_ids             = ["subnet-aaa", "subnet-bbb"]
+Outputs:
+
+ami_id               = "ami-0abcdef1234567890"
+ami_name             = "al2023-ami-2023.6.20241212.0-kernel-6.1-arm64"
+instance_id          = "i-0abc123def456..."
+instance_profile_arn = "arn:aws:iam::123456789012:instance-profile/corp-lab28-ec2-profile"
+public_ip            = "54.xx.xx.xx"
+...
 ```
 
-### Verificar la distribución Multi-AZ y el ALB
-
-Espera ~2 minutos a que las instancias superen los health checks del target group.
-
-**Paso 1** — Obtén la URL del ALB:
+**Verificar la AMI seleccionada:**
 
 ```bash
-terraform output alb_url
+terraform output ami_name
 ```
 
-**Paso 2** — Abre la URL en Firefox o Chrome para comprobar que la página carga correctamente con la información de la instancia.
+El nombre debe comenzar con `al2023-ami-2023` confirmando que el data source seleccionó Amazon Linux 2023.
 
-> Si el navegador devuelve "Esta página no está disponible", las instancias aún están arrancando o pasando los health checks. Espera 30 segundos y recarga.
-
-**Paso 3** — Recarga la página con `F5` (o `Cmd+R`). El servidor incluye la cabecera `Connection: close` en cada respuesta, lo que indica al navegador que cierre la conexión TCP tras recibirla. En la siguiente recarga el navegador abre una conexión nueva y el ALB la dirige a una instancia diferente. Observa cómo cambian la **Availability Zone** y el **Instance ID** entre recargas.
-
-**Paso 4** — Confirma el estado de salud de las instancias:
+**Verificar el Instance Profile:**
 
 ```bash
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names "$(terraform output -raw asg_name)" \
-  --query 'AutoScalingGroups[0].Instances[].{ID:InstanceId,AZ:AvailabilityZone,Health:HealthStatus}' \
-  --output table
+aws iam list-instance-profiles-for-role --role-name corp-lab28-ec2-role
 ```
 
-### Demostrar el Rolling Update (Instance Refresh)
-
-Cambia la versión de la aplicación para generar una nueva versión del Launch Template. El ASG detectará el cambio y reemplazará las instancias gradualmente manteniendo el servicio activo.
-
-**Paso 1** — Inicia el rolling update cambiando `app_version`:
+**Verificar que IMDSv2 está activo:**
 
 ```bash
-terraform apply -var="app_version=v2"
+aws ec2 describe-instances \
+  --instance-ids $(terraform output -raw instance_id) \
+  --query 'Reservations[0].Instances[0].MetadataOptions'
 ```
 
-Terraform generará un plan con dos cambios:
-1. El Launch Template recibe una nueva versión (`v2` embebida en `user_data`)
-2. El ASG detecta el cambio en `version` y activa un `instance_refresh`
+Resultado esperado:
 
-**Paso 2** — Mientras Terraform aplica, monitoriza el progreso del refresh en otra terminal:
+```json
+{
+    "State": "applied",
+    "HttpTokens": "required",
+    "HttpPutResponseHopLimit": 1,
+    "HttpEndpoint": "enabled"
+}
+```
+
+El campo `"HttpTokens": "required"` confirma que solo IMDSv2 está permitido.
+
+**Verificar el servidor web (si la instancia tiene IP pública y el SG lo permite):**
 
 ```bash
-watch -n 5 "aws autoscaling describe-instance-refreshes \
-  --auto-scaling-group-name lab28-asg \
-  --query 'InstanceRefreshes[0].{Status:Status,Percentage:PercentageComplete,Remaining:InstancesToUpdate}' \
-  --output table"
+curl http://$(terraform output -raw public_ip)
 ```
 
-**Paso 3** — Envía peticiones continuas al ALB para observar la transición sin interrupciones:
+**Conectarse via SSM Session Manager (sin SSH):**
 
 ```bash
-while true; do
-  curl -s "$ALB_URL"
-  echo ""
-  sleep 2
-done
+aws ssm start-session --target $(terraform output -raw instance_id)
 ```
 
-Durante el proceso verás respuestas mezcladas (`v1` y `v2`) hasta que todas las instancias se hayan reemplazado. En ningún momento el servicio devuelve un error.
+### Verificar el User Data renderizado
 
-**Paso 4** — Cuando el refresh complete, todas las respuestas serán `v2`:
-
-```
-v2 | AZ: us-east-1a | ID: i-0xyz789
-v2 | AZ: us-east-1b | ID: i-0uvw012
-```
-
-### Demostrar el Target Tracking Scaling
-
-Genera carga artificial en una instancia para observar cómo el ASG añade capacidad automáticamente.
-
-**Paso 1** — Identifica el ID de una instancia del ASG:
+El output `user_data_rendered` permite inspeccionar el script que recibió la instancia:
 
 ```bash
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names lab28-asg \
-  --query 'AutoScalingGroups[0].Instances[0].InstanceId' \
-  --output text
+terraform output user_data_rendered
 ```
 
-**Paso 2** — Conéctate a la instancia vía SSM Session Manager (no requiere SSH ni bastión):
-
-```bash
-aws ssm start-session --target <INSTANCE_ID>
-```
-
-> Si el perfil IAM de la instancia no tiene permisos de SSM, usa `aws ec2-instance-connect send-ssh-public-key` o lanza una instancia bastion temporal.
-
-**Paso 3** — Desde dentro de la instancia, instala `stress` y genera carga de CPU:
-
-```bash
-sudo dnf install -y stress
-
-# 2 workers de CPU durante 5 minutos (uno por vCPU en t4g.small)
-stress --cpu 2 --timeout 300
-```
-
-> **Nota:** El Target Tracking calcula la CPU **media de todas las instancias del ASG**. Si el ASG tiene dos instancias y solo estreses una, la media puede quedarse en torno al 50% — justo en el umbral — y el escalado no llegará a activarse. Para garantizar el experimento, repite el mismo comando en la segunda instancia (obtenla con el mismo comando del Paso 1 cambiando `Instances[0]` por `Instances[1]`).
-
-**Paso 4** — Monitoriza el escalado desde tu terminal local:
-
-```bash
-watch -n 30 "aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names lab28-asg \
-  --query 'AutoScalingGroups[0].{Min:MinSize,Desired:DesiredCapacity,Max:MaxSize,Instances:length(Instances)}' \
-  --output table"
-```
-
-El ASG aumentará `DesiredCapacity` para mantener la CPU media en torno al 50%. Cuando `stress` finalice tras los 300 segundos, el ASG reducirá la capacidad gradualmente respetando el periodo de enfriamiento.
+Confirma que las variables `${env}`, `${app_name}` y `${db_endpoint}` fueron sustituidas por los valores reales de Terraform.
 
 ---
-
-> **Antes de comenzar los retos**, asegúrate de que todos los cambios de `main.tf` están aplicados (`terraform apply`). Si hay modificaciones pendientes en el ASG, se aplicarán junto con el reto y el criterio *"sin cambios en recursos existentes"* no se cumplirá.
 
 ## Verificación final
 
 ```bash
-# Obtener la URL del ALB
-ALB_URL=$(terraform output -raw alb_url)
+# Obtener la IP pública de la instancia
+PUBLIC_IP=$(terraform output -raw public_ip)
 
-# Probar la aplicación
-curl -s "http://${ALB_URL}" | head -5
+# Probar el servidor web
+curl -s "http://${PUBLIC_IP}"
 
-# Verificar que el ASG tiene instancias en servicio
-aws autoscaling describe-auto-scaling-groups \
-  --query 'AutoScalingGroups[?contains(AutoScalingGroupName,`lab28`)].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}' \
-  --output table
+# Verificar que IMDSv2 está activo (requiere token)
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=lab28" \
+  --query 'Reservations[*].Instances[*].MetadataOptions.HttpTokens' \
+  --output text
+# Esperado: required
 
-# Ver el estado del target group
-TG_ARN=$(terraform output -raw target_group_arn)
-aws elbv2 describe-target-health \
-  --target-group-arn "$TG_ARN" \
-  --query 'TargetHealthDescriptions[*].{ID:Target.Id,State:TargetHealth.State}' \
-  --output table
+# Verificar el IAM Instance Profile asignado
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=lab28" \
+  --query 'Reservations[*].Instances[*].IamInstanceProfile.Arn' \
+  --output text
+
+# Conectarse via SSM (sin SSH ni claves)
+INSTANCE_ID=$(terraform output -raw instance_id)
+aws ssm start-session --target "${INSTANCE_ID}"
 ```
 
 ---
 
 ## Retos
 
-### Reto 1 — Escalado Programado
+### Reto 1 — Restricción de AMI por Entorno
 
-La política de Target Tracking reacciona a la carga en tiempo real, pero hay patrones de uso predecibles — por ejemplo, un pico de tráfico siempre entre las 08:00 y las 20:00 UTC de lunes a viernes. El escalado programado (`aws_autoscaling_schedule`) ajusta la capacidad del ASG en horarios fijos, complementando al Target Tracking.
+El equipo de seguridad exige que en producción solo se usen AMIs con un nombre que contenga la palabra `minimal` (imágenes sin paquetes innecesarios), mientras que en desarrollo se permite cualquier AMI de Amazon Linux 2023.
 
-**Requisitos**
+**Tu objetivo:**
 
-1. Crea un archivo `schedules.tf` en `aws/` con dos recursos `aws_autoscaling_schedule`.
-2. El primero, `scale_up`, debe ejecutarse de lunes a viernes a las **08:00 UTC** y escalar el ASG a `min_size = 4`, `desired_capacity = 4`.
-3. El segundo, `scale_down`, debe ejecutarse de lunes a viernes a las **20:00 UTC** y devolver el ASG a `min_size = var.min_size`, `desired_capacity = var.desired_capacity`.
-4. Ambas acciones deben expresarse en formato cron y referenciar el ASG ya existente sin modificarlo.
+1. Añade una variable `ami_name_filter` de tipo `string` en `variables.tf` con valor por defecto `"al2023-ami-2023.*-arm64"`.
 
-**Criterios de éxito**
+2. Añade un bloque `validation` a la variable `env` (o crea una lógica en `locals`) que fuerce que cuando `var.env == "prod"`, el filtro de AMI contenga la cadena `minimal`. Pista: puedes usar la función `strcontains()`.
 
-- `terraform plan` no muestra cambios en los recursos existentes — solo añade los dos schedules.
-- `aws autoscaling describe-scheduled-actions --auto-scaling-group-name lab28-asg` lista las dos acciones con los horarios correctos.
-- Puedes explicar por qué `max_size` no se modifica en `scale_up` aunque la capacidad deseada aumente.
+3. Actualiza el `data "aws_ami"` para que use `var.ami_name_filter` en lugar del valor fijo.
 
-### Reto 2 — Alarma CloudWatch y Notificación SNS
+4. Verifica que `terraform plan -var='env=prod'` falla si el filtro no contiene `minimal`, y que `terraform plan -var='env=prod' -var='ami_name_filter=al2023-ami-minimal-2023.*-arm64'` funciona correctamente.
 
-El Target Tracking gestiona el escalado, pero no avisa al equipo cuando la carga es anormalmente alta. Un umbral de CPU del 80% sostenido durante 2 minutos podría indicar un problema en la aplicación (bucle infinito, fuga de memoria) más que una demanda legítima.
+**Criterios de Éxito**
 
-**Requisitos**
+- En `dev`, el plan funciona con el filtro por defecto sin cambios.
+- En `prod`, el plan falla con un mensaje de error claro si el filtro no contiene `minimal`.
+- El data source `aws_ami` usa la variable en lugar de un valor fijo.
 
-1. Crea un archivo `alerts.tf` en `aws/` con los siguientes recursos:
-   - `aws_sns_topic` con nombre `"${var.project}-alerts"`.
-   - `aws_sns_topic_subscription` de tipo `email` a tu dirección de correo.
-   - `aws_cloudwatch_metric_alarm` que se active cuando la **CPU media del ASG supere el 80%** durante **2 periodos consecutivos de 60 segundos** y envíe la notificación al topic SNS.
-2. La alarma debe también enviar una notificación de recuperación (`ok_actions`) cuando la CPU baje del umbral.
-3. Añade a `outputs.tf` la ARN del SNS topic y el nombre de la alarma.
+### Reto 2 — Política IAM de Mínimo Privilegio para S3
 
-**Criterios de éxito**
+El rol IAM actual solo tiene la política `AmazonSSMManagedInstanceCore`. El equipo necesita que la instancia pueda leer objetos de un bucket S3 específico (p. ej. para descargar configuraciones), pero **sin** otorgar acceso a todos los buckets de la cuenta.
 
-- `terraform apply` completa sin errores.
-- Recibes un correo de confirmación de suscripción SNS de AWS; debes aceptarlo para activar las notificaciones.
-- `aws cloudwatch describe-alarms --alarm-names "lab28-cpu-high"` muestra el estado `OK`.
-- Al generar carga de CPU superior al 80% durante 2 minutos (usando `yes > /dev/null &`), recibes un correo de alerta.
+**Tu objetivo:**
+
+1. Añade una variable `config_bucket_name` de tipo `string` con valor por defecto `"corp-lab28-config"`.
+
+2. Crea un `data "aws_iam_policy_document"` que otorgue permisos `s3:GetObject` y `s3:ListBucket` **únicamente** sobre el bucket `var.config_bucket_name` y sus objetos.
+
+3. Crea un recurso `aws_iam_policy` con el documento generado y asócialo al rol existente con `aws_iam_role_policy_attachment`.
+
+4. Añade un output `s3_policy_arn` que exponga el ARN de la política creada.
+
+5. Verifica con `terraform plan` que se crean 2 recursos nuevos (la política y el attachment) sin modificar los existentes.
+
+**Pistas**
+
+- El ARN de un bucket S3 es `arn:aws:s3:::nombre-del-bucket` y el de sus objetos `arn:aws:s3:::nombre-del-bucket/*`.
+- `s3:ListBucket` se aplica al bucket; `s3:GetObject` se aplica a los objetos (`/*`).
+- Usa dos bloques `statement` separados en el policy document, uno para cada nivel de recurso.
+
+**Criterios de Éxito**
+
+- El plan muestra exactamente `2 to add` (la policy y el attachment).
+- Los recursos existentes (rol, instance profile, instancia) no se modifican.
+- La política solo permite `s3:GetObject` y `s3:ListBucket` sobre el bucket especificado, no sobre `*`.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Escalado Programado</strong></summary>
+<summary><strong>Solución al Reto 1 — Restricción de AMI por Entorno</strong></summary>
 
-### Solución al Reto 1 — Escalado Programado
+### Solución al Reto 1 — Restricción de AMI por Entorno
 
-Crea el archivo `aws/schedules.tf`:
+#### Paso 1 — Añadir la variable `ami_name_filter` en `variables.tf`
 
 ```hcl
-resource "aws_autoscaling_schedule" "scale_up" {
-  scheduled_action_name  = "${var.project}-scale-up"
-  autoscaling_group_name = aws_autoscaling_group.web.name
-  recurrence             = "0 8 * * 1-5"   # Lunes–viernes, 08:00 UTC
-  time_zone              = "UTC"
-
-  min_size         = 4
-  max_size         = -1   # -1 significa "no cambiar el valor actual"
-  desired_capacity = 4
-}
-
-resource "aws_autoscaling_schedule" "scale_down" {
-  scheduled_action_name  = "${var.project}-scale-down"
-  autoscaling_group_name = aws_autoscaling_group.web.name
-  recurrence             = "0 20 * * 1-5"  # Lunes–viernes, 20:00 UTC
-  time_zone              = "UTC"
-
-  min_size         = var.min_size
-  max_size         = -1
-  desired_capacity = var.desired_capacity
+variable "ami_name_filter" {
+  type        = string
+  default     = "al2023-ami-2023.*-arm64"
+  description = "Patron de nombre para filtrar la AMI. En prod debe contener 'minimal'."
 }
 ```
 
-El valor `-1` en `max_size` le indica al ASG que no modifique el máximo vigente en ese momento. Si se pusiera el valor explícito de `var.max_size`, funcionaría igual, pero `-1` es más robusto: si alguien cambia manualmente el máximo fuera de ciclo, la acción programada no lo sobreescribirá.
+#### Paso 2 — Añadir la validación cruzada
 
-Verificación:
+Terraform no permite validaciones que referencien otras variables dentro de un bloque `variable`. La alternativa es usar un bloque `check` o una `locals` con `validation` mediante un recurso `null_resource` o un `precondition`. La forma más limpia en Terraform 1.5+ es un bloque `check`:
+
+```hcl
+check "ami_filter_prod" {
+  assert {
+    condition     = var.env != "prod" || strcontains(var.ami_name_filter, "minimal")
+    error_message = "En producción, ami_name_filter debe contener 'minimal' para cumplir con la politica de seguridad."
+  }
+}
+```
+
+Alternativamente, si usas una versión anterior a 1.5, puedes usar un `precondition` en el data source:
+
+```hcl
+data "aws_ami" "al2023" {
+  # ...filtros...
+
+  lifecycle {
+    precondition {
+      condition     = var.env != "prod" || strcontains(var.ami_name_filter, "minimal")
+      error_message = "En producción, ami_name_filter debe contener 'minimal'."
+    }
+  }
+}
+```
+
+#### Paso 3 — Actualizar el data source
+
+Sustituye el valor fijo del filtro `name` por la variable:
+
+```hcl
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = [var.ami_name_filter]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+```
+
+#### Verificación
 
 ```bash
-terraform apply
+# Dev: funciona con el filtro por defecto
+terraform plan
 
-aws autoscaling describe-scheduled-actions \
-  --auto-scaling-group-name lab28-asg \
-  --query 'ScheduledUpdateGroupActions[].{Nombre:ScheduledActionName,Cron:Recurrence,Min:MinSize,Desired:DesiredCapacity}' \
-  --output table
+# Prod sin minimal: falla
+terraform plan -var='env=prod'
+# Error: En producción, ami_name_filter debe contener 'minimal'...
+
+# Prod con minimal: funciona
+terraform plan -var='env=prod' -var='ami_name_filter=al2023-ami-minimal-2023.*-arm64'
 ```
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Alarma CloudWatch y Notificación SNS</strong></summary>
+<summary><strong>Solución al Reto 2 — Política IAM de Mínimo Privilegio para S3</strong></summary>
 
-### Solución al Reto 2 — Alarma CloudWatch y Notificación SNS
+### Solución al Reto 2 — Política IAM de Mínimo Privilegio para S3
 
-Crea el archivo `aws/alerts.tf`:
+#### Paso 1 — Variable en `variables.tf`
 
 ```hcl
-resource "aws_sns_topic" "alerts" {
-  name = "${var.project}-alerts"
-  tags = local.tags
+variable "config_bucket_name" {
+  type        = string
+  default     = "corp-lab28-config"
+  description = "Nombre del bucket S3 con configuraciones de la aplicación."
 }
+```
 
-resource "aws_sns_topic_subscription" "email" {
-  topic_arn = aws_sns_topic.alerts.arn
-  protocol  = "email"
-  endpoint  = "tu-correo@ejemplo.com"   # Sustituye por tu dirección real
-}
+#### Paso 2 — Policy document y recursos en `main.tf`
 
-resource "aws_cloudwatch_metric_alarm" "cpu_high" {
-  alarm_name          = "${var.project}-cpu-high"
-  alarm_description   = "CPU media del ASG por encima del 80% durante 2 minutos"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 60
-  statistic           = "Average"
-  threshold           = 80
-
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.web.name
+```hcl
+data "aws_iam_policy_document" "s3_read" {
+  statement {
+    sid       = "ListConfigBucket"
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::${var.config_bucket_name}"]
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  statement {
+    sid       = "GetConfigObjects"
+    actions   = ["s3:GetObject"]
+    resources = ["arn:aws:s3:::${var.config_bucket_name}/*"]
+  }
+}
 
-  tags = local.tags
+resource "aws_iam_policy" "s3_read" {
+  name   = "${var.app_name}-s3-read"
+  policy = data.aws_iam_policy_document.s3_read.json
+
+  tags = {
+    Name = "${var.app_name}-s3-read"
+    Env  = var.env
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "s3_read" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = aws_iam_policy.s3_read.arn
 }
 ```
 
-Añade a `outputs.tf`:
+#### Paso 3 — Output en `outputs.tf`
 
 ```hcl
-output "sns_topic_arn" {
-  description = "ARN del topic SNS de alertas"
-  value       = aws_sns_topic.alerts.arn
-}
-
-output "cloudwatch_alarm_name" {
-  description = "Nombre de la alarma de CPU alta"
-  value       = aws_cloudwatch_metric_alarm.cpu_high.alarm_name
+output "s3_policy_arn" {
+  description = "ARN de la politica IAM de lectura S3"
+  value       = aws_iam_policy.s3_read.arn
 }
 ```
 
-> **Importante:** tras el `terraform apply`, AWS envía un correo a la dirección configurada con un enlace de confirmación. La suscripción queda en estado `PendingConfirmation` hasta que se acepte; sin confirmar, no se reciben notificaciones.
-
-Verificación:
+### Verificación
 
 ```bash
+terraform plan
+# Plan: 2 to add, 0 to change, 0 to destroy.
+
 terraform apply
 
-# Confirmar que la alarma existe y está en estado OK
-aws cloudwatch describe-alarms \
-  --alarm-names "lab28-cpu-high" \
-  --query 'MetricAlarms[0].{Nombre:AlarmName,Estado:StateValue,Umbral:Threshold}' \
-  --output table
-
-# Generar carga para activar la alarma
-stress --cpu 2 --timeout 300 &
-
-# Monitorizar el estado de la alarma
-watch -n 15 "aws cloudwatch describe-alarms \
-  --alarm-names lab28-cpu-high \
-  --query 'MetricAlarms[0].StateValue' --output text"
+# Verificar que la política está asociada al rol
+aws iam list-attached-role-policies --role-name corp-lab28-ec2-role
 ```
+
+La política resultante solo permite lectura sobre el bucket específico. A diferencia de usar la política gestionada `AmazonS3ReadOnlyAccess` (que da acceso a todos los buckets), esta política sigue el principio de mínimo privilegio.
 
 </details>
 
@@ -517,22 +755,19 @@ watch -n 15 "aws cloudwatch describe-alarms \
 
 ## Limpieza
 
+Desde el directorio `lab28/aws/`:
+
 ```bash
-# Desde lab28/aws/
 terraform destroy
 ```
-
-El destroy elimina recursos en orden inverso. El NAT Gateway, el ALB y las instancias del ASG tardan varios minutos en destruirse completamente.
-
-> El bucket S3 de estado (`terraform-state-labs-<ACCOUNT_ID>`) no se destruye: se reutiliza en otros laboratorios.
 
 ---
 
 ## LocalStack
 
-Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
+Este laboratorio puede ejecutarse íntegramente en LocalStack para validar la sintaxis y la estructura de los recursos. Consulta [localstack/README.md](localstack/README.md) para las instrucciones de despliegue local.
 
-LocalStack Community soporta VPC, subnets y Launch Templates completamente. El ALB y el ASG tienen soporte parcial: los recursos se crean pero las instancias no se lanzan realmente y el DNS del ALB no resuelve a backends funcionales. Para observar el comportamiento dinámico del rolling update y el escalado, se requiere AWS real o LocalStack Pro.
+>  **Limitación:** dado que LocalStack simula la instancia EC2 sin ejecutarla realmente, el User Data no se ejecuta y la página web no estará accesible. Las verificaciones de IMDSv2, Instance Profile y AMI se validan a nivel de API.
 
 ---
 
@@ -540,37 +775,38 @@ LocalStack Community soporta VPC, subnets y Launch Templates completamente. El A
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| VPC, subnets, route tables | Infraestructura real | Soportado |
-| NAT Gateway | Activo, con coste por hora y datos | Simulado sin coste |
-| ALB con DNS funcional | Resuelve a instancias reales | DNS simulado, sin backends reales |
-| Instancias EC2 en ASG | Se lanzan, ejecutan `user_data` y pasan health checks | No se lanzan instancias reales |
-| Instance Refresh visible | Reemplaza instancias gradualmente | Registra la operación sin efecto real |
-| Target Tracking Scaling | CloudWatch emite métricas y el ASG escala | Sin métricas reales — no escala |
-| Coste aproximado del lab | ~$0.10–0.20/hora (NAT GW + ALB + EC2) | Sin coste |
+| `data "aws_ami"` | Consulta el catálogo real de AMIs | Devuelve AMIs simuladas |
+| `aws_iam_role` | Rol IAM real con permisos efectivos | Soportado, comportamiento simulado |
+| `aws_iam_instance_profile` | Profile real asociable a instancias | Soportado |
+| `aws_instance` | Instancia EC2 real ejecutandose | Instancia simulada |
+| `metadata_options` (IMDSv2) | Protección real contra SSRF | Aceptado por la API, no aplicable |
+| `templatefile()` | Se evalúa en local antes del plan | Idéntico (función de Terraform) |
+| `user_data` | Ejecutado por cloud-init al arrancar | Almacenado pero no ejecutado |
+| Conectividad HTTP | Servidor web accesible | No accesible (instancia simulada) |
+| SSM Session Manager | Funcional con el Instance Profile | No disponible |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Un NAT Gateway por AZ.** Este laboratorio crea un NAT Gateway por AZ (`count = length(local.azs)`). Si una zona cae, las instancias de las AZs restantes conservan su conectividad de salida. Usar un único NAT Gateway abarataría el laboratorio, pero convertiría ese recurso en un SPOF de la conectividad de salida.
-- **Usa `version = aws_launch_template.web.latest_version` en lugar de `"$Latest"`.** El puntero `$Latest` no cambia en el estado de Terraform, por lo que no activa el `instance_refresh` al actualizar el template. Referenciar `latest_version` directamente garantiza que Terraform detecta el cambio.
-- **Ajusta `min_healthy_percentage` según tu SLA.** Al 90% con 10 instancias, el ASG puede reemplazar como máximo 1 instancia a la vez. Al 50% puede reemplazar 5 simultáneamente (más rápido, pero con mayor riesgo).
-- **Combina `instance_warmup` con el tiempo real de arranque de tu aplicación.** Si `user_data` tarda 90 segundos en levantar el servicio, configura `instance_warmup = 120` para que el ASG no evalúe la salud antes de que la instancia esté lista.
-- **Habilita `enabled_metrics` en el ASG.** Sin este bloque, CloudWatch solo recibe métricas de instancia individuales con granularidad de 5 minutos. Con `metrics_granularity = "1Minute"` y `enabled_metrics`, el ASG publica métricas propias (instancias en servicio, pendientes, terminando…) cada minuto, lo que acelera la respuesta del Target Tracking y permite monitorizar el escalado en tiempo real desde la consola de CloudWatch.
-- **Usa `health_check_type = "ELB"` siempre que tengas un ALB.** El health check de tipo EC2 solo comprueba que la instancia está encendida; el de tipo ELB comprueba que la aplicación responde correctamente al health check del target group.
-- **Protege las subredes privadas.** Los Security Groups de las instancias solo deben aceptar tráfico del Security Group del ALB, nunca de `0.0.0.0/0`. Así, ningún atacante puede llegar directamente a las instancias aunque conozca su IP.
+- **Nunca hardcodees AMI IDs.** Usa `data "aws_ami"` con filtros para obtener la versión más reciente de forma agnóstica a la región. Un AMI ID que funciona en `us-east-1` no existe en `eu-west-1`.
+- **Usa Instance Profiles en lugar de Access Keys.** Las credenciales temporales del Instance Metadata Service rotan automáticamente y no requieren gestión manual. Las Access Keys estáticas dentro de una instancia son un riesgo de seguridad crítico.
+- **Fuerza IMDSv2 siempre.** Configura `http_tokens = "required"` en todas las instancias. IMDSv1 es vulnerable a ataques SSRF y AWS recomienda desactivarlo. Considera establecer esto como política a nivel de cuenta con una SCP.
+- **Verifica el User Data antes de aplicar.** El output `user_data_rendered` permite detectar errores de plantilla en el `plan` en lugar de depurar una instancia que no arrancó correctamente.
+- **No abras el puerto SSH.** Usa SSM Session Manager para acceso interactivo. Esto elimina la necesidad de gestionar claves SSH, bastion hosts y reglas de firewall para el puerto 22.
+- **Usa `user_data_replace_on_change = true`** para forzar la recreación de la instancia cuando cambie el script de bootstrap. Sin este argumento, cambios en el User Data se ignoran en instancias existentes.
 
 ---
 
 ## Recursos
 
-- [aws_launch_template — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/launch_template)
-- [aws_autoscaling_group — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_group)
-- [aws_autoscaling_schedule — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_schedule)
-- [aws_cloudwatch_metric_alarm — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm)
-- [aws_sns_topic — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sns_topic)
-- [aws_lb / aws_lb_listener — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lb)
-- [Instance Refresh — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/asg-instance-refresh.html)
-- [Target Tracking Scaling — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
-- [Scheduled Scaling — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-scheduled-scaling.html)
-- [Multi-AZ ASG — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html)
+- [Data source aws_ami](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/ami)
+- [Recurso aws_instance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance)
+- [Recurso aws_iam_role](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role)
+- [Recurso aws_iam_instance_profile](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile)
+- [Data source aws_iam_policy_document](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document)
+- [Recurso aws_security_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group)
+- [Función templatefile()](https://developer.hashicorp.com/terraform/language/functions/templatefile)
+- [Configurar IMDSv2 en EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
+- [SSM Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
+- [Buenas prácticas de seguridad en EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security.html)

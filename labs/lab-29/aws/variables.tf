@@ -14,21 +14,31 @@ variable "vpc_cidr" {
   default = "10.0.0.0/16"
 }
 
-variable "desired_count" {
+variable "instance_type" {
+  type    = string
+  default = "t4g.small"
+}
+
+variable "min_size" {
   type        = number
-  description = "Número de tareas Fargate que ECS mantendrá en ejecución"
+  description = "Número mínimo de instancias en el ASG"
   default     = 2
 }
 
-variable "container_image" {
-  type        = string
-  description = "Imagen del contenedor a desplegar. Usa la imagen pública de nginx para pruebas inmediatas o sustitúyela por la URL de tu repositorio ECR tras hacer push."
-  default     = "nginx:alpine"
+variable "max_size" {
+  type        = number
+  description = "Número máximo de instancias en el ASG"
+  default     = 6
 }
 
-variable "api_key" {
+variable "desired_capacity" {
+  type        = number
+  description = "Capacidad deseada inicial del ASG"
+  default     = 2
+}
+
+variable "app_version" {
   type        = string
-  description = "Clave de API almacenada en SSM Parameter Store como SecureString. ECS la inyecta como la variable de entorno API_KEY en cada contenedor."
-  sensitive   = true
-  default     = "mi-clave-de-api-secreta-lab29"
+  description = "Versión de la aplicación embebida en user_data. Cambiarla genera una nueva versión del Launch Template y activa el instance_refresh."
+  default     = "v1"
 }

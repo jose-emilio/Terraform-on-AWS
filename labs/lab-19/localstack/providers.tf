@@ -24,9 +24,11 @@ provider "aws" {
   s3_use_path_style = true
 
   endpoints {
-    ec2 = "http://localhost.localstack.cloud:4566"
-    s3  = "http://localhost.localstack.cloud:4566"
-    iam = "http://localhost.localstack.cloud:4566"
-    sts = "http://localhost.localstack.cloud:4566"
+    ec2   = "http://localhost.localstack.cloud:4566"
+    s3    = "http://localhost.localstack.cloud:4566"
+    elbv2 = "http://localhost.localstack.cloud:4566"
+    iam   = "http://localhost.localstack.cloud:4566"
+    sts   = "http://localhost.localstack.cloud:4566"
+    logs  = "http://localhost.localstack.cloud:4566"
   }
 }

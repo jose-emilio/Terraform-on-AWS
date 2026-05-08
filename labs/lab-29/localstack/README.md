@@ -1,9 +1,9 @@
-# Laboratorio 29 — LocalStack: Microservicios con ECS Fargate y Malla de Servicios
+# Laboratorio 29 — LocalStack: Escalabilidad y Alta Disponibilidad con Zero Downtime
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Este documento describe cómo ejecutar el laboratorio 29 contra LocalStack. El código Terraform es el mismo que en `aws/`; solo cambia la configuración del provider.
+Este documento describe cómo ejecutar el laboratorio 28 contra LocalStack. El código Terraform es el mismo que en `aws/`; solo cambia la configuración del provider.
 
 ## Requisitos previos
 
@@ -20,17 +20,15 @@ LocalStack Community simula los servicios de AWS con algunas restricciones relev
 
 | Servicio | Soporte en Community |
 |---|---|
-| ECR (`aws_ecr_repository`, `aws_ecr_lifecycle_policy`) | Completo — el repositorio se crea; el push no rechaza tags duplicados (IMMUTABLE no se valida) |
-| SSM Parameter Store (`SecureString`) | Completo — `--with-decryption` devuelve el valor almacenado |
-| IAM roles y políticas | Completo |
-| CloudWatch Log Groups | Completo |
-| ECS Cluster y Task Definitions | Parcial — los recursos se registran en el estado de Terraform correctamente |
-| Tareas Fargate | No se lanzan contenedores reales; los scripts `startup.sh` y `startup-api.sh` no se ejecutan |
-| Service Connect / Cloud Map | Configuración registrada, sin proxy Envoy real ni resolución DNS interna |
-| Deployment Circuit Breaker | Se configura, no hay despliegue real que fallar |
-| ECS Execute Command | No disponible sin contenedores reales |
+| VPC, subnets, IGW, NAT GW | Completo |
+| Security Groups | Completo |
+| ALB (`aws_lb`, `aws_lb_listener`) | Parcial — el DNS no resuelve a instancias reales |
+| Auto Scaling Group | Parcial — crea el recurso pero no lanza instancias EC2 reales |
+| Launch Template | Completo |
+| Política Target Tracking | Parcial — se crea el recurso, pero CloudWatch no emite métricas |
+| `instance_refresh` | Parcial — se registra la operación, no hay instancias que reemplazar |
 
-El valor del laboratorio con LocalStack radica en verificar que el código Terraform es sintácticamente válido y que todos los recursos se crean sin errores de API. Para observar el comportamiento real de Service Connect, la inyección de secretos SSM y el Circuit Breaker, se requiere AWS real.
+El valor del laboratorio con LocalStack radica en verificar que el código Terraform es válido y que los recursos se crean sin errores de API. Para observar el comportamiento real del ALB, ASG e `instance_refresh`, se requiere AWS real o LocalStack Pro.
 
 ### Inicialización y despliegue
 
@@ -51,42 +49,45 @@ terraform apply
 
 ### Verificación
 
-Comprueba que los recursos se han creado correctamente:
+Comprueba que los recursos se han creado:
 
 ```bash
-# ECR
-awslocal ecr describe-repositories \
-  --query 'repositories[].{Nombre:repositoryName,Mutabilidad:imageTagMutability}'
+# VPC y subredes
+aws --profile localstack ec2 describe-vpcs \
+  --filters "Name=tag:Project,Values=lab29-local" \
+  --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock}' --output table
 
-# SSM — el parámetro SecureString se almacena y se puede recuperar
-awslocal ssm get-parameter \
-  --name /lab29-local/api-key \
-  --with-decryption \
-  --query 'Parameter.{Nombre:Name,Tipo:Type,Valor:Value}'
+aws --profile localstack ec2 describe-subnets \
+  --filters "Name=tag:Project,Values=lab29-local" \
+  --query 'Subnets[].{ID:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone}' --output table
 
-# ECS Cluster
-awslocal ecs describe-clusters \
-  --clusters lab29-local-cluster \
-  --query 'clusters[].{Nombre:clusterName,Estado:status}'
+# ALB
+aws --profile localstack elbv2 describe-load-balancers \
+  --query 'LoadBalancers[].{Name:LoadBalancerName,DNS:DNSName,State:State.Code}' \
+  --output table
 
-# Task Definitions (web y api)
-awslocal ecs describe-task-definition \
-  --task-definition lab29-local-web \
-  --query 'taskDefinition.{Family:family,Revision:revision,CPU:cpu,Memoria:memory}'
+# ASG
+aws --profile localstack autoscaling describe-auto-scaling-groups \
+  --query 'AutoScalingGroups[].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}' \
+  --output table
 
-awslocal ecs describe-task-definition \
-  --task-definition lab29-local-api \
-  --query 'taskDefinition.{Family:family,Revision:revision,CPU:cpu,Memoria:memory}'
+# Launch Template
+aws --profile localstack ec2 describe-launch-templates \
+  --query 'LaunchTemplates[].{Name:LaunchTemplateName,Version:LatestVersionNumber}' \
+  --output table
+```
 
-# Servicios ECS
-awslocal ecs describe-services \
-  --cluster lab29-local-cluster \
-  --services lab29-local-web lab29-local-api \
-  --query 'services[].{Nombre:serviceName,Estado:status,Deseadas:desiredCount}'
+### Demostración del Instance Refresh (LocalStack)
 
-# Namespace Service Connect
-awslocal servicediscovery list-namespaces \
-  --query 'Namespaces[].{Nombre:Name,Tipo:Type}'
+Aunque LocalStack no reemplaza instancias reales, puedes verificar que Terraform genera una nueva versión del Launch Template al cambiar `app_version` y que el ASG registra una operación de refresh:
+
+```bash
+# Desde lab29/localstack/
+terraform apply -var="app_version=v2"
+
+# Consultar el historial de instance refreshes del ASG
+aws --profile localstack autoscaling describe-instance-refreshes \
+  --auto-scaling-group-name lab29-local-asg
 ```
 
 ---
@@ -104,31 +105,24 @@ terraform destroy
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| ECR con IMMUTABLE | Rechaza push con tag duplicado | El repositorio se crea; IMMUTABLE no se valida en Community |
-| Lifecycle policy | Se evalúa automáticamente | Se almacena pero no se evalúa |
-| SSM SecureString | Cifrado con KMS real | Almacenado; `--with-decryption` devuelve el valor |
-| ECS Task Definition | Registrada y utilizable | Registrada correctamente |
-| Tareas Fargate | Se lanzan y ejecutan `startup.sh` | No se lanzan contenedores reales |
-| Service Connect | Proxy Envoy funcional entre tareas | Configuración registrada, sin proxy real |
-| Circuit Breaker | Detecta fallos y revierte automáticamente | Se configura, sin despliegue real que fallar |
-| Execute Command | Funcional con el SSM Agent | No disponible sin contenedores |
-| Inyección de secretos SSM | El agente ECS descifra y entrega la variable de entorno | Sin contenedor que reciba la variable |
-| Coste aproximado | ~$0.03/hora × 4 tareas Fargate (2 web + 2 api, 256 CPU / 512 MB) | Sin coste |
+| ALB con DNS funcional | Sí — resuelve a instancias reales | Parcial — DNS simulado |
+| Instancias EC2 en ASG | Se lanzan y pasan health checks | No se lanzan instancias reales |
+| Instance Refresh visible | Reemplaza instancias gradualmente | Registra la operación sin efecto real |
+| Target Tracking (CPU) | CloudWatch escala el ASG | Sin métricas reales — no escala |
+| Coste | NAT GW + instancias EC2 + ALB | Sin coste |
 
 ---
 
 ## Buenas Prácticas
 
-- Usa LocalStack para validar la sintaxis de las task definitions y los `jsonencode()` antes de desplegar en AWS real.
-- Para probar el comportamiento dinámico de Service Connect, la autenticación por header y el Circuit Breaker, usa AWS real.
+- Usa LocalStack para validar la sintaxis y los tipos de recursos antes de desplegar en AWS real.
+- Para probar el comportamiento dinámico (scaling, rolling update), usa AWS real o LocalStack Pro.
 - El flag `terraform validate` y `terraform plan` son suficientes para detectar errores de configuración sin necesidad de LocalStack.
-- Verifica siempre el parámetro SSM con `--with-decryption` para confirmar que el valor se almacenó correctamente, aunque en LocalStack no haya cifrado KMS real.
 
 ---
 
 ## Recursos Adicionales
 
-- [LocalStack — ECR](https://docs.localstack.cloud/aws/services/ecr/)
-- [LocalStack — ECS](https://docs.localstack.cloud/aws/services/ecs/)
-- [LocalStack — SSM](https://docs.localstack.cloud/aws/services/ssm/)
+- [LocalStack — ELBv2](https://docs.localstack.cloud/aws/services/elb/)
+- [LocalStack — Auto Scaling](https://docs.localstack.cloud/aws/services/autoscaling/)
 - [LocalStack Pro — soporte ampliado](https://docs.localstack.cloud/aws/getting-started/)

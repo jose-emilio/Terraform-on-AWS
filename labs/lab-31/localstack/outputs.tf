@@ -1,19 +1,26 @@
-# api_endpoint y api_id se han eliminado: API Gateway v2 no está disponible
-# en LocalStack Community. Usa aws/ para el despliegue completo con AWS real.
-
 output "function_name" {
   description = "Nombre de la función Lambda"
-  value       = aws_lambda_function.api.function_name
+  value       = aws_lambda_function.processor.function_name
 }
 
-output "layer_arn" {
-  description = "ARN versionado de la Lambda Layer 'utils'"
-  value       = aws_lambda_layer_version.utils.arn
+output "orders_queue_url" {
+  description = "URL de la cola SQS de entrada (órdenes)"
+  value       = aws_sqs_queue.orders.url
 }
 
-output "layer_version" {
-  description = "Número de versión de la Lambda Layer"
-  value       = aws_lambda_layer_version.utils.version
+output "dlq_url" {
+  description = "URL de la Dead Letter Queue"
+  value       = aws_sqs_queue.dlq.url
+}
+
+output "success_queue_url" {
+  description = "URL de la cola de éxitos (Lambda Destination on_success)"
+  value       = aws_sqs_queue.success.url
+}
+
+output "failure_queue_url" {
+  description = "URL de la cola de fallos (Lambda Destination on_failure)"
+  value       = aws_sqs_queue.failure.url
 }
 
 output "log_group" {
@@ -21,7 +28,17 @@ output "log_group" {
   value       = aws_cloudwatch_log_group.lambda.name
 }
 
-output "invoke_example" {
-  description = "Comando awslocal para invocar la función directamente"
-  value       = "awslocal lambda invoke --function-name ${aws_lambda_function.api.function_name} --payload '{\"requestContext\":{\"http\":{\"method\":\"GET\"}},\"rawPath\":\"/items\"}' --cli-binary-format raw-in-base64-out /tmp/response.json && cat /tmp/response.json"
+output "send_premium_example" {
+  description = "Comando para enviar una orden premium a la cola de entrada"
+  value       = "awslocal sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"order_id\":\"ORD-001\",\"order_type\":\"premium\",\"amount\":299.99}'"
+}
+
+output "invoke_async_success_example" {
+  description = "Invocación async directa para probar Lambda Destinations (éxito)"
+  value       = "awslocal lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-001\",\"order_type\":\"premium\",\"amount\":500.00}' --cli-binary-format raw-in-base64-out /dev/null"
+}
+
+output "invoke_async_failure_example" {
+  description = "Invocación async directa para probar Lambda Destinations (fallo, amount > 9999)"
+  value       = "awslocal lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-002\",\"order_type\":\"premium\",\"amount\":99999.99}' --cli-binary-format raw-in-base64-out /dev/null"
 }

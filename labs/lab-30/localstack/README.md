@@ -1,9 +1,9 @@
-# Laboratorio 30 — LocalStack: Procesamiento Asíncrono y Resiliencia de Eventos
+# Laboratorio 30 — LocalStack: Microservicios con ECS Fargate y Malla de Servicios
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Este documento describe cómo ejecutar el laboratorio 30 contra LocalStack. El código Terraform de `localstack/` es equivalente al de `aws/` con las adaptaciones necesarias para los servicios disponibles en LocalStack Community.
+Este documento describe cómo ejecutar el laboratorio 29 contra LocalStack. El código Terraform es el mismo que en `aws/`; solo cambia la configuración del provider.
 
 ## Requisitos previos
 
@@ -16,17 +16,21 @@ Este documento describe cómo ejecutar el laboratorio 30 contra LocalStack. El c
 
 ### Limitaciones conocidas
 
+LocalStack Community simula los servicios de AWS con algunas restricciones relevantes para este laboratorio:
+
 | Servicio | Soporte en Community |
 |---|---|
-| `archive_file` (provider archive) | Completo — operación local, sin llamadas a AWS |
-| `source_code_hash` | Completo — detecta cambios y redespliega |
-| SQS (`aws_sqs_queue`, `redrive_policy`) | Completo — colas, DLQ y política de redrive funcionan correctamente |
-| Lambda Function (Python 3.12) | Completo — el código Python se ejecuta realmente |
-| `aws_lambda_event_source_mapping` (SQS) | Completo — Lambda recibe mensajes de la cola automáticamente |
+| ECR (`aws_ecr_repository`, `aws_ecr_lifecycle_policy`) | Completo — el repositorio se crea; el push no rechaza tags duplicados (IMMUTABLE no se valida) |
+| SSM Parameter Store (`SecureString`) | Completo — `--with-decryption` devuelve el valor almacenado |
 | IAM roles y políticas | Completo |
 | CloudWatch Log Groups | Completo |
-| `filter_criteria` | Parcial — los filtros pueden no aplicarse en Community; todos los mensajes podrían activar Lambda independientemente del `order_type` |
-| `aws_lambda_function_event_invoke_config` (Lambda Destinations) | Parcial — el recurso se crea sin errores, pero LocalStack Community puede no enrutar el resultado a las colas de destino |
+| ECS Cluster y Task Definitions | Parcial — los recursos se registran en el estado de Terraform correctamente |
+| Tareas Fargate | No se lanzan contenedores reales; los scripts `startup.sh` y `startup-api.sh` no se ejecutan |
+| Service Connect / Cloud Map | Configuración registrada, sin proxy Envoy real ni resolución DNS interna |
+| Deployment Circuit Breaker | Se configura, no hay despliegue real que fallar |
+| ECS Execute Command | No disponible sin contenedores reales |
+
+El valor del laboratorio con LocalStack radica en verificar que el código Terraform es sintácticamente válido y que todos los recursos se crean sin errores de API. Para observar el comportamiento real de Service Connect, la inyección de secretos SSM y el Circuit Breaker, se requiere AWS real.
 
 ### Inicialización y despliegue
 
@@ -45,122 +49,44 @@ terraform plan
 terraform apply
 ```
 
-El `apply` despliega todas las colas SQS, Lambda, IAM y CloudWatch. No fallará por las limitaciones de `filter_criteria` o Lambda Destinations — los recursos se crean correctamente.
+### Verificación
 
-### Verificación de recursos
-
-```bash
-# Función Lambda
-awslocal lambda get-function \
-  --function-name "$(terraform output -raw function_name)" \
-  --query 'Configuration.{Estado:State,Runtime:Runtime,Handler:Handler}'
-
-# Event Source Mapping
-awslocal lambda list-event-source-mappings \
-  --function-name "$(terraform output -raw function_name)" \
-  --query 'EventSourceMappings[*].{UUID:UUID,Estado:State,BatchSize:BatchSize,Source:EventSourceArn}'
-
-# Colas SQS creadas
-awslocal sqs list-queues
-
-# Atributos de la cola de órdenes (redrive policy)
-awslocal sqs get-queue-attributes \
-  --queue-url "$(terraform output -raw orders_queue_url)" \
-  --attribute-names All \
-  --query 'Attributes.{RetentionSeconds:MessageRetentionPeriod,VisibilityTimeout:VisibilityTimeout,RedrivePolicy:RedrivePolicy}'
-
-# Log group
-awslocal logs describe-log-groups \
-  --log-group-name-prefix /aws/lambda/lab30-local
-```
-
-### Flujo SQS → Lambda (Event Source Mapping)
-
-El Event Source Mapping está activo y Lambda pollea la cola automáticamente. Envía mensajes y observa cómo Lambda los procesa:
+Comprueba que los recursos se han creado correctamente:
 
 ```bash
-ORDERS_URL=$(terraform output -raw orders_queue_url)
+# ECR
+awslocal ecr describe-repositories \
+  --query 'repositories[].{Nombre:repositoryName,Mutabilidad:imageTagMutability}'
 
-# Orden premium (debería activar Lambda según filter_criteria)
-awslocal sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_id":"ORD-001","order_type":"premium","amount":299.99}'
+# SSM — el parámetro SecureString se almacena y se puede recuperar
+awslocal ssm get-parameter \
+  --name /lab30-local/api-key \
+  --with-decryption \
+  --query 'Parameter.{Nombre:Name,Tipo:Type,Valor:Value}'
 
-# Orden estándar (debería ser filtrada en AWS real; en Community puede activar Lambda)
-awslocal sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_id":"ORD-002","order_type":"standard","amount":49.99}'
+# ECS Cluster
+awslocal ecs describe-clusters \
+  --clusters lab30-local-cluster \
+  --query 'clusters[].{Nombre:clusterName,Estado:status}'
 
-# Orden con amount > 9999 (procesamiento fallará → 3 reintentos → DLQ)
-awslocal sqs send-message \
-  --queue-url "$ORDERS_URL" \
-  --message-body '{"order_id":"ORD-003","order_type":"premium","amount":99999.99}'
+# Task Definitions (web y api)
+awslocal ecs describe-task-definition \
+  --task-definition lab30-local-web \
+  --query 'taskDefinition.{Family:family,Revision:revision,CPU:cpu,Memoria:memory}'
 
-# Espera unos segundos y verifica los logs de Lambda
-awslocal logs describe-log-streams \
-  --log-group-name "$(terraform output -raw log_group)" \
-  --order-by LastEventTime --descending --max-items 3
+awslocal ecs describe-task-definition \
+  --task-definition lab30-local-api \
+  --query 'taskDefinition.{Family:family,Revision:revision,CPU:cpu,Memoria:memory}'
 
-# Verifica mensajes en la DLQ (tras varios segundos para que los reintentos completen)
-awslocal sqs get-queue-attributes \
-  --queue-url "$(terraform output -raw dlq_url)" \
-  --attribute-names ApproximateNumberOfMessages
-```
+# Servicios ECS
+awslocal ecs describe-services \
+  --cluster lab30-local-cluster \
+  --services lab30-local-web lab30-local-api \
+  --query 'services[].{Nombre:serviceName,Estado:status,Deseadas:desiredCount}'
 
-### Lambda Destinations (invocación async directa)
-
-Para demostrar Lambda Destinations con invocación asíncrona:
-
-```bash
-FUNCTION=$(terraform output -raw function_name)
-
-# Invocación async exitosa (amount ≤ 9999) → debería llegar a success-queue
-awslocal lambda invoke \
-  --function-name "$FUNCTION" \
-  --invocation-type Event \
-  --payload '{"order_id":"ASYNC-001","order_type":"premium","amount":500.00}' \
-  --cli-binary-format raw-in-base64-out \
-  /dev/null
-
-# Invocación async fallida (amount > 9999) → debería llegar a failure-queue
-awslocal lambda invoke \
-  --function-name "$FUNCTION" \
-  --invocation-type Event \
-  --payload '{"order_id":"ASYNC-002","order_type":"premium","amount":99999.99}' \
-  --cli-binary-format raw-in-base64-out \
-  /dev/null
-
-# Verifica mensajes en success-queue (soporte parcial en Community)
-awslocal sqs receive-message \
-  --queue-url "$(terraform output -raw success_queue_url)" \
-  --max-number-of-messages 5
-
-# Verifica mensajes en failure-queue (soporte parcial en Community)
-awslocal sqs receive-message \
-  --queue-url "$(terraform output -raw failure_queue_url)" \
-  --max-number-of-messages 5
-```
-
-### Invocación sync directa (para verificar el handler)
-
-Para verificar que el handler Python funciona correctamente sin esperar al Event Source Mapping, invoca Lambda de forma síncrona:
-
-```bash
-FUNCTION=$(terraform output -raw function_name)
-
-# Orden premium válida
-awslocal lambda invoke \
-  --function-name "$FUNCTION" \
-  --payload '{"Records":[{"body":"{\"order_id\":\"ORD-TEST\",\"order_type\":\"premium\",\"amount\":150.00}"}]}' \
-  --cli-binary-format raw-in-base64-out \
-  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
-
-# Orden que falla (amount > 9999) — verifica el mensaje de error
-awslocal lambda invoke \
-  --function-name "$FUNCTION" \
-  --payload '{"Records":[{"body":"{\"order_id\":\"ORD-FAIL\",\"order_type\":\"premium\",\"amount\":99999.99}"}]}' \
-  --cli-binary-format raw-in-base64-out \
-  /tmp/response_fail.json && cat /tmp/response_fail.json | python3 -m json.tool
+# Namespace Service Connect
+awslocal servicediscovery list-namespaces \
+  --query 'Namespaces[].{Nombre:Name,Tipo:Type}'
 ```
 
 ---
@@ -170,9 +96,6 @@ awslocal lambda invoke \
 ```bash
 # Desde lab30/localstack/
 terraform destroy
-
-# Eliminar el ZIP generado localmente
-rm -f function.zip
 ```
 
 ---
@@ -181,28 +104,31 @@ rm -f function.zip
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| SQS colas y DLQ | Colas reales con latencia de red | Emulado localmente — comportamiento idéntico |
-| `redrive_policy` (maxReceiveCount=3) | Mueve mensajes a DLQ tras 3 fallos reales | Funciona correctamente |
-| `aws_lambda_event_source_mapping` | Lambda pollea SQS continuamente | Funciona; puede haber mayor latencia de polling |
-| `filter_criteria` (order_type=premium) | Solo activa Lambda para mensajes premium | Soporte parcial — puede ignorar el filtro |
-| Lambda Destinations (on_success/on_failure) | Enruta resultado a colas según éxito/fallo | Soporte parcial — puede no enrutar |
-| `source_code_hash` | Detecta cambios y fuerza redeploy | Detecta cambios y fuerza redeploy |
-| CloudWatch Logs | Logs reales con `aws logs tail` | Registrados; `awslocal logs` limitado |
-| Coste | ~$0 con volumen de laboratorio | Sin coste |
+| ECR con IMMUTABLE | Rechaza push con tag duplicado | El repositorio se crea; IMMUTABLE no se valida en Community |
+| Lifecycle policy | Se evalúa automáticamente | Se almacena pero no se evalúa |
+| SSM SecureString | Cifrado con KMS real | Almacenado; `--with-decryption` devuelve el valor |
+| ECS Task Definition | Registrada y utilizable | Registrada correctamente |
+| Tareas Fargate | Se lanzan y ejecutan `startup.sh` | No se lanzan contenedores reales |
+| Service Connect | Proxy Envoy funcional entre tareas | Configuración registrada, sin proxy real |
+| Circuit Breaker | Detecta fallos y revierte automáticamente | Se configura, sin despliegue real que fallar |
+| Execute Command | Funcional con el SSM Agent | No disponible sin contenedores |
+| Inyección de secretos SSM | El agente ECS descifra y entrega la variable de entorno | Sin contenedor que reciba la variable |
+| Coste aproximado | ~$0.03/hora × 4 tareas Fargate (2 web + 2 api, 256 CPU / 512 MB) | Sin coste |
 
 ---
 
 ## Buenas Prácticas
 
-- Usa LocalStack para verificar que el handler Python (`handler.py`) procesa correctamente tanto lotes SQS como invocaciones directas, antes de desplegar en AWS real.
-- El mecanismo de `source_code_hash` funciona igual en LocalStack: practica el ciclo editar → `terraform apply` → verificar aquí antes de afectar AWS real.
-- Para verificar el comportamiento preciso de `filter_criteria` (solo mensajes premium activan Lambda) y Lambda Destinations (enrutamiento correcto a success/failure queues), usa AWS real.
-- Verifica siempre que `visibility_timeout_seconds` de la cola es >= `timeout` de la función Lambda para evitar que mensajes se reencolen mientras Lambda los procesa.
+- Usa LocalStack para validar la sintaxis de las task definitions y los `jsonencode()` antes de desplegar en AWS real.
+- Para probar el comportamiento dinámico de Service Connect, la autenticación por header y el Circuit Breaker, usa AWS real.
+- El flag `terraform validate` y `terraform plan` son suficientes para detectar errores de configuración sin necesidad de LocalStack.
+- Verifica siempre el parámetro SSM con `--with-decryption` para confirmar que el valor se almacenó correctamente, aunque en LocalStack no haya cifrado KMS real.
 
 ---
 
 ## Recursos Adicionales
 
-- [LocalStack — SQS](https://docs.localstack.cloud/aws/services/sqs/)
-- [LocalStack — Lambda](https://docs.localstack.cloud/aws/services/lambda/)
-- [LocalStack coverage — Lambda Event Source Mappings](https://docs.localstack.cloud/aws/services/lambda/)
+- [LocalStack — ECR](https://docs.localstack.cloud/aws/services/ecr/)
+- [LocalStack — ECS](https://docs.localstack.cloud/aws/services/ecs/)
+- [LocalStack — SSM](https://docs.localstack.cloud/aws/services/ssm/)
+- [LocalStack Pro — soporte ampliado](https://docs.localstack.cloud/aws/getting-started/)

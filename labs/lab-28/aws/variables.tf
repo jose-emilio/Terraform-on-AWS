@@ -1,44 +1,35 @@
 variable "region" {
-  type    = string
-  default = "us-east-1"
-}
-
-variable "project" {
+  description = "Region de AWS donde se desplegaran los recursos."
   type        = string
-  description = "Prefijo que identifica todos los recursos del laboratorio"
-  default     = "lab28"
+  default     = "us-east-1"
 }
 
-variable "vpc_cidr" {
+# Entorno de despliegue: controla el hardening del script de bootstrap
+# y el tipo de instancia seleccionado.
+variable "env" {
   type    = string
-  default = "10.0.0.0/16"
+  default = "dev"
+
+  validation {
+    condition     = contains(["dev", "prod"], var.env)
+    error_message = "El entorno debe ser 'dev' o 'prod'."
+  }
 }
 
+variable "app_name" {
+  type    = string
+  default = "corp-lab28"
+}
+
+# Endpoint de la base de datos inyectado en el script de bootstrap via templatefile().
+# En un proyecto real vendría de un output de otro módulo (p. ej. aws_db_instance).
+variable "db_endpoint" {
+  type    = string
+  default = "db.corp-lab28.internal:5432"
+}
+
+# Tipo de instancia EC2. t4g.small usa arquitectura ARM64 (Graviton2).
 variable "instance_type" {
   type    = string
   default = "t4g.small"
-}
-
-variable "min_size" {
-  type        = number
-  description = "Número mínimo de instancias en el ASG"
-  default     = 2
-}
-
-variable "max_size" {
-  type        = number
-  description = "Número máximo de instancias en el ASG"
-  default     = 6
-}
-
-variable "desired_capacity" {
-  type        = number
-  description = "Capacidad deseada inicial del ASG"
-  default     = 2
-}
-
-variable "app_version" {
-  type        = string
-  description = "Versión de la aplicación embebida en user_data. Cambiarla genera una nueva versión del Launch Template y activa el instance_refresh."
-  default     = "v1"
 }

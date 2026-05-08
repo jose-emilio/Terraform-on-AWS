@@ -1,9 +1,9 @@
-# Laboratorio 34 — LocalStack: Almacenamiento Híbrido: EBS de Alto Rendimiento y EFS Compartido
+# Laboratorio 34 — LocalStack: El Data Lake Blindado: S3 con Seguridad y Ciclo de Vida
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Este documento describe cómo ejecutar el laboratorio 34 contra LocalStack. Los recursos EFS (file system, mount targets, access points) y EC2/EBS funcionan en Community con las limitaciones indicadas. DLM no está disponible en Community.
+Este documento describe cómo ejecutar el laboratorio 33 contra LocalStack. Los recursos S3 (bucket, public access block, versionado, lifecycle configuration) funcionan plenamente en Community. KMS y la condición de VPC endpoint tienen soporte parcial.
 
 ## Requisitos previos
 
@@ -18,16 +18,16 @@ Este documento describe cómo ejecutar el laboratorio 34 contra LocalStack. Los 
 
 | Recurso | Soporte en Community |
 |---|---|
-| `aws_vpc` + `aws_subnet` | Completo |
-| `aws_security_group` | Completo |
-| `aws_instance` | Parcial — instancia creada; estado simulado |
-| `aws_ebs_volume` (gp3, iops, throughput) | Parcial — volumen creado; iops/throughput aceptados sin efecto real |
-| `aws_volume_attachment` | Parcial — adjunto aceptado; sin bloque de dispositivo real |
-| `aws_dlm_lifecycle_policy` | **No disponible** — omitido en esta versión |
-| `aws_efs_file_system` | **No disponible** — requiere licencia de pago; módulo `efs-share` omitido |
-| `aws_efs_mount_target` | **No disponible** — depende de EFS |
-| `aws_efs_access_point` | **No disponible** — depende de EFS |
-| Módulo `efs-share` | **Omitido** — EFS no incluido en LocalStack Community |
+| `aws_s3_bucket` | Completo |
+| `aws_s3_bucket_public_access_block` | Completo |
+| `aws_s3_bucket_versioning` | Completo |
+| `aws_s3_bucket_lifecycle_configuration` | Completo |
+| `aws_s3_bucket_server_side_encryption_configuration` | Parcial — configuración aceptada; cifrado real no se aplica |
+| `aws_kms_key` + `aws_kms_alias` | Parcial — clave creada; SSE-KMS no cifra realmente en Community |
+| `aws_vpc` + `aws_route_table` | Completo |
+| `aws_vpc_endpoint` (Gateway S3) | Parcial — recurso creado; no enruta tráfico real |
+| `aws_s3_bucket_policy` (condición `aws:sourceVpce`) | Parcial — política aceptada; condición no evaluada en Community |
+| Módulo `secure-bucket` | Completo — todos los recursos creados sin error |
 
 ### Inicialización y despliegue
 
@@ -41,26 +41,77 @@ terraform plan
 terraform apply
 ```
 
-### Verificación de EBS
+### Verificación de S3
 
 ```bash
-EBS_ID=$(terraform output -raw ebs_volume_id)
+BUCKET=$(terraform output -raw bucket_name)
 
-# Confirma el volumen y sus parámetros gp3
-awslocal ec2 describe-volumes \
-  --volume-ids "$EBS_ID" \
-  --query 'Volumes[0].{Tipo:VolumeType,Tamanyo:Size,IOPS:Iops,Throughput:Throughput,Cifrado:Encrypted}'
+# Confirma que el bucket existe
+awslocal s3api head-bucket --bucket "$BUCKET"
+
+# Verifica el bloqueo de acceso público (los 4 controles en true)
+awslocal s3api get-public-access-block --bucket "$BUCKET"
+
+# Verifica el cifrado SSE-KMS
+awslocal s3api get-bucket-encryption --bucket "$BUCKET"
+
+# Verifica el versionado
+awslocal s3api get-bucket-versioning --bucket "$BUCKET"
+
+# Verifica la lifecycle configuration
+awslocal s3api get-bucket-lifecycle-configuration --bucket "$BUCKET"
 ```
 
-### Verificación de EFS
+### Verificación de versionado
 
-EFS no está disponible en LocalStack Community. Consulta la sección [Montaje del EFS desde la instancia (SSM)](../README.md#montaje-del-efs-desde-la-instancia-ssm) del README principal para las verificaciones de EFS.
+```bash
+BUCKET=$(terraform output -raw bucket_name)
+
+# Sube un objeto
+echo "version 1" | awslocal s3 cp - s3://"$BUCKET"/test.txt
+
+# Sobreescribe (crea nueva versión)
+echo "version 2" | awslocal s3 cp - s3://"$BUCKET"/test.txt
+
+# Lista versiones — deben aparecer 2 versiones de test.txt
+awslocal s3api list-object-versions \
+  --bucket "$BUCKET" \
+  --query 'Versions[*].{Key:Key,VersionId:VersionId,LastModified:LastModified}'
+```
+
+### Verificación de KMS y VPC Endpoint
+
+```bash
+# CMK creada
+awslocal kms describe-key \
+  --key-id "$(terraform output -raw kms_key_arn)" \
+  --query 'KeyMetadata.{KeyId:KeyId,Estado:KeyState,Rotacion:KeyRotationStatus}'
+
+# VPC Endpoint creado
+awslocal ec2 describe-vpc-endpoints \
+  --vpc-endpoint-ids "$(terraform output -raw vpc_endpoint_id)" \
+  --query 'VpcEndpoints[0].{ID:VpcEndpointId,Estado:State,Tipo:VpcEndpointType}'
+```
+
+### Verificación de la bucket policy
+
+```bash
+awslocal s3api get-bucket-policy \
+  --bucket "$(terraform output -raw bucket_name)" \
+  --query Policy --output text | python3 -m json.tool
+```
+
+La política mostrará la condición `aws:sourceVpce`, aunque en LocalStack Community no se evalúa realmente.
 
 ---
 
 ## Limpieza
 
 ```bash
+# Vaciar el bucket antes de destruir
+awslocal s3 rm s3://"$(terraform output -raw bucket_name)" --recursive
+
+# Destruir la infraestructura
 terraform destroy
 ```
 
@@ -70,13 +121,16 @@ terraform destroy
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| EBS gp3 iops/throughput | Rendimiento real desacoplado del tamaño | Parámetros aceptados; sin efecto real |
-| DLM snapshots automáticos | Snapshots reales creados y rotados | No disponible en Community |
-| EFS (file system, mount targets, access points) | Recursos reales con cifrado y POSIX enforcement | **No disponible** en Community — módulo omitido |
+| Bucket + public access block | Bloqueo real de ACLs y políticas públicas | Configuración aceptada y verificable |
+| SSE-KMS + Bucket Key | Cifrado real con CMK; Bucket Key reduce llamadas KMS un 99% | Configuración aceptada; sin cifrado real |
+| Versionado | Versiones inmutables; protección real contra ransomware | Versiones creadas correctamente |
+| Lifecycle configuration | AWS mueve objetos a Glacier automáticamente a los 90 días | Regla aceptada; sin transición real de storage class |
+| VPC Gateway Endpoint | Ruta real inyectada en route table; sin coste de transferencia | Recurso creado; sin enrutamiento real |
+| Bucket policy (`aws:sourceVpce`) | Deniega acceso desde fuera del endpoint; probado con `aws s3 cp` desde EC2 | Política aceptada; condición no evaluada |
 
 ---
 
 ## Recursos Adicionales
 
-- [LocalStack — EFS](https://docs.localstack.cloud/aws/services/efs/)
-- [LocalStack — EC2](https://docs.localstack.cloud/aws/services/ec2/)
+- [LocalStack — S3](https://docs.localstack.cloud/aws/services/s3/)
+- [LocalStack — KMS](https://docs.localstack.cloud/aws/services/kms/)

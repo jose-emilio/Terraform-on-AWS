@@ -1,76 +1,108 @@
 # ── Locales ───────────────────────────────────────────────────────────────────
 
 locals {
-  account_id = "000000000000" # ID de cuenta simulado por LocalStack
   tags = {
     Project   = var.project
     ManagedBy = "terraform"
   }
 }
 
-# ── Customer Managed Key (CMK) ────────────────────────────────────────────────
-# LocalStack soporta KMS completo: CMK, alias, cifrado y descifrado.
-# enable_key_rotation se acepta pero la rotación no se ejecuta realmente.
+# ── Grupo IAM de Desarrolladores ─────────────────────────────────────────────
 
-resource "aws_kms_key" "main" {
-  description             = "CMK del Lab13 — cifrado de EBS y S3"
-  enable_key_rotation     = true
-  deletion_window_in_days = 7
-  multi_region            = false
+resource "aws_iam_group" "developers" {
+  name = "${var.project}-developers"
+  path = "/"
+}
 
-  # En LocalStack se usa una policy simplificada sin data source de caller identity.
+resource "aws_iam_group_policy" "developers_read" {
+  name  = "${var.project}-developers-read"
+  group = aws_iam_group.developers.name
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid       = "EnableRootAccess"
-        Effect    = "Allow"
-        Principal = { AWS = "arn:aws:iam::${local.account_id}:root" }
-        Action    = "kms:*"
-        Resource  = "*"
+        Sid      = "EC2ReadOnly"
+        Effect   = "Allow"
+        Action   = ["ec2:Describe*", "ec2:Get*"]
+        Resource = "*"
+      },
+      {
+        Sid      = "IAMReadOnly"
+        Effect   = "Allow"
+        Action   = ["iam:Get*", "iam:List*"]
+        Resource = "*"
+      },
+      {
+        Sid      = "STSCallerIdentity"
+        Effect   = "Allow"
+        Action   = "sts:GetCallerIdentity"
+        Resource = "*"
       }
     ]
   })
-
-  tags = merge(local.tags, { Name = "${var.project}-cmk" })
 }
 
-resource "aws_kms_alias" "main" {
-  name          = "alias/${var.project}-main"
-  target_key_id = aws_kms_key.main.key_id
-}
+# ── Usuario IAM dev-01 ────────────────────────────────────────────────────────
 
-# ── Bucket S3 cifrado con la CMK ──────────────────────────────────────────────
-# EBS no está disponible en LocalStack Community, se omite.
-# S3 con SSE-KMS sí es funcional en LocalStack.
-
-resource "aws_s3_bucket" "main" {
-  bucket        = "${var.project}-data-${local.account_id}"
+resource "aws_iam_user" "dev01" {
+  name          = "${var.project}-dev-01"
+  path          = "/"
   force_destroy = true
 
-  tags = merge(local.tags, { Name = "${var.project}-data" })
+  tags = merge(local.tags, { Name = "${var.project}-dev-01" })
 }
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
-  bucket = aws_s3_bucket.main.id
+resource "aws_iam_user_group_membership" "dev01" {
+  user   = aws_iam_user.dev01.name
+  groups = [aws_iam_group.developers.name]
+}
 
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
-      kms_master_key_id = aws_kms_alias.main.arn
+# ── Trust Policy y Rol IAM para EC2 ──────────────────────────────────────────
+
+data "aws_iam_policy_document" "ec2_trust" {
+  statement {
+    sid     = "AllowEC2AssumeRole"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
     }
-    bucket_key_enabled = true
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "main" {
-  bucket                  = aws_s3_bucket.main.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+resource "aws_iam_role" "ec2" {
+  name               = "${var.project}-ec2-role"
+  path               = "/"
+  assume_role_policy = data.aws_iam_policy_document.ec2_trust.json
+  description        = "Rol para instancias EC2 del Lab12"
+
+  tags = merge(local.tags, { Name = "${var.project}-ec2-role" })
 }
 
-# Nota: aws_s3_bucket_policy se omite en LocalStack ya que la evaluación de
-# condiciones de política (StringNotEqualsIfExists) no está implementada
-# en LocalStack Community y devuelve error al hacer PutBucketPolicy.
+resource "aws_iam_role_policy_attachment" "ec2_ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_readonly" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+}
+
+# ── Instance Profile ──────────────────────────────────────────────────────────
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.project}-ec2-profile"
+  role = aws_iam_role.ec2.name
+
+  tags = merge(local.tags, { Name = "${var.project}-ec2-profile" })
+}
+
+# La instancia EC2, el Security Group y el data source de AMI se omiten en
+# LocalStack: el servicio EC2 de LocalStack Community no propaga el Instance
+# Profile correctamente antes de RunInstances, lo que provoca un error 404.
+# El objetivo del laboratorio (crear y verificar los recursos IAM) se cubre
+# íntegramente con los recursos anteriores.

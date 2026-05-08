@@ -1,54 +1,39 @@
+output "bucket_name" {
+  description = "Nombre del bucket S3"
+  value       = module.datalake.bucket_id
+}
+
+output "bucket_arn" {
+  description = "ARN del bucket S3"
+  value       = module.datalake.bucket_arn
+}
+
+output "kms_key_arn" {
+  description = "ARN de la CMK KMS usada para el cifrado SSE-KMS"
+  value       = module.datalake.kms_key_arn
+}
+
+output "kms_alias" {
+  description = "Alias de la CMK KMS"
+  value       = module.datalake.kms_alias
+}
+
 output "vpc_id" {
-  description = "ID de la VPC"
-  value       = module.vpc.vpc_id
+  description = "ID de la VPC del laboratorio"
+  value       = aws_vpc.main.id
 }
 
-output "instance_id" {
-  description = "ID de la instancia EC2"
-  value       = module.ec2.instance_id
+output "vpc_endpoint_id" {
+  description = "ID del VPC Gateway Endpoint de S3"
+  value       = aws_vpc_endpoint.s3.id
 }
 
-output "ebs_volume_id" {
-  description = "ID del volumen EBS gp3"
-  value       = module.ec2.ebs_volume_id
+output "put_object_example" {
+  description = "Comando de ejemplo para subir un objeto al bucket (desde la VPC)"
+  value       = "aws s3 cp /tmp/test.txt s3://${module.datalake.bucket_id}/test.txt"
 }
 
-output "ebs_volume_arn" {
-  description = "ARN del volumen EBS gp3"
-  value       = module.ec2.ebs_volume_arn
-}
-
-output "dlm_policy_id" {
-  description = "ID de la politica DLM de snapshots automaticos"
-  value       = aws_dlm_lifecycle_policy.ebs_backup.id
-}
-
-output "efs_file_system_id" {
-  description = "ID del EFS File System"
-  value       = module.efs_share.file_system_id
-}
-
-output "efs_dns_name" {
-  description = "DNS name del EFS para construir comandos de montaje"
-  value       = module.efs_share.file_system_dns_name
-}
-
-output "efs_access_point_id" {
-  description = "ID del EFS Access Point de la aplicacion"
-  value       = module.efs_share.access_point_id
-}
-
-output "efs_access_point_arn" {
-  description = "ARN del EFS Access Point (usar en el comando de montaje)"
-  value       = module.efs_share.access_point_arn
-}
-
-output "efs_mount_targets" {
-  description = "Mapa AZ → ID del mount target"
-  value       = module.efs_share.mount_target_ids
-}
-
-output "mount_command" {
-  description = "Comando para montar el EFS via Access Point en la instancia EC2"
-  value       = "sudo mount -t efs -o tls,accesspoint=${module.efs_share.access_point_id} ${module.efs_share.file_system_id}:/ /mnt/efs"
+output "list_versions_example" {
+  description = "Comando de ejemplo para listar versiones de objetos"
+  value       = "aws s3api list-object-versions --bucket ${module.datalake.bucket_id}"
 }

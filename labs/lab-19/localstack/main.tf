@@ -1,8 +1,10 @@
 # ===========================================================================
-# Lab19 — Conectividad Punto a Punto con VPC Peering (LocalStack)
+# Lab18 — Seguridad y Control de Tráfico en VPC (LocalStack)
 # ===========================================================================
-# Nota: LocalStack emula VPC Peering a nivel de API pero no ejecuta tráfico
-# real. El objetivo es validar la estructura de Terraform.
+# Nota: LocalStack emula la mayoria de recursos de red (VPC, subnets, SGs,
+# NACLs, ALB, Flow Logs) pero no ejecuta trafico real. El objetivo de esta
+# version es validar la estructura de Terraform y el plan de despliegue
+# sin incurrir en costes de AWS.
 
 # --- Data Sources ---
 
@@ -15,6 +17,16 @@ data "aws_availability_zones" "available" {
 locals {
   azs = slice(data.aws_availability_zones.available.names, 0, 2)
 
+  subnets = {
+    "public-1"  = { az_index = 0, subnet_index = 0, public = true }
+    "public-2"  = { az_index = 1, subnet_index = 1, public = true }
+    "private-1" = { az_index = 0, subnet_index = 10, public = false }
+    "private-2" = { az_index = 1, subnet_index = 11, public = false }
+  }
+
+  public_subnets  = { for k, v in local.subnets : k => v if v.public }
+  private_subnets = { for k, v in local.subnets : k => v if !v.public }
+
   common_tags = {
     Environment = var.environment
     ManagedBy   = "terraform"
@@ -23,233 +35,443 @@ locals {
 }
 
 # ===========================================================================
-# VPC app
+# VPC
 # ===========================================================================
 
-resource "aws_vpc" "app" {
-  cidr_block           = var.app_cidr
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = merge(local.common_tags, {
-    Name = "vpc-app-${var.project_name}"
+    Name = "vpc-${var.project_name}"
   })
 }
 
-resource "aws_subnet" "app_private" {
-  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
+# --- Subredes ---
 
-  vpc_id            = aws_vpc.app.id
-  availability_zone = each.value.az
-  cidr_block        = cidrsubnet(aws_vpc.app.cidr_block, 8, each.value.index)
+resource "aws_subnet" "this" {
+  for_each = local.subnets
+
+  vpc_id                  = aws_vpc.main.id
+  availability_zone       = local.azs[each.value.az_index]
+  cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, each.value.subnet_index)
+  map_public_ip_on_launch = each.value.public
 
   tags = merge(local.common_tags, {
-    Name = "app-${each.key}-${var.project_name}"
-    Tier = "private"
+    Name = "${var.project_name}-${each.key}"
+    Tier = each.value.public ? "public" : "private"
   })
-}
-
-resource "aws_route_table" "app" {
-  vpc_id = aws_vpc.app.id
-
-  tags = merge(local.common_tags, {
-    Name = "app-private-rt-${var.project_name}"
-  })
-}
-
-resource "aws_route_table_association" "app_private" {
-  for_each = aws_subnet.app_private
-
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.app.id
 }
 
 # ===========================================================================
-# VPC db
+# Internet Gateway
 # ===========================================================================
 
-resource "aws_vpc" "db" {
-  cidr_block           = var.db_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
 
   tags = merge(local.common_tags, {
-    Name = "vpc-db-${var.project_name}"
+    Name = "igw-${var.project_name}"
   })
 }
 
-resource "aws_subnet" "db" {
-  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
+# --- Tabla de rutas pública ---
 
-  vpc_id            = aws_vpc.db.id
-  availability_zone = each.value.az
-  cidr_block        = cidrsubnet(aws_vpc.db.cidr_block, 8, each.value.index)
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
 
   tags = merge(local.common_tags, {
-    Name = "db-${each.key}-${var.project_name}"
-    Tier = "private"
+    Name = "${var.project_name}-public-rt"
   })
 }
 
-resource "aws_route_table" "db" {
-  vpc_id = aws_vpc.db.id
-
-  tags = merge(local.common_tags, {
-    Name = "db-rt-${var.project_name}"
-  })
+resource "aws_route" "public_internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.main.id
 }
 
-resource "aws_route_table_association" "db" {
-  for_each = aws_subnet.db
+resource "aws_route_table_association" "public" {
+  for_each = local.public_subnets
 
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.db.id
+  subnet_id      = aws_subnet.this[each.key].id
+  route_table_id = aws_route_table.public.id
 }
 
 # ===========================================================================
-# VPC C
+# NAT Gateway
 # ===========================================================================
 
-resource "aws_vpc" "c" {
-  cidr_block           = var.c_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
+resource "aws_eip" "nat" {
+  domain = "vpc"
 
   tags = merge(local.common_tags, {
-    Name = "vpc-c-${var.project_name}"
+    Name = "eip-nat-${var.project_name}"
   })
 }
 
-resource "aws_subnet" "c" {
-  for_each = { for idx, az in local.azs : "private-${idx + 1}" => { az = az, index = 10 + idx } }
-
-  vpc_id            = aws_vpc.c.id
-  availability_zone = each.value.az
-  cidr_block        = cidrsubnet(aws_vpc.c.cidr_block, 8, each.value.index)
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.this["public-1"].id
 
   tags = merge(local.common_tags, {
-    Name = "c-${each.key}-${var.project_name}"
-    Tier = "private"
+    Name = "natgw-${var.project_name}"
+  })
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+# --- Tabla de rutas privada ---
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-private-rt"
   })
 }
 
-resource "aws_route_table" "c" {
-  vpc_id = aws_vpc.c.id
+resource "aws_route" "private_nat" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.main.id
+}
+
+resource "aws_route_table_association" "private" {
+  for_each = local.private_subnets
+
+  subnet_id      = aws_subnet.this[each.key].id
+  route_table_id = aws_route_table.private.id
+}
+
+# ===========================================================================
+# Security Group del ALB — Puertos dinamicos desde Internet
+# ===========================================================================
+# Las reglas se gestionan en recursos independientes
+# (aws_vpc_security_group_ingress_rule / aws_vpc_security_group_egress_rule),
+# sucesores oficiales de aws_security_group_rule desde el provider AWS 5.x.
+
+resource "aws_security_group" "alb" {
+  name        = "alb-${var.project_name}"
+  description = "Trafico HTTP/HTTPS desde Internet hacia el ALB"
+  vpc_id      = aws_vpc.main.id
 
   tags = merge(local.common_tags, {
-    Name = "c-rt-${var.project_name}"
+    Name = "alb-sg-${var.project_name}"
   })
 }
 
-resource "aws_route_table_association" "c" {
-  for_each = aws_subnet.c
+resource "aws_vpc_security_group_ingress_rule" "alb_ports" {
+  for_each = { for p in var.alb_ingress_ports : tostring(p) => p }
 
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.c.id
+  security_group_id = aws_security_group.alb.id
+  cidr_ipv4         = "0.0.0.0/0"
+  from_port         = each.value
+  to_port           = each.value
+  ip_protocol       = "tcp"
+  description       = "Puerto ${each.value} desde Internet"
+
+  tags = merge(local.common_tags, {
+    Name = "alb-ingress-${each.key}-${var.project_name}"
+  })
+}
+
+resource "aws_vpc_security_group_egress_rule" "alb_all" {
+  security_group_id = aws_security_group.alb.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+  description       = "Todo el trafico saliente"
+
+  tags = merge(local.common_tags, {
+    Name = "alb-egress-${var.project_name}"
+  })
 }
 
 # ===========================================================================
-# VPC Peering — app ↔ db
+# Security Group de las EC2 — Solo trafico desde el ALB
 # ===========================================================================
 
-resource "aws_vpc_peering_connection" "app_to_db" {
-  vpc_id      = aws_vpc.app.id
-  peer_vpc_id = aws_vpc.db.id
-  auto_accept = true
+resource "aws_security_group" "app" {
+  name        = "app-${var.project_name}"
+  description = "Trafico solo desde el ALB"
+  vpc_id      = aws_vpc.main.id
 
-  requester {
-    allow_remote_vpc_dns_resolution = true
+  tags = merge(local.common_tags, {
+    Name = "app-sg-${var.project_name}"
+  })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
+  security_group_id            = aws_security_group.app.id
+  referenced_security_group_id = aws_security_group.alb.id
+  from_port                    = 80
+  to_port                      = 80
+  ip_protocol                  = "tcp"
+  description                  = "HTTP desde el ALB"
+
+  tags = merge(local.common_tags, {
+    Name = "app-ingress-from-alb-${var.project_name}"
+  })
+}
+
+resource "aws_vpc_security_group_egress_rule" "app_all" {
+  security_group_id = aws_security_group.app.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+  description       = "Todo el trafico saliente"
+
+  tags = merge(local.common_tags, {
+    Name = "app-egress-${var.project_name}"
+  })
+}
+
+# ===========================================================================
+# Network ACL — Subred publica (bloqueo de IP maliciosa)
+# ===========================================================================
+
+resource "aws_network_acl" "public" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
+
+  # Regla 50: Bloquear IP maliciosa
+  ingress {
+    rule_no    = 50
+    action     = "deny"
+    protocol   = "-1"
+    from_port  = 0
+    to_port    = 0
+    cidr_block = var.blocked_ip
   }
-  accepter {
-    allow_remote_vpc_dns_resolution = true
+
+  # Regla 100: Permitir HTTP
+  ingress {
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 80
+    to_port    = 80
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla 110: Permitir HTTPS
+  ingress {
+    rule_no    = 110
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 443
+    to_port    = 443
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla 120: Puertos efimeros (trafico de retorno)
+  ingress {
+    rule_no    = 120
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 1024
+    to_port    = 65535
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla de salida: Permitir todo
+  egress {
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "-1"
+    from_port  = 0
+    to_port    = 0
+    cidr_block = "0.0.0.0/0"
   }
 
   tags = merge(local.common_tags, {
-    Name = "peering-app-db-${var.project_name}"
+    Name = "nacl-public-${var.project_name}"
   })
 }
 
-resource "aws_route" "app_to_db" {
-  route_table_id            = aws_route_table.app.id
-  destination_cidr_block    = var.db_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_db.id
-}
-
-resource "aws_route" "db_to_app" {
-  route_table_id            = aws_route_table.db.id
-  destination_cidr_block    = var.app_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_db.id
-}
-
 # ===========================================================================
-# VPC Peering — app ↔ vpc-c
+# Network ACL — Subred privada
 # ===========================================================================
 
-resource "aws_vpc_peering_connection" "app_to_c" {
-  vpc_id      = aws_vpc.app.id
-  peer_vpc_id = aws_vpc.c.id
-  auto_accept = true
+resource "aws_network_acl" "private" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = [for k, s in aws_subnet.this : s.id if !local.subnets[k].public]
 
-  requester {
-    allow_remote_vpc_dns_resolution = true
-  }
-  accepter {
-    allow_remote_vpc_dns_resolution = true
+  # Regla 100: Permitir trafico desde la VPC
+  ingress {
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "-1"
+    from_port  = 0
+    to_port    = 0
+    cidr_block = var.vpc_cidr
   }
 
+  # Regla 110: Puertos efimeros desde Internet
+  ingress {
+    rule_no    = 110
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 1024
+    to_port    = 65535
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla de salida: Permitir todo
+  egress {
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "-1"
+    from_port  = 0
+    to_port    = 0
+    cidr_block = "0.0.0.0/0"
+  }
+
   tags = merge(local.common_tags, {
-    Name = "peering-app-c-${var.project_name}"
+    Name = "nacl-private-${var.project_name}"
   })
-}
-
-resource "aws_route" "app_to_c" {
-  route_table_id            = aws_route_table.app.id
-  destination_cidr_block    = var.c_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_c.id
-}
-
-resource "aws_route" "c_to_app" {
-  route_table_id            = aws_route_table.c.id
-  destination_cidr_block    = var.app_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_c.id
 }
 
 # ===========================================================================
-# Instancias EC2 de test
+# Application Load Balancer — No disponible en LocalStack Community
+# ===========================================================================
+# ELBv2 (ALB / NLB) sigue siendo una funcionalidad de pago en LocalStack:
+# está incluida en los planes Base y Ultimate, pero NO en Community Edition
+# ni en el nuevo plan gratuito Hobby (vigente desde marzo 2026, sustituye a
+# Community). Descomenta los siguientes bloques solo si dispones de una
+# suscripción de pago. Verificado contra docs.localstack.cloud/aws/services/elb/
+# y la página de pricing (revisado en mayo 2026).
+
+# resource "aws_lb" "main" {
+#   name               = "${var.project_name}-alb"
+#   internal           = false
+#   load_balancer_type = "application"
+#   security_groups    = [aws_security_group.alb.id]
+#   subnets            = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
+#
+#   tags = merge(local.common_tags, {
+#     Name = "alb-${var.project_name}"
+#   })
+# }
+
+# resource "aws_lb_target_group" "app" {
+#   name     = "${var.project_name}-tg"
+#   port     = 80
+#   protocol = "HTTP"
+#   vpc_id   = aws_vpc.main.id
+#
+#   health_check {
+#     path                = "/"
+#     protocol            = "HTTP"
+#     healthy_threshold   = 2
+#     unhealthy_threshold = 3
+#     timeout             = 5
+#     interval            = 10
+#   }
+#
+#   tags = local.common_tags
+# }
+
+# resource "aws_lb_listener" "http" {
+#   load_balancer_arn = aws_lb.main.arn
+#   port              = 80
+#   protocol          = "HTTP"
+#
+#   default_action {
+#     type             = "forward"
+#     target_group_arn = aws_lb_target_group.app.arn
+#   }
+#
+#   tags = local.common_tags
+# }
+
+# ===========================================================================
+# Instancias EC2 de aplicacion
 # ===========================================================================
 
-resource "aws_instance" "test_app" {
-  # AMI e instance_type alineados con la version aws/ (AL2023 ARM + t4g.micro)
-  # para mantener paridad. LocalStack no ejecuta tráfico ni user_data real.
-  ami           = "ami-00000000000000000"
-  instance_type = "t4g.micro"
-  subnet_id     = aws_subnet.app_private["private-1"].id
+resource "aws_instance" "app" {
+  for_each = local.private_subnets
+
+  # AMI e instance_type se alinean con la version aws/ (AL2023 minimal arm64 + t4g.micro)
+  # para mantener paridad de configuracion. LocalStack no ejecuta tráfico ni
+  # user_data real, asi que la AMI es ficticia y el tipo solo se valida a nivel de API.
+  ami                    = "ami-00000000000000000"
+  instance_type          = "t4g.micro"
+  subnet_id              = aws_subnet.this[each.key].id
+  vpc_security_group_ids = [aws_security_group.app.id]
 
   tags = merge(local.common_tags, {
-    Name = "test-app-${var.project_name}"
+    Name = "app-${var.project_name}-${each.key}"
+  })
+
+  depends_on = [aws_route.private_nat]
+}
+
+# Descomenta si dispones de LocalStack Pro (ELBv2):
+# resource "aws_lb_target_group_attachment" "app" {
+#   for_each = local.private_subnets
+#
+#   target_group_arn = aws_lb_target_group.app.arn
+#   target_id        = aws_instance.app[each.key].id
+#   port             = 80
+# }
+
+# ===========================================================================
+# VPC Flow Logs — Solo trafico REJECT
+# ===========================================================================
+
+resource "aws_cloudwatch_log_group" "flow_logs" {
+  name              = "/vpc/${var.project_name}/flow-logs"
+  retention_in_days = var.flow_log_retention_days
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role" "flow_logs" {
+  name = "vpc-flow-logs-${var.project_name}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "vpc-flow-logs.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy" "flow_logs" {
+  name = "vpc-flow-logs-${var.project_name}"
+  role = aws_iam_role.flow_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+      ]
+      Effect   = "Allow"
+      Resource = "*"
+    }]
   })
 }
 
-resource "aws_instance" "test_db" {
-  # AMI e instance_type alineados con la version aws/ (AL2023 ARM + t4g.micro)
-  # para mantener paridad. LocalStack no ejecuta tráfico ni user_data real.
-  ami           = "ami-00000000000000000"
-  instance_type = "t4g.micro"
-  subnet_id     = aws_subnet.db["private-1"].id
+resource "aws_flow_log" "reject" {
+  vpc_id               = aws_vpc.main.id
+  traffic_type         = "REJECT"
+  log_destination_type = "cloud-watch-logs"
+  log_destination      = aws_cloudwatch_log_group.flow_logs.arn
+  iam_role_arn         = aws_iam_role.flow_logs.arn
 
   tags = merge(local.common_tags, {
-    Name = "test-db-${var.project_name}"
-  })
-}
-
-resource "aws_instance" "test_c" {
-  # AMI e instance_type alineados con la version aws/ (AL2023 ARM + t4g.micro)
-  # para mantener paridad. LocalStack no ejecuta tráfico ni user_data real.
-  ami           = "ami-00000000000000000"
-  instance_type = "t4g.micro"
-  subnet_id     = aws_subnet.c["private-1"].id
-
-  tags = merge(local.common_tags, {
-    Name = "test-c-${var.project_name}"
+    Name = "flow-log-reject-${var.project_name}"
   })
 }

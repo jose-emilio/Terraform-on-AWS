@@ -8,46 +8,32 @@ output "vpc_cidr" {
   value       = aws_vpc.main.cidr_block
 }
 
-# Descomenta si dispones de LocalStack Pro (ELBv2):
-# output "alb_dns_name" {
-#   description = "DNS publico del Application Load Balancer"
-#   value       = aws_lb.main.dns_name
-# }
-
-output "alb_sg_id" {
-  description = "ID del Security Group del ALB"
-  value       = aws_security_group.alb.id
+output "internet_gateway_id" {
+  description = "ID del Internet Gateway"
+  value       = aws_internet_gateway.main.id
 }
 
-output "app_sg_id" {
-  description = "ID del Security Group de las instancias de aplicacion"
-  value       = aws_security_group.app.id
-}
-
-output "public_nacl_id" {
-  description = "ID de la NACL de las subredes publicas"
-  value       = aws_network_acl.public.id
-}
-
-output "private_nacl_id" {
-  description = "ID de la NACL de las subredes privadas"
-  value       = aws_network_acl.private.id
-}
-
-output "flow_log_group" {
-  description = "Nombre del CloudWatch Log Group de VPC Flow Logs"
-  value       = aws_cloudwatch_log_group.flow_logs.name
-}
-
-output "app_instance_ids" {
-  description = "IDs de las instancias de aplicacion"
+output "nat_gateway_ids" {
+  description = "IDs de los NAT Gateways (uno por AZ)"
   value = {
-    for key, inst in aws_instance.app : key => inst.id
+    for key, gw in aws_nat_gateway.main : key => gw.id
   }
 }
 
+output "nat_public_ips" {
+  description = "IPs públicas de los NAT Gateways"
+  value = {
+    for key, eip in aws_eip.nat : key => eip.public_ip
+  }
+}
+
+output "s3_endpoint_id" {
+  description = "ID del VPC Gateway Endpoint para S3"
+  value       = aws_vpc_endpoint.s3.id
+}
+
 output "public_subnet_ids" {
-  description = "IDs de las subredes publicas"
+  description = "IDs de las subredes públicas"
   value = {
     for key, subnet in aws_subnet.this :
     key => subnet.id if local.subnets[key].public
@@ -59,5 +45,17 @@ output "private_subnet_ids" {
   value = {
     for key, subnet in aws_subnet.this :
     key => subnet.id if !local.subnets[key].public
+  }
+}
+
+output "public_route_table_id" {
+  description = "ID de la tabla de rutas pública"
+  value       = aws_route_table.public.id
+}
+
+output "private_route_table_ids" {
+  description = "IDs de las tablas de rutas privadas (una por AZ)"
+  value = {
+    for key, rt in aws_route_table.private : key => rt.id
   }
 }

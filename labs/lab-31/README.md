@@ -1,4 +1,4 @@
-# Laboratorio 31 — API Serverless: Lambda, API Gateway v2 y Layers
+# Laboratorio 31 — Procesamiento Asíncrono y Resiliencia de Eventos
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,145 +8,144 @@
 
 ## Visión general
 
-En este laboratorio construirás una API REST completa usando el ecosistema serverless de AWS sin gestionar servidores. Automatizarás el empaquetado del código Python con el data source `archive_file` y forzarás redespliegues precisos mediante `source_code_hash`, de modo que cualquier cambio en el código fuente se detecta en el `terraform plan` antes de aplicar. Separarás las utilidades compartidas del código lógico usando una **Lambda Layer**, desplegando una API en API Gateway v2 con `auto_deploy = true` e integración `AWS_PROXY`, y configurarás los permisos de invocación con `aws_lambda_permission` limitado al ARN de ejecución de esta API concreta.
+En este laboratorio construirás un sistema de procesamiento asíncrono de órdenes sobre AWS usando SQS y Lambda. Aprenderás a configurar el **polling automático de colas** con `aws_lambda_event_source_mapping`, a reducir invocaciones innecesarias mediante **filtros de eventos** (`filter_criteria`) que descartan mensajes que no cumplen los criterios de negocio, y a implementar dos mecanismos de resiliencia complementarios: las **Lambda Destinations** para capturar el resultado de invocaciones asíncronas directas, y la **Dead Letter Queue** con `redrive_policy` para aislar los mensajes que fallan repetidamente en el polling SQS.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Usar `data "archive_file"` del provider `archive` para empaquetar directorios de código fuente en ZIPs localmente y calcular su hash con `output_base64sha256`
-- Pasar `source_code_hash` a `aws_lambda_function` y `aws_lambda_layer_version` para que Terraform detecte cambios en el contenido del código y fuerce el redespliegue aunque el nombre del ZIP no cambie
-- Crear una Lambda Layer con `aws_lambda_layer_version` usando la estructura de directorio `python/` que el runtime Python añade automáticamente al `sys.path`
-- Desplegar una HTTP API v2 con `aws_apigatewayv2_api`, un stage `$default` con `auto_deploy = true` y una integración `AWS_PROXY` con `payload_format_version = "2.0"` que delega toda la lógica HTTP a Lambda
-- Definir rutas con `aws_apigatewayv2_route` usando placeholders de path (`{id}`) que se exponen en el evento Lambda como `pathParameters`
-- Configurar `aws_lambda_permission` con `source_arn` acotado al `execution_arn` de la API para que solo esa API pueda invocar la función
+- Configurar `aws_lambda_event_source_mapping` para que Lambda consuma mensajes SQS automáticamente con un `batch_size` de hasta 10 mensajes por invocación
+- Aplicar `filter_criteria` para que Lambda solo procese mensajes cuyo cuerpo JSON cumpla condiciones específicas (como `order_type = "premium"`), eliminando el resto sin invocación
+- Implementar `aws_lambda_function_event_invoke_config` con `destination_config` para enrutar el resultado de invocaciones asíncronas a colas de éxito o fallo
+- Crear una Dead Letter Queue con `aws_sqs_queue` y `redrive_policy` que capture los mensajes que fallan tras `maxReceiveCount` intentos de procesamiento
+- Dimensionar correctamente el `visibility_timeout_seconds` de SQS respecto al `timeout` de Lambda para evitar reprocesamientos accidentales
+- Distinguir cuándo actúan las Lambda Destinations (invocación asíncrona directa) vs cuándo actúa la DLQ (path de Event Source Mapping)
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre Lambda, API Gateway v2, IAM y CloudWatch Logs
+- Perfil AWS con permisos sobre Lambda, SQS, IAM y CloudWatch Logs
 - LocalStack en ejecución (para la sección de LocalStack)
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### Empaquetado con archive_file y source_code_hash
+### Event Source Mapping y Polling de Colas SQS
 
-`data "archive_file"` es un data source del provider `hashicorp/archive` que genera ZIPs localmente sin llamar a ninguna API de AWS. Procesa el directorio fuente en tiempo de `terraform plan` y expone el atributo `output_base64sha256` con el hash SHA-256 del ZIP resultante.
+`aws_lambda_event_source_mapping` configura Lambda para que pida mensajes a SQS periódicamente sin necesidad de código de polling propio. Lambda gestiona el ciclo completo: recibe el lote, invoca la función y, si la función retorna con éxito, elimina los mensajes de la cola.
 
 ```hcl
-data "archive_file" "function" {
-  type        = "zip"
-  source_dir  = "${path.module}/src/function"
-  output_path = "${path.module}/function.zip"
+resource "aws_lambda_event_source_mapping" "orders" {
+  event_source_arn = aws_sqs_queue.orders.arn
+  function_name    = aws_lambda_function.processor.arn
+  batch_size       = 10
+  enabled          = true
 }
 ```
 
-El problema que resuelve `source_code_hash` es sutil: si solo usas `filename` en `aws_lambda_function`, Terraform detecta cambios en el archivo ZIP comparando su checksum en disco. Si el ZIP se regenera con el mismo contenido (por ejemplo, tras un `terraform init` en otra máquina), Terraform podría no detectar el cambio. Con `source_code_hash`, el hash se almacena explícitamente en el estado y se compara en cada plan:
+El evento que llega al handler tiene la forma `{"Records": [...]}`, donde cada elemento es un mensaje SQS. El handler debe procesar todos los mensajes del lote:
+
+```python
+def lambda_handler(event, context):
+    for record in event["Records"]:
+        body = json.loads(record["body"])
+        # procesar body...
+```
+
+Un `batch_size` de 10 reduce el número de invocaciones Lambda comparado con procesar un mensaje a la vez, optimizando tanto el coste como la latencia.
+
+### Filtros de Eventos con filter_criteria
+
+`filter_criteria` permite descartar mensajes en el lado de AWS antes de que Lambda se invoque. Los mensajes que no coinciden con el patrón se eliminan automáticamente de la cola — no se reencolan ni van a la DLQ.
 
 ```hcl
-resource "aws_lambda_function" "api" {
-  filename         = data.archive_file.function.output_path
-  source_code_hash = data.archive_file.function.output_base64sha256
-  # ...
+filter_criteria {
+  filter {
+    pattern = jsonencode({
+      body = {
+        order_type = ["premium"]
+      }
+    })
+  }
 }
 ```
 
-Cuando modificas `handler.py`, el ZIP cambia, su hash cambia, y la salida de `terraform plan` muestra:
+AWS parsea el `body` del mensaje SQS como JSON para evaluar el filtro. El valor `["premium"]` es una lista de valores aceptados (equivale a `order_type == "premium"`). Si el body no es JSON válido o no contiene el campo, el mensaje no coincide y se descarta.
 
-```
-~ source_code_hash = "aBcDe..." -> "XyZwV..."
-```
+Se pueden definir múltiples `filter` dentro de un mismo `filter_criteria`: los filtros actúan como un OR lógico — un mensaje activa Lambda si coincide con **cualquiera** de los filtros.
 
-### Lambda Layers
+### Lambda Destinations: Destinos Post-Ejecución
 
-Una Lambda Layer es un paquete ZIP que Lambda monta en el entorno de ejecución en `/opt`. Para el runtime Python, la estructura dentro del ZIP debe ser:
-
-```
-layer.zip
-└── python/
-    └── utils.py      ← accesible como "from utils import ..."
-```
-
-Lambda añade `/opt/python` al `sys.path` del runtime automáticamente. El código de la función puede importar el módulo sin instalación adicional ni rutas explícitas.
+`aws_lambda_function_event_invoke_config` configura los destinos a los que Lambda envía el resultado de una invocación **asíncrona** (cuando el cliente invoca con `InvocationType = Event` y no espera respuesta). Lambda genera automáticamente un registro de invocación y lo envía al destino correspondiente:
 
 ```hcl
-resource "aws_lambda_layer_version" "utils" {
-  layer_name          = "${var.project}-utils"
-  filename            = data.archive_file.layer.output_path
-  source_code_hash    = data.archive_file.layer.output_base64sha256
-  compatible_runtimes = ["python3.12"]
+resource "aws_lambda_function_event_invoke_config" "processor" {
+  function_name = aws_lambda_function.processor.function_name
+
+  destination_config {
+    on_success {
+      destination = aws_sqs_queue.success.arn  # función retornó con éxito
+    }
+    on_failure {
+      destination = aws_sqs_queue.failure.arn  # función lanzó una excepción
+    }
+  }
 }
 ```
 
-Cada `terraform apply` que modifica `utils.py` crea una **nueva versión numerada** de la Layer. Las versiones son inmutables: no se sobreescriben. La función Lambda referencia la Layer por su ARN versionado, por lo que un cambio en la Layer fuerza automáticamente el redespliegue de la función:
+El registro enviado al destino incluye el input original, el output (o el error), metadatos de la invocación y el ARN de la función. Es más rico que una DLQ porque también captura los éxitos.
+
+> **Importante**: Las Lambda Destinations **no** se activan en el path de SQS Event Source Mapping, porque ese path usa invocación síncrona desde el servicio de SQS. Para el path de polling, los fallos se gestionan con la `redrive_policy` de la cola.
+
+### Dead Letter Queue y Política de Redrive
+
+La DLQ es el mecanismo de resiliencia para el path de **SQS Event Source Mapping**. Si Lambda lanza una excepción al procesar un mensaje, SQS lo reencola. Tras `maxReceiveCount` intentos fallidos, SQS mueve el mensaje a la DLQ automáticamente:
 
 ```hcl
-layers = [aws_lambda_layer_version.utils.arn]
-# ARN ejemplo: arn:aws:lambda:us-east-1:123:layer:lab31-utils:3
-```
-
-### HTTP API con API Gateway v2
-
-API Gateway v2 ofrece HTTP API (barata y rápida) y WebSocket API. La HTTP API es hasta 70 % más barata que la REST API v1 y tiene menor latencia porque elimina muchas funcionalidades de transformación que REST API incluye por defecto.
-
-```hcl
-resource "aws_apigatewayv2_api" "main" {
-  name          = "${var.project}-api"
-  protocol_type = "HTTP"   # HTTP API (v2) — no REST API (v1)
+resource "aws_sqs_queue" "dlq" {
+  name                      = "${var.project}-dlq"
+  message_retention_seconds = 1209600  # 14 días para análisis post-mortem
 }
 
-resource "aws_apigatewayv2_stage" "default" {
-  api_id      = aws_apigatewayv2_api.main.id
-  name        = "$default"    # stage especial: URL sin sufijo de stage
-  auto_deploy = true          # publica cambios de rutas e integraciones automáticamente
-}
-```
+resource "aws_sqs_queue" "orders" {
+  name                       = "${var.project}-orders"
+  visibility_timeout_seconds = 30  # debe ser >= timeout de la función Lambda
 
-El stage `$default` es especial: su URL no incluye el nombre del stage. En REST API v1, la URL sería `https://{id}.execute-api.{region}.amazonaws.com/prod/items`; en HTTP API con `$default` es simplemente `https://{id}.execute-api.{region}.amazonaws.com/items`.
-
-### Integración AWS_PROXY y Payload Format 2.0
-
-`integration_type = "AWS_PROXY"` delega toda la lógica HTTP a Lambda. API Gateway reenvía el evento completo (método, path, headers, body, query params…) a la función y devuelve la respuesta sin transformarla. La función Lambda controla completamente el `statusCode`, `headers` y `body`.
-
-```hcl
-resource "aws_apigatewayv2_integration" "lambda" {
-  api_id                 = aws_apigatewayv2_api.main.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.api.invoke_arn
-  payload_format_version = "2.0"
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 3
+  })
 }
 ```
 
-`payload_format_version = "2.0"` usa el esquema de evento simplificado que expone `requestContext.http.method`, `rawPath`, `pathParameters`, etc. — en lugar del esquema verbose de la REST API v1.
+`visibility_timeout_seconds` es el tiempo durante el que un mensaje es invisible para otros consumidores después de ser recibido. Debe ser mayor o igual al timeout de Lambda para evitar que el mensaje vuelva a ser visible (y se reencole) mientras Lambda todavía lo está procesando.
 
-Los placeholders `{id}` en `route_key` se mapean automáticamente a `event["pathParameters"]["id"]` en Lambda:
+### IAM para Event Source Mapping
 
-```hcl
-resource "aws_apigatewayv2_route" "get_item" {
-  api_id    = aws_apigatewayv2_api.main.id
-  route_key = "GET /items/{id}"   # {id} → event["pathParameters"]["id"]
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-```
-
-### Permiso de Invocación Lambda
-
-Sin `aws_lambda_permission`, API Gateway recibe `403 Forbidden` al intentar invocar Lambda. Este recurso añade una política basada en recursos a la función Lambda que autoriza a `apigateway.amazonaws.com` como principal.
+Lambda necesita permisos explícitos para leer de SQS y para escribir en las colas de destino. El Event Source Mapping no se puede activar sin `sqs:ReceiveMessage`, `sqs:DeleteMessage` y `sqs:GetQueueAttributes` en la cola de origen:
 
 ```hcl
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.api.function_name
-  principal     = "apigateway.amazonaws.com"
+resource "aws_iam_role_policy" "sqs" {
+  name = "${var.project}-sqs-policy"
+  role = aws_iam_role.lambda.id
 
-  # execution_arn: arn:aws:execute-api:{region}:{account}:{api-id}
-  # El patrón "/*/*" cubre cualquier stage y ruta de ESTA API.
-  # Es más seguro que "*" porque limita el permiso a una API concreta.
-  source_arn = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.orders.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = [aws_sqs_queue.success.arn, aws_sqs_queue.failure.arn]
+      },
+    ]
+  })
 }
 ```
 
@@ -162,94 +161,87 @@ lab-31/
 │   ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
 │   ├── providers.tf          # Backend S3, Terraform >= 1.10, providers AWS y archive
 │   ├── variables.tf          # region, project, runtime, app_env
-│   ├── main.tf               # archive_file, IAM, CloudWatch, Layer, Lambda, APIGW, Permission
-│   ├── outputs.tf            # api_endpoint, function_name, layer_arn, log_group, curl_*
+│   ├── main.tf               # archive_file, SQS (x4), IAM, CloudWatch, Lambda,
+│   │                         # Lambda Destinations, Event Source Mapping
+│   ├── outputs.tf            # URLs de colas, function_name, log_group, comandos de ejemplo
 │   └── src/
-│       ├── function/
-│       │   └── handler.py    # Handler Lambda: GET /items, GET /items/{id}, POST /items
-│       └── layer/
-│           └── python/
-│               └── utils.py  # Layer: format_response() y get_metadata()
+│       └── function/
+│           └── handler.py    # Handler: procesa lotes SQS e invocaciones async directas
 └── localstack/
-    ├── providers.tf          # Endpoints apuntando a LocalStack (lambda, apigatewayv2, iam, logs)
+    ├── providers.tf          # Endpoints apuntando a LocalStack (lambda, sqs, iam, logs)
     ├── variables.tf          # Mismas variables, project = "lab31-local"
-    ├── main.tf               # Idéntico a aws/main.tf
+    ├── main.tf               # Idéntico a aws/main.tf (filter_criteria y Destinations con soporte parcial)
     ├── outputs.tf
-    └── src/                  # Copia del código fuente (idéntica a aws/src/)
-        ├── function/
-        │   └── handler.py
-        └── layer/
-            └── python/
-                └── utils.py
+    └── src/
+        └── function/
+            └── handler.py    # Copia idéntica a aws/src/
 ```
 
-> **Nota**: `layer.zip` y `function.zip` son artefactos generados por `archive_file` durante `terraform plan/apply`. No se versionan en Git — añádelos a `.gitignore`.
+> **Nota**: `function.zip` es un artefacto generado por `archive_file` durante `terraform plan/apply`. No se versiona en Git — añádelo a `.gitignore`.
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Arquitectura
 
-![API Gateway v2 HTTP API → integración AWS_PROXY → Lambda con Layer compartida + CloudWatch Logs](arch/diagrama.svg)
+![SQS orders + Lambda async con filter_criteria + DLQ tras 3 reintentos + Lambda Destinations on_success/on_failure (solo en invocación async)](arch/diagrama.svg)
 
-El cliente HTTP llega al stage `$default` de una HTTP API v2 (más simple y barata que REST API v1). La integración `AWS_PROXY` con `payload_format_version = "2.0"` reenvía el evento completo a la Lambda. Tres rutas mapean a la misma función: `GET /items`, `GET /items/{id}` y `POST /items`. La función importa utilidades (`format_response`, `get_metadata`) desde una **Lambda Layer** independiente — el `source_code_hash` separado en cada `archive_file` permite redespliegues granulares: editar `utils.py` solo recrea la layer; editar `handler.py` solo recrea la función.
+El productor encola mensajes en `orders`. El **Event Source Mapping** hace polling en batches de 10 con `filter_criteria` que descarta los mensajes que no son `order_type = premium` antes de invocar Lambda — invocación síncrona. Si el handler falla 3 veces sobre el mismo mensaje, la `redrive_policy` lo mueve a la **DLQ** (retención 14 días). El `aws_lambda_function_event_invoke_config` con `on_success → success` y `on_failure → failure` **solo dispara en invocaciones asíncronas** (`InvocationType = Event` desde S3, EventBridge, etc.). En caso de invocaciones mediante **Event Source Mapping** sólo se pueden crear `Destinations` para las invocaciones fallidas.
+
 
 ### Código Terraform
 
 **`aws/main.tf`** — Fragmentos clave:
 
-El laboratorio usa **dos `archive_file` independientes** para empaquetar la Layer y la función por separado. Así un cambio en `utils.py` solo actualiza la capa sin recrear la función ZIP, y viceversa:
+La cola principal define la DLQ a través de `redrive_policy`. El `visibility_timeout_seconds` iguala el timeout de Lambda para evitar reprocesamientos accidentales:
 
 ```hcl
-# Empaqueta src/layer/ → layer.zip (contiene python/utils.py)
-data "archive_file" "layer" {
-  type        = "zip"
-  source_dir  = "${path.module}/src/layer"
-  output_path = "${path.module}/layer.zip"
-}
+resource "aws_sqs_queue" "orders" {
+  name                       = "${var.project}-orders"
+  visibility_timeout_seconds = 30  # igual que el timeout de Lambda
 
-# Empaqueta src/function/ → function.zip (contiene handler.py)
-data "archive_file" "function" {
-  type        = "zip"
-  source_dir  = "${path.module}/src/function"
-  output_path = "${path.module}/function.zip"
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 3  # 3 intentos fallidos → DLQ
+  })
 }
 ```
 
-El log group se crea **antes** de la función con `depends_on` para capturar los logs del cold start inicial. Sin él, Lambda crea el grupo automáticamente pero sin `retention_in_days`, acumulando logs indefinidamente:
+El `filter_criteria` usa `jsonencode()` para construir el patrón de filtro. El campo `body` es especial: AWS parsea el body del mensaje SQS como JSON para evaluar el filtro:
 
 ```hcl
-resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${var.project}-function"
-  retention_in_days = 7
-}
+resource "aws_lambda_event_source_mapping" "orders" {
+  event_source_arn = aws_sqs_queue.orders.arn
+  function_name    = aws_lambda_function.processor.arn
+  batch_size       = 10
 
-resource "aws_lambda_function" "api" {
-  function_name    = "${var.project}-function"
-  filename         = data.archive_file.function.output_path
-  source_code_hash = data.archive_file.function.output_base64sha256
-  runtime          = var.runtime
-  handler          = "handler.lambda_handler"
-  role             = aws_iam_role.lambda.arn
-  layers           = [aws_lambda_layer_version.utils.arn]
-
-  depends_on = [
-    aws_iam_role_policy_attachment.lambda_basic,
-    aws_cloudwatch_log_group.lambda,
-  ]
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        body = {
+          order_type = ["premium"]
+        }
+      })
+    }
+  }
 }
 ```
 
-El `aws_lambda_permission` usa el `execution_arn` de la API (no el ARN de la función) como `source_arn`. Esto garantiza que solo las invocaciones originadas en esta API puedan ejecutar la función:
+Las Lambda Destinations se configuran en un recurso separado, no como argumento de `aws_lambda_function`. Esto permite modificarlas sin redesplegar la función:
 
 ```hcl
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.api.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
+resource "aws_lambda_function_event_invoke_config" "processor" {
+  function_name = aws_lambda_function.processor.function_name
+
+  destination_config {
+    on_success {
+      destination = aws_sqs_queue.success.arn
+    }
+    on_failure {
+      destination = aws_sqs_queue.failure.arn
+    }
+  }
 }
 ```
 
@@ -271,410 +263,418 @@ terraform apply
 Al finalizar, los outputs mostrarán:
 
 ```
-api_endpoint   = "https://abc123def4.execute-api.us-east-1.amazonaws.com"
-api_id         = "abc123def4"
-curl_get_items = "curl -s 'https://abc123def4.execute-api.us-east-1.amazonaws.com/items' | python3 -m json.tool"
-curl_post_item = "curl -s -X POST 'https://...' -H 'Content-Type: application/json' -d '{...}' | python3 -m json.tool"
-function_arn   = "arn:aws:lambda:us-east-1:123456789:function:lab31-function"
-function_name  = "lab31-function"
-layer_arn      = "arn:aws:lambda:us-east-1:123456789:layer:lab31-utils:1"
-layer_version  = 1
-log_group      = "/aws/lambda/lab31-function"
+dlq_url                      = "https://sqs.us-east-1.amazonaws.com/123456789/lab31-dlq"
+failure_queue_url             = "https://sqs.us-east-1.amazonaws.com/123456789/lab31-failure"
+function_arn                  = "arn:aws:lambda:us-east-1:123456789:function:lab31-processor"
+function_name                 = "lab31-processor"
+invoke_async_failure_example  = "aws lambda invoke --function-name lab31-processor ..."
+invoke_async_success_example  = "aws lambda invoke --function-name lab31-processor ..."
+log_group                     = "/aws/lambda/lab31-processor"
+orders_queue_arn              = "arn:aws:sqs:us-east-1:123456789:lab31-orders"
+orders_queue_url              = "https://sqs.us-east-1.amazonaws.com/123456789/lab31-orders"
+send_premium_example          = "aws sqs send-message --queue-url ... --message-body ..."
+send_standard_example         = "aws sqs send-message --queue-url ... --message-body ..."
+success_queue_url             = "https://sqs.us-east-1.amazonaws.com/123456789/lab31-success"
 ```
 
-### Verificar la API
+### Verificar el sistema
 
-**Paso 1** — Obtén la URL base y comprueba que la función responde:
+**Paso 1** — Envía una orden premium y observa cómo Lambda la procesa:
 
 ```bash
-API=$(terraform output -raw api_endpoint)
-echo "API endpoint: $API"
+ORDERS_URL=$(terraform output -raw orders_queue_url)
+
+aws sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_id":"ORD-001","order_type":"premium","amount":299.99,"customer":"cliente-test"}'
 ```
 
-**Paso 2** — `GET /items` — lista todos los items del catálogo:
-
-```bash
-curl -s "$API/items" | python3 -m json.tool
-```
-
-Respuesta esperada:
-```json
-{
-  "items": [
-    {"id": "1", "nombre": "Laptop Pro",       "precio": 1299.99, "categoria": "Electrónica"},
-    {"id": "2", "nombre": "Teclado Mecánico", "precio": 149.99,  "categoria": "Electrónica"},
-    {"id": "3", "nombre": "Monitor 4K",        "precio": 599.99,  "categoria": "Electrónica"}
-  ],
-  "total": 3,
-  "metadata": {
-    "function":    "lab31-function",
-    "request_id":  "abc123...",
-    "timestamp":   "2025-01-15T10:30:00.123456+00:00",
-    "environment": "production",
-    "project":     "lab31"
-  }
-}
-```
-
-**Paso 3** — `GET /items/{id}` — item por ID:
-
-```bash
-# Item existente (200 OK)
-curl -s "$API/items/2" | python3 -m json.tool
-
-# Item inexistente (404 Not Found)
-curl -s "$API/items/999" | python3 -m json.tool
-```
-
-**Paso 4** — `POST /items` — crear un nuevo item:
-
-```bash
-# Creación correcta (201 Created)
-curl -s -X POST "$API/items" \
-  -H "Content-Type: application/json" \
-  -d '{"nombre": "Ratón Ergonómico", "precio": 79.99, "categoria": "Electrónica"}' \
-  | python3 -m json.tool
-
-# El item quedó en memoria — verifica que existe (id 4)
-curl -s "$API/items/4" | python3 -m json.tool
-
-# Validación: campo 'nombre' requerido (400 Bad Request)
-curl -s -X POST "$API/items" \
-  -H "Content-Type: application/json" \
-  -d '{"precio": 19.99}' | python3 -m json.tool
-```
-
-> **Nota sobre warm starts**: el catálogo `_CATALOG` vive en memoria del contenedor Lambda. Se conserva entre invocaciones "cálidas" (mismo contenedor) y se reinicia en cada cold start. Después de POST /items, la siguiente petición GET /items puede devolver 3 ó 4 items dependiendo de si Lambda reutilizó el mismo contenedor. En producción usa DynamoDB u otro almacén persistente.
-
-**Paso 5** — Verifica la Layer adjunta a la función:
-
-```bash
-FUNCTION=$(terraform output -raw function_name)
-
-# Versiones de la Layer publicadas
-aws lambda list-layer-versions \
-  --layer-name "$(terraform output -raw function_name | sed 's/-function//')-utils" \
-  --query 'LayerVersions[*].{Version:Version,ARN:LayerVersionArn,Runtime:CompatibleRuntimes[0]}' \
-  --output table
-
-# Layers adjuntas a la función
-aws lambda get-function-configuration \
-  --function-name "$FUNCTION" \
-  --query 'Layers[*].Arn' \
-  --output table
-```
-
-**Paso 6** — Verifica la configuración de la integración y las rutas:
-
-```bash
-API_ID=$(terraform output -raw api_id)
-
-# Integración AWS_PROXY
-aws apigatewayv2 get-integrations \
-  --api-id "$API_ID" \
-  --query 'Items[*].{Tipo:IntegrationType,URI:IntegrationUri,Formato:PayloadFormatVersion}' \
-  --output table
-
-# Rutas registradas
-aws apigatewayv2 get-routes \
-  --api-id "$API_ID" \
-  --query 'Items[*].{Ruta:RouteKey,Target:Target}' \
-  --output table
-```
-
-**Paso 7** — Verifica el permiso Lambda:
-
-```bash
-aws lambda get-policy \
-  --function-name "$FUNCTION" \
-  --query 'Policy' --output text | python3 -m json.tool
-```
-
-La política debe mostrar `apigateway.amazonaws.com` como principal y el `execution_arn` de la API como `AWS:SourceArn`.
-
-**Paso 8** — Ver logs en CloudWatch:
+Espera unos segundos (Lambda pollea periódicamente) y verifica los logs:
 
 ```bash
 LOG_GROUP=$(terraform output -raw log_group)
 aws logs tail "$LOG_GROUP" --follow --format short
 ```
 
-### Forzar redeploy con source_code_hash
-
-Este es el mecanismo central del laboratorio. Modifica el código fuente y observa cómo Terraform detecta el cambio sin que el nombre del ZIP varíe:
-
-```bash
-# Añade un campo nuevo a la respuesta de GET /items
-# Edita src/function/handler.py y añade "version": "1.1" en el return de la ruta /items
-
-# terraform plan muestra el cambio en source_code_hash
-terraform plan
-# ~ source_code_hash = "aBcDe..." -> "XyZwV..."
-# ~ last_modified    = "2025-01-15T10:30:00.000+0000" -> (known after apply)
-
-terraform apply
-
-# Verifica que el nuevo campo aparece
-curl -s "$API/items" | python3 -m json.tool
+Deberías ver algo como:
+```
+Procesando orden order_id=ORD-001 order_type=premium amount=299.99
+[SQS] Batch completado: 1 órdenes procesadas — env=production project=lab31
 ```
 
-Prueba también modificar `utils.py` — Terraform detectará el cambio en la Layer y redespliegará tanto la capa (nueva versión) como la función (nuevo ARN de Layer):
+**Paso 2** — Verifica que filter_criteria descarta órdenes estándar:
 
 ```bash
-# Añade un campo "lab_version": "1.0" en get_metadata() de src/layer/python/utils.py
+# Esta orden NO debería activar Lambda (order_type = "standard")
+aws sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_id":"ORD-002","order_type":"standard","amount":49.99}'
+
+# Espera y comprueba que la cola de órdenes queda vacía (mensaje descartado)
+aws sqs get-queue-attributes \
+  --queue-url "$ORDERS_URL" \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+```
+
+**Paso 3** — Prueba la DLQ con un mensaje que falla sistemáticamente:
+
+```bash
+# amount > 9999 → handler lanza ValueError → 3 reintentos → DLQ
+aws sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_id":"ORD-FAIL","order_type":"premium","amount":99999.99}'
+```
+
+Tras unos minutos (3 intentos × visibility_timeout), el mensaje aparecerá en la DLQ:
+
+```bash
+DLQ_URL=$(terraform output -raw dlq_url)
+aws sqs receive-message \
+  --queue-url "$DLQ_URL" \
+  --max-number-of-messages 10 \
+  --query 'Messages[*].Body'
+```
+
+**Paso 4** — Inspecciona el Event Source Mapping y su estado:
+
+```bash
+FUNCTION=$(terraform output -raw function_name)
+
+aws lambda list-event-source-mappings \
+  --function-name "$FUNCTION" \
+  --query 'EventSourceMappings[*].{UUID:UUID,Estado:State,BatchSize:BatchSize,Filtros:FilterCriteria}'
+```
+
+**Paso 5** — Demuestra Lambda Destinations con invocación asíncrona:
+
+```bash
+# Invocación exitosa → debería llegar a success-queue
+terraform output -raw invoke_async_success_example | bash
+
+# Invocación fallida (amount > 9999) → debería llegar a failure-queue
+terraform output -raw invoke_async_failure_example | bash
+
+# Espera unos segundos y verifica las colas de destino
+SUCCESS_URL=$(terraform output -raw success_queue_url)
+FAILURE_URL=$(terraform output -raw failure_queue_url)
+
+aws sqs receive-message \
+  --queue-url "$SUCCESS_URL" \
+  --max-number-of-messages 5 \
+  --query 'Messages[*].Body' | python3 -m json.tool
+
+aws sqs receive-message \
+  --queue-url "$FAILURE_URL" \
+  --max-number-of-messages 5 \
+  --query 'Messages[*].Body' | python3 -m json.tool
+```
+
+El mensaje en `success_queue` tendrá la forma:
+```json
+{
+  "version": "1.0",
+  "timestamp": "2025-01-15T10:30:00.000Z",
+  "requestContext": { "functionArn": "...", "requestId": "..." },
+  "requestPayload": { "order_id": "ASYNC-001", ... },
+  "responseContext": { "statusCode": 200 },
+  "responsePayload": { "order_id": "ASYNC-001", "status": "processed", ... }
+}
+```
+
+### Forzar redeploy con source_code_hash
+
+Modifica el handler y verifica que Terraform detecta el cambio:
+
+```bash
+# Añade un campo "version" al resultado del handler
+# Edita src/function/handler.py y añade "lab_version": "1.1" en el return de _process_order
+
+terraform plan
+# ~ source_code_hash = "aBcDe..." -> "XyZwV..."
+
 terraform apply
-# Verás que TANTO la Layer como la función se actualizan
+
+# Verifica que el nuevo código se ejecuta
+aws sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_id":"ORD-v2","order_type":"premium","amount":99.99}'
+
+aws logs tail "$LOG_GROUP" --format short
 ```
 
 ---
 
-> **Antes de comenzar los retos**, asegúrate de que `terraform apply` ha completado sin errores y la API responde correctamente. Ejecuta `curl -s "$API/items"` para confirmarlo.
+> **Antes de comenzar los retos**, asegúrate de que `terraform apply` ha completado sin errores y de que enviando un mensaje premium a la cola de órdenes Lambda lo procesa correctamente (verifica los logs).
 
 ## Verificación final
 
 ```bash
-# Obtener la URL base de la API
-API_URL=$(terraform output -raw api_endpoint)
+# Verificar las 4 colas SQS creadas (orders, dlq, success, failure)
+aws sqs list-queues \
+  --query 'QueueUrls[?contains(@,`lab31`)]' --output table
 
-# Probar GET /items
-curl -s "${API_URL}/items" | python3 -m json.tool
-# Esperado: {"items": [...], "total": 3, "metadata": {...}}
+# Enviar un mensaje de prueba a la cola de órdenes
+ORDERS_URL=$(terraform output -raw orders_queue_url)
+aws sqs send-message \
+  --queue-url "$ORDERS_URL" \
+  --message-body '{"order_type":"premium","order_id":"test-001","amount":99.99}'
 
-# Probar GET /items/{id}
-curl -s "${API_URL}/items/2" | python3 -m json.tool
-# Esperado: {"item": {"id": "2", ...}, "metadata": {...}}
+# Verificar que Lambda procesó el mensaje (ver logs)
+aws logs tail "$(terraform output -raw log_group)" --since 5m
 
-# Verificar que la Layer está asociada a la función
-aws lambda get-function-configuration \
-  --function-name "$(terraform output -raw function_name)" \
-  --query 'Layers[*].Arn' --output text
-
-# Comprobar que los logs se generan en CloudWatch
-aws logs describe-log-groups \
-  --query 'logGroups[?contains(logGroupName,`lab31`)].logGroupName' \
-  --output text
+# Comprobar que la DLQ está vacía (no hay mensajes fallidos)
+DLQ_URL=$(terraform output -raw dlq_url)
+aws sqs get-queue-attributes \
+  --queue-url "$DLQ_URL" \
+  --attribute-names ApproximateNumberOfMessages \
+  --query 'Attributes.ApproximateNumberOfMessages'
+# Esperado: "0"
 ```
 
 ---
 
 ## Retos
 
-### Reto 1 — CORS y Throttling
+### Reto 1 — Alarma en la Dead Letter Queue
 
-La API actual no tiene cabeceras CORS, lo que impide llamarla desde aplicaciones web en el navegador (el navegador bloqueará las peticiones cross-origin). Tampoco tiene limitación de tasa, por lo que un cliente descontrolado podría generar invocaciones masivas de Lambda con coste ilimitado.
+En producción, los mensajes que llegan a la DLQ indican fallos que requieren atención. Sin una alarma, estos mensajes pueden acumularse días sin ser detectados. El objetivo de este reto es configurar un mecanismo de alerta temprana sobre la DLQ.
 
 **Requisitos**
 
-1. Añade un bloque `cors_configuration` en `aws_apigatewayv2_api` que permita:
-   - Headers: `Content-Type`
-   - Métodos: `GET`, `POST`, `OPTIONS`
-   - Orígenes: `*` (en producción se restringiría a dominios concretos)
-   - `max_age = 300` (segundos que el navegador cachea la respuesta preflight)
-2. Añade un bloque `default_route_settings` en `aws_apigatewayv2_stage` con:
-   - `throttling_burst_limit = 100` (peticiones simultáneas máximas)
-   - `throttling_rate_limit  = 50`  (peticiones por segundo sostenidas)
+1. Crea un recurso `aws_cloudwatch_metric_alarm` que se active cuando `ApproximateNumberOfMessagesVisible` en la DLQ sea `>= 1`.
+   - `alarm_name`: `"${var.project}-dlq-not-empty"`
+   - `namespace`: `"AWS/SQS"`
+   - `metric_name`: `"ApproximateNumberOfMessagesVisible"`
+   - `dimensions`: `{ QueueName = aws_sqs_queue.dlq.name }`
+   - `period`: `60` segundos
+   - `evaluation_periods`: `1`
+   - `statistic`: `"Sum"`
+   - `comparison_operator`: `"GreaterThanOrEqualToThreshold"`
+   - `threshold`: `1`
+2. Añade un output `dlq_alarm_name` con el nombre de la alarma.
 
 **Criterios de éxito**
 
-- Una petición `OPTIONS` a `/items` devuelve 200 con la cabecera `Access-Control-Allow-Origin: *`.
-- La configuración de throttling es visible en la consola de API Gateway o con `aws apigatewayv2 get-stage`.
-- Puedes explicar la diferencia entre `throttling_burst_limit` (capacidad de ráfaga) y `throttling_rate_limit` (tasa sostenida), y qué código HTTP devuelve API Gateway cuando se supera el límite.
+- `aws cloudwatch describe-alarms --alarm-names "${var.project}-dlq-not-empty"` muestra la alarma en estado `OK` o `ALARM`.
+- Si envías un mensaje que falla sistemáticamente (amount > 9999) y esperas a que llegue a la DLQ, la alarma pasa al estado `ALARM`.
+- Puedes explicar la diferencia entre `period` (ventana de evaluación) y `evaluation_periods` (cuántas ventanas consecutivas deben cumplir la condición).
 
-### Reto 2 — Lambda Versioning y Alias
+### Reto 2 — Fallos Parciales de Lote (report_batch_item_failures)
 
-En producción, la integración de API Gateway no debería apuntar a `$LATEST` (la versión mutable y siempre actualizable de Lambda) sino a un **alias** que apunte a una versión numerada e inmutable. Esto permite hacer rollback a una versión anterior cambiando solo a qué versión apunta el alias, sin modificar la integración de API Gateway.
+Actualmente, si un lote de 10 mensajes contiene 1 mensaje inválido, Lambda lanza una excepción y los 10 mensajes se reencolan. Esto provoca que 9 mensajes válidos se procesen hasta 3 veces antes de que el inválido llegue a la DLQ. `report_batch_item_failures` permite que Lambda reporte exactamente qué mensajes fallaron, para que solo esos se reencolen.
 
 ### Requisitos
 
-1. Activa `publish = true` en `aws_lambda_function` para que cada despliegue genere una versión numerada inmutable.
-2. Crea `aws_lambda_alias` con `name = "live"` apuntando a `aws_lambda_function.api.version` (la versión publicada más reciente).
-3. Actualiza `aws_apigatewayv2_integration` para que `integration_uri` apunte al `invoke_arn` del alias.
-4. Actualiza `aws_lambda_permission` para usar `qualifier = aws_lambda_alias.live.name`, de modo que el permiso se aplique sobre el alias y no sobre `$LATEST`.
-5. Añade un output `function_version` con el número de versión publicada más reciente.
+1. Activa `function_response_types = ["ReportBatchItemFailures"]` en `aws_lambda_event_source_mapping`.
+2. Modifica el handler para que, en lugar de lanzar una excepción al fallar un mensaje, capture el error y construya una respuesta de `batchItemFailures`:
+
+```python
+def lambda_handler(event, context):
+    failures = []
+    for record in event["Records"]:
+        try:
+            body = json.loads(record["body"])
+            _process_order(body)
+        except Exception as e:
+            logger.error("Fallo en mensaje %s: %s", record["messageId"], e)
+            failures.append({"itemIdentifier": record["messageId"]})
+
+    return {"batchItemFailures": failures}
+```
+
+3. Verifica que, con un lote mixto (un mensaje inválido + varios válidos), solo el inválido se reencola y eventualmente llega a la DLQ, mientras los válidos se procesan una sola vez.
 
 **Criterios de éxito**
 
-- `aws lambda list-versions-by-function` muestra al menos la versión `1` publicada.
-- `aws lambda get-alias --name live` muestra que el alias apunta a esa versión.
-- La API sigue respondiendo correctamente (`curl -s "$API/items"`).
-- Al modificar el código y hacer `terraform apply`, se publica una nueva versión y el alias avanza automáticamente.
-- Puedes explicar por qué el permiso debe usar `qualifier` y no solo `function_name`.
+- `aws lambda list-event-source-mappings` muestra `FunctionResponseTypes: ["ReportBatchItemFailures"]` en el mapping.
+- Enviando un lote mixto (puedes enviar varios mensajes rapidamente), los mensajes válidos aparecen procesados en los logs exactamente una vez.
+- El mensaje inválido aparece en la DLQ tras `maxReceiveCount` reintentos.
+- Puedes explicar por qué sin `report_batch_item_failures` el procesamiento de duplicados puede disparar costes inesperados en colas de alto volumen.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — CORS y Throttling</strong></summary>
+<summary><strong>Solución al Reto 1 — Alarma en la Dead Letter Queue</strong></summary>
 
-### Solución al Reto 1 — CORS y Throttling
+### Solución al Reto 1 — Alarma en la Dead Letter Queue
 
-Modifica `aws_apigatewayv2_api` y `aws_apigatewayv2_stage` en `main.tf`:
+Añade el recurso `aws_cloudwatch_metric_alarm` en `main.tf`:
 
 ```hcl
-resource "aws_apigatewayv2_api" "main" {
-  name          = "${var.project}-api"
-  protocol_type = "HTTP"
-  description   = "HTTP API del lab31 — con CORS y throttling"
-
-  cors_configuration {
-    allow_headers = ["Content-Type", "X-Api-Key", "Authorization"]
-    allow_methods = ["GET", "POST", "OPTIONS"]
-    allow_origins = ["*"]   # en producción: ["https://mi-app.example.com"]
-    max_age       = 300
-  }
-
-  tags = local.tags
-}
-
-resource "aws_apigatewayv2_stage" "default" {
-  api_id      = aws_apigatewayv2_api.main.id
-  name        = "$default"
-  auto_deploy = true
-
-  default_route_settings {
-    throttling_burst_limit = 100  # capacidad de ráfaga: peticiones simultáneas máximas
-    throttling_rate_limit  = 50   # tasa sostenida: peticiones por segundo
-  }
+resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
+  alarm_name          = "${var.project}-dlq-not-empty"
+  alarm_description   = "La DLQ tiene mensajes — revisar fallos de procesamiento"
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  dimensions          = { QueueName = aws_sqs_queue.dlq.name }
+  period              = 60
+  evaluation_periods  = 1
+  statistic           = "Sum"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
 
   tags = local.tags
 }
 ```
 
-Verificación:
+Añade el output en `outputs.tf`:
+
+```hcl
+output "dlq_alarm_name" {
+  description = "Nombre de la alarma CloudWatch sobre la DLQ"
+  value       = aws_cloudwatch_metric_alarm.dlq_not_empty.alarm_name
+}
+```
+
+Verifica el estado de la alarma:
 
 ```bash
-terraform apply
-
-API=$(terraform output -raw api_endpoint)
-
-# El preflight OPTIONS debe devolver 200 con cabeceras CORS
-curl -s -X OPTIONS "$API/items" \
-  -H "Origin: https://mi-app.example.com" \
-  -H "Access-Control-Request-Method: GET" \
-  -D - -o /dev/null | grep -i "access-control"
-# access-control-allow-origin: *
-# access-control-allow-methods: GET,POST,OPTIONS
-
-# Verifica la configuración del stage
-aws apigatewayv2 get-stage \
-  --api-id "$(terraform output -raw api_id)" \
-  --stage-name '$default' \
-  --query 'DefaultRouteSettings.{Burst:ThrottlingBurstLimit,Rate:ThrottlingRateLimit}' \
-  --output table
+aws cloudwatch describe-alarms \
+  --alarm-names "$(terraform output -raw dlq_alarm_name)" \
+  --query 'MetricAlarms[0].{Estado:StateValue,Razon:StateReason}'
 ```
 
-Cuando se supera `throttling_rate_limit`, API Gateway devuelve `429 Too Many Requests` sin invocar Lambda — lo que protege la función de picos de coste.
+Justo después del `terraform apply`, la alarma muestra `INSUFFICIENT_DATA` con razón `"Unchecked: Initial alarm creation"`. Es el estado inicial normal: CloudWatch aún no tiene datos de la métrica `ApproximateNumberOfMessagesVisible` para ese `period`. Tras el primer ciclo de evaluación (60 segundos), transitará a `OK` si la DLQ está vacía.
+
+`treat_missing_data = "notBreaching"` es lo que evita que esa ausencia inicial de datos se interprete como un fallo y dispare la alarma prematuramente.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Lambda Versioning y Alias</strong></summary>
+<summary><strong>Solución al Reto 2 — Fallos Parciales de Lote</strong></summary>
 
-### Solución al Reto 2 — Lambda Versioning y Alias
+### Solución al Reto 2 — Fallos Parciales de Lote
 
-Añade `publish = true` a `aws_lambda_function` y los nuevos recursos en `main.tf`:
+**Terraform** — actualiza `aws_lambda_event_source_mapping` en `main.tf`:
 
 ```hcl
-resource "aws_lambda_function" "api" {
-  function_name    = "${var.project}-function"
-  filename         = data.archive_file.function.output_path
-  source_code_hash = data.archive_file.function.output_base64sha256
-  runtime          = var.runtime
-  handler          = "handler.lambda_handler"
-  role             = aws_iam_role.lambda.arn
-  layers           = [aws_lambda_layer_version.utils.arn]
-  publish          = true   # ← publica una versión numerada en cada cambio de código
+resource "aws_lambda_event_source_mapping" "orders" {
+  event_source_arn        = aws_sqs_queue.orders.arn
+  function_name           = aws_lambda_function.processor.arn
+  batch_size              = 10
+  enabled                 = true
+  function_response_types = ["ReportBatchItemFailures"]
 
-  environment {
-    variables = {
-      APP_ENV     = var.app_env
-      APP_PROJECT = var.project
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        body = { order_type = ["premium"] }
+      })
     }
   }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.lambda_basic,
-    aws_cloudwatch_log_group.lambda,
-  ]
-
-  tags = merge(local.tags, { Name = "${var.project}-function" })
-}
-
-# Alias que siempre apunta a la versión publicada más reciente
-resource "aws_lambda_alias" "live" {
-  name             = "live"
-  description      = "Alias de producción — apunta a la última versión publicada"
-  function_name    = aws_lambda_function.api.function_name
-  function_version = aws_lambda_function.api.version   # número de versión publicada
 }
 ```
 
-Actualiza la integración para usar el `invoke_arn` del alias:
+**Python** — reemplaza `lambda_handler` en `handler.py`:
 
-```hcl
-resource "aws_apigatewayv2_integration" "lambda" {
-  api_id                 = aws_apigatewayv2_api.main.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_alias.live.invoke_arn   # ← alias, no $LATEST
-  payload_format_version = "2.0"
-}
+```python
+def lambda_handler(event, context):
+    env     = os.environ.get("APP_ENV", "unknown")
+    project = os.environ.get("APP_PROJECT", "unknown")
+    failures = []
+
+    for record in event["Records"]:
+        try:
+            body = json.loads(record["body"])
+            result = _process_order(body)
+            logger.info("[SQS] Procesado: %s", json.dumps(result))
+        except Exception as exc:
+            logger.error(
+                "[SQS] Fallo en messageId=%s: %s", record["messageId"], exc
+            )
+            failures.append({"itemIdentifier": record["messageId"]})
+
+    logger.info(
+        "[SQS] Lote finalizado: %d ok, %d fallidos — env=%s project=%s",
+        len(event["Records"]) - len(failures), len(failures), env, project,
+    )
+    return {"batchItemFailures": failures}
 ```
 
-Actualiza el permiso para usar `qualifier` apuntando al alias:
+Verifica que el mapping refleja la configuración:
 
-```hcl
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.api.function_name
-  qualifier     = aws_lambda_alias.live.name           # ← permiso sobre el alias
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
-}
+```bash
+aws lambda list-event-source-mappings \
+  --function-name "$(terraform output -raw function_name)" \
+  --query 'EventSourceMappings[0].FunctionResponseTypes'
 ```
 
-Añade a `outputs.tf`:
-
-```hcl
-output "function_version" {
-  description = "Número de la última versión Lambda publicada"
-  value       = aws_lambda_function.api.version
-}
-```
-
-Verificación:
+**Paso 1** — Aplica los cambios:
 
 ```bash
 terraform apply
-
-FUNCTION=$(terraform output -raw function_name)
-
-# Listar versiones publicadas
-aws lambda list-versions-by-function \
-  --function-name "$FUNCTION" \
-  --query 'Versions[*].{Version:Version,SHA:CodeSha256,Modified:LastModified}' \
-  --output table
-
-# Ver el alias y a qué versión apunta
-aws lambda get-alias \
-  --function-name "$FUNCTION" \
-  --name live \
-  --query '{Nombre:Name,Version:FunctionVersion,ARN:AliasArn}' \
-  --output table
-
-# La API sigue funcionando a través del alias
-API=$(terraform output -raw api_endpoint)
-curl -s "$API/items" | python3 -m json.tool
-
-# Modificar el código y comprobar que la versión avanza
-echo "# version bump" >> src/function/handler.py
-terraform apply -auto-approve
-aws lambda get-alias --function-name "$FUNCTION" --name live --query FunctionVersion
-# "2"  (la versión anterior era "1")
 ```
 
-El alias `live` avanza automáticamente porque `function_version = aws_lambda_function.api.version` es un atributo dinámico: cada vez que Terraform crea una nueva versión publicada (`publish = true`), `version` devuelve el nuevo número y el alias se actualiza en el mismo `apply`.
+**Paso 2** — Invoca Lambda directamente con un evento SQS sintético que contiene un lote mixto. Lambda recoge mensajes de SQS de uno en uno cuando el volumen es bajo, por lo que la forma fiable de probar el comportamiento de lote es construir el evento manualmente:
+
+```bash
+FUNCTION=$(terraform output -raw function_name)
+
+aws lambda invoke \
+  --function-name "$FUNCTION" \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "Records": [
+      {"messageId":"msg-ok-1","body":"{\"order_id\":\"ORD-OK-1\",\"order_type\":\"premium\",\"amount\":50.00}"},
+      {"messageId":"msg-ok-2","body":"{\"order_id\":\"ORD-OK-2\",\"order_type\":\"premium\",\"amount\":100.00}"},
+      {"messageId":"msg-ok-3","body":"{\"order_id\":\"ORD-OK-3\",\"order_type\":\"premium\",\"amount\":150.00}"},
+      {"messageId":"msg-ok-4","body":"{\"order_id\":\"ORD-OK-4\",\"order_type\":\"premium\",\"amount\":200.00}"},
+      {"messageId":"msg-bad-1","body":"{\"order_id\":\"ORD-BAD-1\",\"order_type\":\"premium\",\"amount\":99999.99}"}
+    ]
+  }' \
+  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
+```
+
+**Paso 3** — Verifica la respuesta. Solo el mensaje inválido debe aparecer en `batchItemFailures`:
+
+```json
+{
+  "batchItemFailures": [
+    { "itemIdentifier": "msg-bad-1" }
+  ]
+}
+```
+
+Si la función devuelve `"batchItemFailures": []` o el campo no aparece, significa que `report_batch_item_failures` no está activo o que el handler no está retornando la estructura correcta.
+
+**Paso 4** — Verifica los logs. Los 4 mensajes válidos deben aparecer procesados exactamente una vez; el inválido, con un error:
+
+```bash
+LOG_GROUP=$(terraform output -raw log_group)
+aws logs tail "$LOG_GROUP" --format short
+```
+
+Salida esperada:
+```
+[SQS] Procesado: {"order_id": "ORD-OK-1", "status": "processed", ...}
+[SQS] Procesado: {"order_id": "ORD-OK-2", "status": "processed", ...}
+[SQS] Procesado: {"order_id": "ORD-OK-3", "status": "processed", ...}
+[SQS] Procesado: {"order_id": "ORD-OK-4", "status": "processed", ...}
+[SQS] Fallo en messageId=msg-bad-1: order_id=ORD-BAD-1: amount 99999.99 supera el límite 9999.99
+[SQS] Lote finalizado: 4 ok, 1 fallidos — env=production project=lab31
+```
+
+**Paso 5** — Para contrastar, prueba cómo se comportaría el handler **sin** `report_batch_item_failures` — es decir, el handler original que lanza la excepción directamente en lugar de acumular fallos:
+
+```bash
+# Simula el handler original: lanza excepción en el primer mensaje inválido
+aws lambda invoke \
+  --function-name "$FUNCTION" \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "Records": [
+      {"messageId":"msg-ok-1","body":"{\"order_id\":\"ORD-OK-1\",\"order_type\":\"premium\",\"amount\":50.00}"},
+      {"messageId":"msg-bad-1","body":"{\"order_id\":\"ORD-BAD-1\",\"order_type\":\"premium\",\"amount\":99999.99}"},
+      {"messageId":"msg-ok-2","body":"{\"order_id\":\"ORD-OK-2\",\"order_type\":\"premium\",\"amount\":100.00}"}
+    ]
+  }' \
+  /tmp/response_old.json && cat /tmp/response_old.json | python3 -m json.tool
+```
+
+Con el handler del Reto 2, la respuesta es `{"batchItemFailures":[{"itemIdentifier":"msg-bad-1"}]}` — el `try/except` dentro del bucle hace que `msg-ok-1` y `msg-ok-2` se procesen correctamente (se ven en los logs como "[SQS] Procesado: …") y solo `msg-bad-1` queda registrado como fallo. SQS eliminará los dos mensajes válidos y reencolará únicamente el inválido.
 
 </details>
 
@@ -685,23 +685,20 @@ El alias `live` avanza automáticamente porque `function_version = aws_lambda_fu
 ```bash
 # Desde lab31/aws/
 terraform destroy
+
+# Eliminar el ZIP generado localmente
+rm -f function.zip
 ```
 
-El `destroy` elimina la función Lambda, todas las versiones de la Layer, la HTTP API, los grupos de logs y los roles IAM. Los archivos ZIP generados localmente se pueden borrar manualmente:
-
-```bash
-rm -f aws/layer.zip aws/function.zip
-```
-
-> El bucket S3 de estado (`terraform-state-labs-<ACCOUNT_ID>`) no se destruye: se reutiliza en otros laboratorios.
+`terraform destroy` elimina las 4 colas SQS, la función Lambda, el Event Source Mapping, las Lambda Destinations, IAM y CloudWatch Logs. No hay recursos de API Gateway ni Layers en este laboratorio.
 
 ---
 
 ## LocalStack
 
-Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
+Las colas SQS, Lambda y el Event Source Mapping funcionan correctamente en LocalStack Community. `filter_criteria` y Lambda Destinations tienen soporte parcial — los recursos se crean sin errores pero su comportamiento puede diferir del real.
 
-LocalStack Community soporta Lambda, IAM y CloudWatch Logs. **API Gateway v2 no está disponible en Community** (requiere licencia Pro) y se ha eliminado de `localstack/main.tf`. El código Python se ejecuta realmente invocando la función con `awslocal lambda invoke`, lo que permite verificar `archive_file`, `source_code_hash` y la Layer sin necesitar AWS real.
+Consulta [localstack/README.md](localstack/README.md) para instrucciones detalladas de despliegue y verificación con `awslocal`.
 
 ---
 
@@ -709,46 +706,34 @@ LocalStack Community soporta Lambda, IAM y CloudWatch Logs. **API Gateway v2 no 
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| `archive_file` | Genera ZIP localmente (sin llamadas AWS) | Idéntico — operación local, sin diferencias |
+| SQS colas y DLQ | Colas reales con latencia de red | Emulado localmente — comportamiento idéntico |
+| `redrive_policy` (maxReceiveCount=3) | Mueve mensajes a DLQ tras 3 fallos reales | Funciona correctamente |
+| `aws_lambda_event_source_mapping` | Lambda pollea SQS continuamente | Funciona; latencia de polling puede ser mayor |
+| `filter_criteria` (order_type=premium) | Solo activa Lambda para mensajes premium | Soporte parcial — puede ignorar el filtro |
+| Lambda Destinations (on_success/on_failure) | Enruta resultado de invocaciones async | Soporte parcial — puede no enrutar |
 | `source_code_hash` | Detecta cambios y fuerza redeploy | Detecta cambios y fuerza redeploy |
-| Lambda Layer | Versión numerada inmutable; montada en `/opt/python` | El recurso se crea y versiona, pero Community no la monta en el entorno de ejecución; `utils.py` se bundlea en la función como workaround |
-| Lambda Function | Ejecuta Python 3.12 real en infraestructura AWS | Ejecuta Python 3.12 real en contenedor local |
-| Cold start | Latencia real (100-500 ms) | Latencia mínima (entorno local) |
-| API Gateway v2 HTTP API | URL HTTPS pública, stage `$default` funcional | **No disponible** en Community (requiere Pro) |
-| `auto_deploy = true` | Publica cambios de rutas automáticamente | No desplegado |
-| `aws_lambda_permission` | Control de acceso real; sin permiso → 403 | No desplegado (depende de APIGW) |
-| CloudWatch Logs | Logs reales con `aws logs tail` | Logs registrados; `awslocal logs tail` limitado |
-| Payload format 2.0 | Evento con `requestContext.http.method`, `rawPath`… | Funciona al invocar Lambda directamente |
-| Coste aproximado | ~$0 (capa gratuita: 1 M invocaciones/mes, 400 000 GB-s) | Sin coste |
+| CloudWatch Metric Alarm (Reto 1) | Alarma real visible en consola | Soporte básico; estado puede no actualizarse |
+| `report_batch_item_failures` (Reto 2) | Solo los mensajes fallidos se reencolan | Soporte en versiones recientes de LocalStack |
+| Coste | ~$0 con volumen de laboratorio | Sin coste |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Usa siempre `source_code_hash`.** Sin él, Terraform puede no detectar cambios en el contenido del ZIP si el archivo se regenera con el mismo nombre. `output_base64sha256` de `archive_file` garantiza que cualquier modificación en el código fuente se refleja en el estado y dispara el redeploy.
-- **Crea el log group antes que la función.** Sin `depends_on = [aws_cloudwatch_log_group.lambda]`, Lambda crea el grupo automáticamente durante el primer cold start pero sin `retention_in_days`, acumulando logs indefinidamente y generando coste de almacenamiento no planificado.
-- **Separa Layer y función en `archive_file` independientes.** Un cambio en `utils.py` solo redespliega la Layer; un cambio en `handler.py` solo redespliega la función. Si usaras un único ZIP para todo, cualquier cambio menor reemplazaría el artefacto completo.
-- **Usa `source_arn` en `aws_lambda_permission`, nunca lo omitas.** Sin `source_arn`, cualquier API Gateway de la cuenta podría invocar tu función Lambda. Acotar a `${execution_arn}/*/*` limita el permiso a una API concreta — principio de mínimo privilegio.
-- **Prefiere `payload_format_version = "2.0"` para nuevos proyectos.** El formato 2.0 tiene una estructura de evento más limpia (`requestContext.http.method`, `rawPath`, `pathParameters` directamente accesibles) y es el recomendado para HTTP API. El formato 1.0 existe por compatibilidad con REST API v1.
-- **Usa `publish = true` con alias en producción.** Apuntar la integración a `$LATEST` significa que cualquier `terraform apply` que actualice el código es inmediatamente visible en producción. Con `publish = true` y un alias, tienes la posibilidad de hacer rollback en segundos cambiando `function_version` del alias a una versión anterior.
-- **Mantén el stage `$default` con `auto_deploy = true` solo en desarrollo.** En producción, usa `auto_deploy = false` y gestiona `aws_apigatewayv2_deployment` explícitamente para tener control sobre cuándo se publican los cambios de rutas e integraciones.
+- **`visibility_timeout_seconds` ≥ `timeout` de Lambda**: si el timeout de Lambda es 30 s, el visibility_timeout de la cola debe ser al menos 30 s. De lo contrario, el mensaje puede volver a ser visible mientras Lambda lo procesa y ser recibido por otro consumidor.
+- **DLQ siempre presente**: una cola SQS sin DLQ pierde mensajes silenciosamente cuando se supera el tiempo de retención. La DLQ es el último recurso de diagnóstico.
+- **Alarma sobre la DLQ**: sin alerta, los mensajes en la DLQ pueden acumularse días sin ser detectados. Un umbral de 1 mensaje es suficiente para producción.
+- **`filter_criteria` reduce costes**: los mensajes filtrados no invocán Lambda, eliminando procesamiento innecesario. Úsalo siempre que el volumen de mensajes descartados sea significativo.
+- **Lambda Destinations vs DLQ**: usa Destinations para capturar éxitos (imposible con DLQ) y para tener más contexto sobre el fallo (input + output completos). Usa DLQ cuando el procesamiento es síncrono desde SQS o cuando quieres volver a procesar los mensajes fallidos manualmente.
+- **`report_batch_item_failures` en producción**: sin esta opción, un único mensaje inválido en un lote de 100 fuerza el reprocesamiento de los 99 mensajes válidos. Con cargas altas esto puede multiplicar el coste por 3 (maxReceiveCount).
 
 ---
 
 ## Recursos
 
-- [data source archive_file — Terraform Registry](https://registry.terraform.io/providers/hashicorp/archive/latest/docs/data-sources/file)
-- [aws_lambda_function — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function)
-- [aws_lambda_layer_version — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_layer_version)
-- [aws_lambda_alias — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_alias)
-- [aws_lambda_permission — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_permission)
-- [aws_apigatewayv2_api — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_api)
-- [aws_apigatewayv2_stage — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_stage)
-- [aws_apigatewayv2_integration — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_integration)
-- [aws_apigatewayv2_route — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_route)
-- [Lambda Layers — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/chapter-layers.html)
-- [Working with Lambda functions — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-functions.html)
-- [HTTP API con integración Lambda proxy — AWS Docs](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html)
-- [Payload format 2.0 — AWS Docs](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html#http-api-develop-integrations-lambda.proxy-format)
-- [Lambda versioning — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/configuration-versions.html)
-- [Lambda aliases — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/configuration-aliases.html)
+- [AWS — Lambda Event Source Mapping con SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html)
+- [AWS — Lambda Destinations](https://docs.aws.amazon.com/lambda/latest/dg/invocation-async.html#invocation-async-destinations)
+- [AWS — Filter criteria para Event Source Mapping](https://docs.aws.amazon.com/lambda/latest/dg/invocation-eventfiltering.html)
+- [AWS — Dead Letter Queues en SQS](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+- [Terraform — aws_lambda_event_source_mapping](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_event_source_mapping)
+- [Terraform — aws_lambda_function_event_invoke_config](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function_event_invoke_config)

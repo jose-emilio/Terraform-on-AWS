@@ -1,4 +1,4 @@
-# Laboratorio 32 — FinOps y Rendimiento: Optimización de Cómputo
+# Laboratorio 32 — API Serverless: Lambda, API Gateway v2 y Layers
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,147 +8,145 @@
 
 ## Visión general
 
-En este laboratorio aplicarás técnicas avanzadas para reducir la factura de AWS y mejorar la latencia de tus servicios. Aprenderás a configurar una **estrategia de Fargate Spot** con ratio 3:1 frente a On-Demand para ahorrar hasta un 70% en el coste de cómputo de tus contenedores, a eliminar los **cold starts de Lambda** con Provisioned Concurrency sobre un alias versionado, a desplegar Lambda dentro de una **VPC privada** con `vpc_config` para acceder a bases de datos internas sin exponer esos recursos a internet, y a habilitar **observabilidad de costes** con Container Insights, CloudWatch Alarms y notificaciones SNS.
+En este laboratorio construirás una API REST completa usando el ecosistema serverless de AWS sin gestionar servidores. Automatizarás el empaquetado del código Python con el data source `archive_file` y forzarás redespliegues precisos mediante `source_code_hash`, de modo que cualquier cambio en el código fuente se detecta en el `terraform plan` antes de aplicar. Separarás las utilidades compartidas del código lógico usando una **Lambda Layer**, desplegando una API en API Gateway v2 con `auto_deploy = true` e integración `AWS_PROXY`, y configurarás los permisos de invocación con `aws_lambda_permission` limitado al ARN de ejecución de esta API concreta.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Configurar `aws_ecs_cluster_capacity_providers` con `FARGATE` y `FARGATE_SPOT` usando una estrategia de peso 3:1 para distribuir tareas entre capacidad Spot (barata) y On-Demand (estable)
-- Publicar versiones numeradas de Lambda con `publish = true` y crear un `aws_lambda_alias` que actúe como punto de entrada estable mientras el código evoluciona
-- Configurar `aws_lambda_provisioned_concurrency_config` sobre un alias para mantener instancias pre-calentadas y verificar la ausencia de cold start con la variable `AWS_LAMBDA_INITIALIZATION_TYPE`
-- Desplegar Lambda en subredes privadas mediante `vpc_config` y adjuntar `AWSLambdaVPCAccessExecutionRole` para que el servicio Lambda pueda crear las ENIs necesarias
-- Activar Container Insights en el cluster ECS con el bloque `setting { name = "containerInsights", value = "enabled" }`
-- Crear un `aws_cloudwatch_metric_alarm` sobre `CPUUtilization` con `evaluation_periods = 2` para evitar falsas alarmas por picos momentáneos, y enrutar notificaciones a un `aws_sns_topic`
+- Usar `data "archive_file"` del provider `archive` para empaquetar directorios de código fuente en ZIPs localmente y calcular su hash con `output_base64sha256`
+- Pasar `source_code_hash` a `aws_lambda_function` y `aws_lambda_layer_version` para que Terraform detecte cambios en el contenido del código y fuerce el redespliegue aunque el nombre del ZIP no cambie
+- Crear una Lambda Layer con `aws_lambda_layer_version` usando la estructura de directorio `python/` que el runtime Python añade automáticamente al `sys.path`
+- Desplegar una HTTP API v2 con `aws_apigatewayv2_api`, un stage `$default` con `auto_deploy = true` y una integración `AWS_PROXY` con `payload_format_version = "2.0"` que delega toda la lógica HTTP a Lambda
+- Definir rutas con `aws_apigatewayv2_route` usando placeholders de path (`{id}`) que se exponen en el evento Lambda como `pathParameters`
+- Configurar `aws_lambda_permission` con `source_arn` acotado al `execution_arn` de la API para que solo esa API pueda invocar la función
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre Lambda, ECS, EC2 (VPC), IAM, CloudWatch y SNS
+- Perfil AWS con permisos sobre Lambda, API Gateway v2, IAM y CloudWatch Logs
+- LocalStack en ejecución (para la sección de LocalStack)
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### Estrategia Spot: Capacity Providers en ECS Fargate
+### Empaquetado con archive_file y source_code_hash
 
-`aws_ecs_cluster_capacity_providers` define qué tipos de capacidad puede usar el cluster y cuál es la estrategia por defecto. La estrategia de peso 3:1 indica que por cada 4 tareas nuevas, 3 se solicitan en FARGATE_SPOT y 1 en FARGATE On-Demand:
+`data "archive_file"` es un data source del provider `hashicorp/archive` que genera ZIPs localmente sin llamar a ninguna API de AWS. Procesa el directorio fuente en tiempo de `terraform plan` y expone el atributo `output_base64sha256` con el hash SHA-256 del ZIP resultante.
 
 ```hcl
-resource "aws_ecs_cluster_capacity_providers" "main" {
-  cluster_name       = aws_ecs_cluster.main.name
-  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
-
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE_SPOT"
-    weight            = 3
-    base              = 0
-  }
-
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE"
-    weight            = 1
-    base              = 1  # garantiza al menos 1 tarea On-Demand siempre activa
-  }
+data "archive_file" "function" {
+  type        = "zip"
+  source_dir  = "${path.module}/src/function"
+  output_path = "${path.module}/function.zip"
 }
 ```
 
-`base = 1` en FARGATE es crítico: asegura que al menos 1 tarea On-Demand esté activa antes de distribuir el resto según los pesos. Esto protege el servicio de una interrupción total si AWS reclama toda la capacidad Spot disponible.
-
-AWS puede interrumpir las tareas FARGATE_SPOT con 2 minutos de aviso cuando necesita recuperar capacidad. Por eso, las aplicaciones que usen Spot deben ser **stateless** y capaces de terminar limpiamente en ese tiempo.
-
-### Alias de Lambda y Versiones Publicadas
-
-Con `publish = true`, cada `terraform apply` que cambie el código ZIP genera una versión numerada e inmutable. `aws_lambda_alias` crea un nombre estable que apunta a una versión concreta:
+El problema que resuelve `source_code_hash` es sutil: si solo usas `filename` en `aws_lambda_function`, Terraform detecta cambios en el archivo ZIP comparando su checksum en disco. Si el ZIP se regenera con el mismo contenido (por ejemplo, tras un `terraform init` en otra máquina), Terraform podría no detectar el cambio. Con `source_code_hash`, el hash se almacena explícitamente en el estado y se compara en cada plan:
 
 ```hcl
-resource "aws_lambda_function" "main" {
-  publish = true
+resource "aws_lambda_function" "api" {
+  filename         = data.archive_file.function.output_path
+  source_code_hash = data.archive_file.function.output_base64sha256
   # ...
 }
+```
 
-resource "aws_lambda_alias" "live" {
-  name             = "live"
-  function_name    = aws_lambda_function.main.function_name
-  function_version = aws_lambda_function.main.version  # versión más reciente publicada
+Cuando modificas `handler.py`, el ZIP cambia, su hash cambia, y la salida de `terraform plan` muestra:
+
+```
+~ source_code_hash = "aBcDe..." -> "XyZwV..."
+```
+
+### Lambda Layers
+
+Una Lambda Layer es un paquete ZIP que Lambda monta en el entorno de ejecución en `/opt`. Para el runtime Python, la estructura dentro del ZIP debe ser:
+
+```
+layer.zip
+└── python/
+    └── utils.py      ← accesible como "from utils import ..."
+```
+
+Lambda añade `/opt/python` al `sys.path` del runtime automáticamente. El código de la función puede importar el módulo sin instalación adicional ni rutas explícitas.
+
+```hcl
+resource "aws_lambda_layer_version" "utils" {
+  layer_name          = "${var.project}-utils"
+  filename            = data.archive_file.layer.output_path
+  source_code_hash    = data.archive_file.layer.output_base64sha256
+  compatible_runtimes = ["python3.12"]
 }
 ```
 
-Los clientes que invocan el alias `live` siempre reciben la misma versión hasta que el alias se actualice explícitamente. Esto permite hacer rollback cambiando `function_version` sin afectar la integración del cliente.
-
-### Provisioned Concurrency: Eliminación de Cold Starts
-
-`aws_lambda_provisioned_concurrency_config` mantiene un número fijo de contenedores Lambda inicializados y listos para responder. Las invocaciones al alias reciben una instancia pre-calentada sin pasar por el proceso de inicialización:
+Cada `terraform apply` que modifica `utils.py` crea una **nueva versión numerada** de la Layer. Las versiones son inmutables: no se sobreescriben. La función Lambda referencia la Layer por su ARN versionado, por lo que un cambio en la Layer fuerza automáticamente el redespliegue de la función:
 
 ```hcl
-resource "aws_lambda_provisioned_concurrency_config" "live" {
-  function_name                      = aws_lambda_function.main.function_name
-  qualifier                          = aws_lambda_alias.live.name
-  provisioned_concurrent_executions  = 5
+layers = [aws_lambda_layer_version.utils.arn]
+# ARN ejemplo: arn:aws:lambda:us-east-1:123:layer:lab32-utils:3
+```
+
+### HTTP API con API Gateway v2
+
+API Gateway v2 ofrece HTTP API (barata y rápida) y WebSocket API. La HTTP API es hasta 70 % más barata que la REST API v1 y tiene menor latencia porque elimina muchas funcionalidades de transformación que REST API incluye por defecto.
+
+```hcl
+resource "aws_apigatewayv2_api" "main" {
+  name          = "${var.project}-api"
+  protocol_type = "HTTP"   # HTTP API (v2) — no REST API (v1)
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.main.id
+  name        = "$default"    # stage especial: URL sin sufijo de stage
+  auto_deploy = true          # publica cambios de rutas e integraciones automáticamente
 }
 ```
 
-La variable de entorno `AWS_LAMBDA_INITIALIZATION_TYPE` es la forma oficial de verificar si una invocación usó un contenedor pre-calentado:
+El stage `$default` es especial: su URL no incluye el nombre del stage. En REST API v1, la URL sería `https://{id}.execute-api.{region}.amazonaws.com/prod/items`; en HTTP API con `$default` es simplemente `https://{id}.execute-api.{region}.amazonaws.com/items`.
 
-```python
-init_type = os.environ.get("AWS_LAMBDA_INITIALIZATION_TYPE", "on-demand")
-# "provisioned-concurrency" → sin cold start
-# "on-demand"               → cold start normal
-```
+### Integración AWS_PROXY y Payload Format 2.0
 
-> **Coste de Provisioned Concurrency**: se factura por GB-segundo de capacidad reservada, independientemente de si hay invocaciones. 5 instancias de 128 MB durante 1 hora ≈ 0,013 USD. Desactiva la configuración (`terraform destroy` o `provisioned_concurrent_executions = 0`) cuando no la necesites.
-
-### Lambda en VPC: vpc_config y Subredes Privadas
-
-`vpc_config` conecta Lambda a tu VPC creando ENIs (Elastic Network Interfaces) en las subredes especificadas. Lambda usa esas ENIs para alcanzar recursos privados como RDS, ElastiCache o servicios internos:
+`integration_type = "AWS_PROXY"` delega toda la lógica HTTP a Lambda. API Gateway reenvía el evento completo (método, path, headers, body, query params…) a la función y devuelve la respuesta sin transformarla. La función Lambda controla completamente el `statusCode`, `headers` y `body`.
 
 ```hcl
-resource "aws_lambda_function" "main" {
-  vpc_config {
-    subnet_ids         = aws_subnet.private[*].id
-    security_group_ids = [aws_security_group.lambda.id]
-  }
+resource "aws_apigatewayv2_integration" "lambda" {
+  api_id                 = aws_apigatewayv2_api.main.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.api.invoke_arn
+  payload_format_version = "2.0"
 }
 ```
 
-Sin `AWSLambdaVPCAccessExecutionRole`, el despliegue falla con un error de permisos porque el servicio Lambda no puede crear ni eliminar las ENIs:
+`payload_format_version = "2.0"` usa el esquema de evento simplificado que expone `requestContext.http.method`, `rawPath`, `pathParameters`, etc. — en lugar del esquema verbose de la REST API v1.
+
+Los placeholders `{id}` en `route_key` se mapean automáticamente a `event["pathParameters"]["id"]` en Lambda:
 
 ```hcl
-resource "aws_iam_role_policy_attachment" "lambda_vpc" {
-  role       = aws_iam_role.lambda.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+resource "aws_apigatewayv2_route" "get_item" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /items/{id}"   # {id} → event["pathParameters"]["id"]
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 ```
 
-Lambda en subredes **privadas** (sin ruta a internet) puede acceder a recursos VPC internos pero no a internet. Para que Lambda también pueda llamar a APIs externas, necesita un NAT Gateway o VPC Endpoints para los servicios AWS que use.
+### Permiso de Invocación Lambda
 
-### Observabilidad: Container Insights, CloudWatch Alarm y SNS
-
-Container Insights activa métricas por contenedor (CPU, memoria, red, disco) adicionales a las métricas estándar de servicio:
+Sin `aws_lambda_permission`, API Gateway recibe `403 Forbidden` al intentar invocar Lambda. Este recurso añade una política basada en recursos a la función Lambda que autoriza a `apigateway.amazonaws.com` como principal.
 
 ```hcl
-resource "aws_ecs_cluster" "main" {
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
-  }
-}
-```
+resource "aws_lambda_permission" "apigw" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
 
-La alarma usa `evaluation_periods = 2` para requerir que la condición se cumpla durante 2 periodos consecutivos antes de activarse. Esto evita falsas alarmas por picos momentáneos durante el arranque de contenedores:
-
-```hcl
-resource "aws_cloudwatch_metric_alarm" "ecs_cpu" {
-  namespace           = "AWS/ECS"
-  metric_name         = "CPUUtilization"
-  dimensions          = { ClusterName = "...", ServiceName = "..." }
-  period              = 60
-  evaluation_periods  = 2   # 2 minutos sostenidos > 80% para activar
-  statistic           = "Average"
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 80
-  alarm_actions       = [aws_sns_topic.alerts.arn]
+  # execution_arn: arn:aws:execute-api:{region}:{account}:{api-id}
+  # El patrón "/*/*" cubre cualquier stage y ruta de ESTA API.
+  # Es más seguro que "*" porque limita el permiso a una API concreta.
+  source_arn = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
 }
 ```
 
@@ -160,84 +158,98 @@ resource "aws_cloudwatch_metric_alarm" "ecs_cpu" {
 lab-32/
 ├── arch/
 │   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
-└── aws/
-    ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
-    ├── providers.tf          # Backend S3, Terraform >= 1.10, providers AWS y archive
-    ├── variables.tf          # region, project, runtime, provisioned_concurrency,
-    │                         # ecs_desired_count, alert_email
-    ├── main.tf               # VPC+subredes+SGs, IAM (Lambda+ECS), CloudWatch,
-    │                         # Lambda+Alias+Provisioned Concurrency, ECS cluster+
-    │                         # capacity providers+task def+service, SNS, CW Alarm
-    ├── outputs.tf            # function_name, function_version, alias_arn,
-    │                         # cluster_name, alarm_name, invoke_alias_example
-    └── src/
-        └── function/
-            └── handler.py    # Muestra init_type y vpc_hostname en la respuesta
+├── aws/
+│   ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
+│   ├── providers.tf          # Backend S3, Terraform >= 1.10, providers AWS y archive
+│   ├── variables.tf          # region, project, runtime, app_env
+│   ├── main.tf               # archive_file, IAM, CloudWatch, Layer, Lambda, APIGW, Permission
+│   ├── outputs.tf            # api_endpoint, function_name, layer_arn, log_group, curl_*
+│   └── src/
+│       ├── function/
+│       │   └── handler.py    # Handler Lambda: GET /items, GET /items/{id}, POST /items
+│       └── layer/
+│           └── python/
+│               └── utils.py  # Layer: format_response() y get_metadata()
+└── localstack/
+    ├── providers.tf          # Endpoints apuntando a LocalStack (lambda, apigatewayv2, iam, logs)
+    ├── variables.tf          # Mismas variables, project = "lab32-local"
+    ├── main.tf               # Idéntico a aws/main.tf
+    ├── outputs.tf
+    └── src/                  # Copia del código fuente (idéntica a aws/src/)
+        ├── function/
+        │   └── handler.py
+        └── layer/
+            └── python/
+                └── utils.py
 ```
 
-> **Nota**: `function.zip` es un artefacto generado por `archive_file` durante `terraform plan/apply`. No se versiona en Git — añádelo a `.gitignore`.
+> **Nota**: `layer.zip` y `function.zip` son artefactos generados por `archive_file` durante `terraform plan/apply`. No se versionan en Git — añádelos a `.gitignore`.
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Arquitectura
 
-![Lambda en VPC con Provisioned Concurrency sobre alias live + ECS Fargate Spot 3:1 con base=1 On-Demand + alarma CPU → SNS](arch/diagrama.svg)
+![API Gateway v2 HTTP API → integración AWS_PROXY → Lambda con Layer compartida + CloudWatch Logs](arch/diagrama.svg)
 
-Dos optimizaciones complementarias sobre la misma VPC. **Lambda** vive en subredes privadas (`vpc_config` con ENIs), publica versión por apply (`publish = true`) y un alias `live` apunta a la última. La **Provisioned Concurrency** se aplica al alias — cualquier invocación a `live` golpea contenedores pre-calentados (sin cold start). **ECS Fargate** corre nginx en subredes públicas con la estrategia `capacity_provider_strategy` 3:1 entre `FARGATE_SPOT` y `FARGATE`: `base = 1` en On-Demand garantiza al menos 1 tarea sobreviviente si AWS reclama instancias Spot. Una `aws_cloudwatch_metric_alarm` sobre CPU del servicio dispara `SNS` (con suscripción email opcional) tanto en `alarm` como en `ok`.
+El cliente HTTP llega al stage `$default` de una HTTP API v2 (más simple y barata que REST API v1). La integración `AWS_PROXY` con `payload_format_version = "2.0"` reenvía el evento completo a la Lambda. Tres rutas mapean a la misma función: `GET /items`, `GET /items/{id}` y `POST /items`. La función importa utilidades (`format_response`, `get_metadata`) desde una **Lambda Layer** independiente — el `source_code_hash` separado en cada `archive_file` permite redespliegues granulares: editar `utils.py` solo recrea la layer; editar `handler.py` solo recrea la función.
 
 ### Código Terraform
 
 **`aws/main.tf`** — Fragmentos clave:
 
-Lambda se despliega con `publish = true` y `vpc_config`. Ambos son independientes entre sí — cualquier función puede tener uno, ambos o ninguno:
+El laboratorio usa **dos `archive_file` independientes** para empaquetar la Layer y la función por separado. Así un cambio en `utils.py` solo actualiza la capa sin recrear la función ZIP, y viceversa:
 
 ```hcl
-resource "aws_lambda_function" "main" {
+# Empaqueta src/layer/ → layer.zip (contiene python/utils.py)
+data "archive_file" "layer" {
+  type        = "zip"
+  source_dir  = "${path.module}/src/layer"
+  output_path = "${path.module}/layer.zip"
+}
+
+# Empaqueta src/function/ → function.zip (contiene handler.py)
+data "archive_file" "function" {
+  type        = "zip"
+  source_dir  = "${path.module}/src/function"
+  output_path = "${path.module}/function.zip"
+}
+```
+
+El log group se crea **antes** de la función con `depends_on` para capturar los logs del cold start inicial. Sin él, Lambda crea el grupo automáticamente pero sin `retention_in_days`, acumulando logs indefinidamente:
+
+```hcl
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/${var.project}-function"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_function" "api" {
   function_name    = "${var.project}-function"
   filename         = data.archive_file.function.output_path
   source_code_hash = data.archive_file.function.output_base64sha256
   runtime          = var.runtime
   handler          = "handler.lambda_handler"
   role             = aws_iam_role.lambda.arn
-  publish          = true  # genera versión numerada en cada cambio de código
+  layers           = [aws_lambda_layer_version.utils.arn]
 
-  vpc_config {
-    subnet_ids         = aws_subnet.private[*].id
-    security_group_ids = [aws_security_group.lambda.id]
-  }
+  depends_on = [
+    aws_iam_role_policy_attachment.lambda_basic,
+    aws_cloudwatch_log_group.lambda,
+  ]
 }
 ```
 
-Provisioned Concurrency requiere que el `qualifier` sea un alias o un número de versión — nunca `$LATEST`:
+El `aws_lambda_permission` usa el `execution_arn` de la API (no el ARN de la función) como `source_arn`. Esto garantiza que solo las invocaciones originadas en esta API puedan ejecutar la función:
 
 ```hcl
-resource "aws_lambda_provisioned_concurrency_config" "live" {
-  function_name                      = aws_lambda_function.main.function_name
-  qualifier                          = aws_lambda_alias.live.name  # alias "live", no $LATEST
-  provisioned_concurrent_executions  = var.provisioned_concurrency
-}
-```
-
-La estrategia Spot se define en `aws_ecs_cluster_capacity_providers`, separado del recurso de cluster. Esto permite modificar la estrategia sin recrear el cluster:
-
-```hcl
-resource "aws_ecs_cluster_capacity_providers" "main" {
-  cluster_name       = aws_ecs_cluster.main.name
-  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
-
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE_SPOT"
-    weight            = 3
-    base              = 0
-  }
-
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE"
-    weight            = 1
-    base              = 1
-  }
+resource "aws_lambda_permission" "apigw" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
 }
 ```
 
@@ -256,352 +268,413 @@ terraform plan
 terraform apply
 ```
 
-> **Nota sobre Provisioned Concurrency**: `terraform apply` puede tardar 2–5 minutos adicionales mientras AWS aprovisiona los 5 contenedores Lambda. Es normal — el recurso `aws_lambda_provisioned_concurrency_config` espera a que el estado sea `READY`.
-
 Al finalizar, los outputs mostrarán:
 
 ```
-alarm_name           = "lab32-ecs-cpu-high"
-alias_arn            = "arn:aws:lambda:us-east-1:123456789:function:lab32-function:live"
-alias_invoke_arn     = "arn:aws:apigateway:us-east-1:lambda:path/..."
-cluster_name         = "lab32-cluster"
-function_name        = "lab32-function"
-function_version     = "1"
-invoke_alias_example = "aws lambda invoke --function-name lab32-function --qualifier live ..."
-invoke_latest_example= "aws lambda invoke --function-name lab32-function ..."
-lambda_sg_id         = "sg-0abc123..."
-log_group_ecs        = "/ecs/lab32"
-log_group_lambda     = "/aws/lambda/lab32-function"
-private_subnet_ids   = ["subnet-0abc...", "subnet-0def..."]
-service_name         = "lab32-service"
-sns_topic_arn        = "arn:aws:sns:us-east-1:123456789:lab32-alerts"
-vpc_id               = "vpc-0abc123..."
+api_endpoint   = "https://abc123def4.execute-api.us-east-1.amazonaws.com"
+api_id         = "abc123def4"
+curl_get_items = "curl -s 'https://abc123def4.execute-api.us-east-1.amazonaws.com/items' | python3 -m json.tool"
+curl_post_item = "curl -s -X POST 'https://...' -H 'Content-Type: application/json' -d '{...}' | python3 -m json.tool"
+function_arn   = "arn:aws:lambda:us-east-1:123456789:function:lab32-function"
+function_name  = "lab32-function"
+layer_arn      = "arn:aws:lambda:us-east-1:123456789:layer:lab32-utils:1"
+layer_version  = 1
+log_group      = "/aws/lambda/lab32-function"
 ```
 
-### Verificar el sistema
+### Verificar la API
 
-**Paso 1** — Verifica Provisioned Concurrency y el alias:
+**Paso 1** — Obtén la URL base y comprueba que la función responde:
 
 ```bash
-FUNCTION=$(terraform output -raw function_name)
-
-# Estado de la Provisioned Concurrency sobre el alias "live"
-aws lambda get-provisioned-concurrency-config \
-  --function-name "$FUNCTION" \
-  --qualifier live \
-  --query '{Solicitada:RequestedProvisionedConcurrentExecutions,Asignada:AllocatedProvisionedConcurrentExecutions,Estado:Status}'
+API=$(terraform output -raw api_endpoint)
+echo "API endpoint: $API"
 ```
 
-El estado debe ser `READY`. Si muestra `IN_PROGRESS`, espera un minuto y repite.
-
-**Paso 2** — Invoca a través del alias y verifica que no hay cold start:
+**Paso 2** — `GET /items` — lista todos los items del catálogo:
 
 ```bash
-# Invocación vía alias "live" → init_type debe ser "provisioned-concurrency"
-terraform output -raw invoke_alias_example | bash
+curl -s "$API/items" | python3 -m json.tool
 ```
 
 Respuesta esperada:
 ```json
 {
-  "statusCode": 200,
-  "body": {
-    "function_name": "lab32-function",
-    "function_version": "1",
-    "init_type": "provisioned-concurrency",
-    "vpc_hostname": "169.254.x.x",
-    "env": "production",
-    ...
+  "items": [
+    {"id": "1", "nombre": "Laptop Pro",       "precio": 1299.99, "categoria": "Electrónica"},
+    {"id": "2", "nombre": "Teclado Mecánico", "precio": 149.99,  "categoria": "Electrónica"},
+    {"id": "3", "nombre": "Monitor 4K",        "precio": 599.99,  "categoria": "Electrónica"}
+  ],
+  "total": 3,
+  "metadata": {
+    "function":    "lab32-function",
+    "request_id":  "abc123...",
+    "timestamp":   "2025-01-15T10:30:00.123456+00:00",
+    "environment": "production",
+    "project":     "lab32"
   }
 }
 ```
 
-**Paso 3** — Contrasta con una invocación a `$LATEST` (sin Provisioned Concurrency):
+**Paso 3** — `GET /items/{id}` — item por ID:
 
 ```bash
-# Invocación a $LATEST → init_type puede ser "on-demand" (cold start)
-terraform output -raw invoke_latest_example | bash
+# Item existente (200 OK)
+curl -s "$API/items/2" | python3 -m json.tool
+
+# Item inexistente (404 Not Found)
+curl -s "$API/items/999" | python3 -m json.tool
 ```
 
-Si es la primera invocación a `$LATEST`, verás `"init_type": "on-demand"` y un tiempo de respuesta mayor.
-
-**Paso 4** — Verifica la configuración VPC de Lambda:
+**Paso 4** — `POST /items` — crear un nuevo item:
 
 ```bash
+# Creación correcta (201 Created)
+curl -s -X POST "$API/items" \
+  -H "Content-Type: application/json" \
+  -d '{"nombre": "Ratón Ergonómico", "precio": 79.99, "categoria": "Electrónica"}' \
+  | python3 -m json.tool
+
+# El item quedó en memoria — verifica que existe (id 4)
+curl -s "$API/items/4" | python3 -m json.tool
+
+# Validación: campo 'nombre' requerido (400 Bad Request)
+curl -s -X POST "$API/items" \
+  -H "Content-Type: application/json" \
+  -d '{"precio": 19.99}' | python3 -m json.tool
+```
+
+> **Nota sobre warm starts**: el catálogo `_CATALOG` vive en memoria del contenedor Lambda. Se conserva entre invocaciones "cálidas" (mismo contenedor) y se reinicia en cada cold start. Después de POST /items, la siguiente petición GET /items puede devolver 3 ó 4 items dependiendo de si Lambda reutilizó el mismo contenedor. En producción usa DynamoDB u otro almacén persistente.
+
+**Paso 5** — Verifica la Layer adjunta a la función:
+
+```bash
+FUNCTION=$(terraform output -raw function_name)
+
+# Versiones de la Layer publicadas
+aws lambda list-layer-versions \
+  --layer-name "$(terraform output -raw function_name | sed 's/-function//')-utils" \
+  --query 'LayerVersions[*].{Version:Version,ARN:LayerVersionArn,Runtime:CompatibleRuntimes[0]}' \
+  --output table
+
+# Layers adjuntas a la función
 aws lambda get-function-configuration \
   --function-name "$FUNCTION" \
-  --query 'VpcConfig.{Subredes:SubnetIds,SG:SecurityGroupIds,VPC:VpcId}'
+  --query 'Layers[*].Arn' \
+  --output table
 ```
 
-**Paso 5** — Verifica la estrategia Spot del cluster ECS:
-
-> **Nota**: en la consola de ECS la columna *Launch type* muestra `Fargate` para **todas** las tareas, tanto FARGATE como FARGATE_SPOT. Eso es correcto — ambas usan la misma infraestructura Fargate. La distinción está en la columna *Capacity provider*, no en el launch type.
+**Paso 6** — Verifica la configuración de la integración y las rutas:
 
 ```bash
-CLUSTER=$(terraform output -raw cluster_name)
-SERVICE=$(terraform output -raw service_name)
+API_ID=$(terraform output -raw api_id)
 
-# Estrategia configurada en el servicio
-aws ecs describe-services \
-  --cluster "$CLUSTER" \
-  --services "$SERVICE" \
-  --query 'services[0].{Deseadas:desiredCount,Corriendo:runningCount,Estrategia:capacityProviderStrategy}'
+# Integración AWS_PROXY
+aws apigatewayv2 get-integrations \
+  --api-id "$API_ID" \
+  --query 'Items[*].{Tipo:IntegrationType,URI:IntegrationUri,Formato:PayloadFormatVersion}' \
+  --output table
 
-# Capacity provider real de cada tarea en ejecución
-TASK_ARNS=$(aws ecs list-tasks --cluster "$CLUSTER" --query 'taskArns[]' --output text)
-
-aws ecs describe-tasks \
-  --cluster "$CLUSTER" \
-  --tasks $TASK_ARNS \
-  --query 'tasks[*].{ID:taskArn,LaunchType:launchType,CapacityProvider:capacityProviderName}'
+# Rutas registradas
+aws apigatewayv2 get-routes \
+  --api-id "$API_ID" \
+  --query 'Items[*].{Ruta:RouteKey,Target:Target}' \
+  --output table
 ```
 
-La salida mostrará `"LaunchType": "Fargate"` en todas las tareas y `"CapacityProvider": "FARGATE_SPOT"` o `"FARGATE"` según la distribución 3:1. Con `desired_count = 2` y `base = 1`, una tarea irá a FARGATE (el base) y la otra a FARGATE_SPOT.
-
-**Paso 6** — Verifica la alarma CloudWatch:
+**Paso 7** — Verifica el permiso Lambda:
 
 ```bash
-aws cloudwatch describe-alarms \
-  --alarm-names "$(terraform output -raw alarm_name)" \
-  --query 'MetricAlarms[0].{Estado:StateValue,Umbral:Threshold,Periodos:EvaluationPeriods}'
+aws lambda get-policy \
+  --function-name "$FUNCTION" \
+  --query 'Policy' --output text | python3 -m json.tool
 ```
 
-La alarma comenzará en `INSUFFICIENT_DATA` y pasará a `OK` tras el primer ciclo de 60 segundos si el cluster tiene tareas corriendo con CPU < 80%.
+La política debe mostrar `apigateway.amazonaws.com` como principal y el `execution_arn` de la API como `AWS:SourceArn`.
 
-**Paso 7** — Verifica la suscripción SNS (si configuraste `alert_email`):
+**Paso 8** — Ver logs en CloudWatch:
 
 ```bash
-aws sns list-subscriptions-by-topic \
-  --topic-arn "$(terraform output -raw sns_topic_arn)" \
-  --query 'Subscriptions[*].{Protocolo:Protocol,Endpoint:Endpoint,Estado:SubscriptionArn}'
+LOG_GROUP=$(terraform output -raw log_group)
+aws logs tail "$LOG_GROUP" --follow --format short
 ```
 
-Si la suscripción está en `PendingConfirmation`, revisa tu bandeja de entrada y confirma el email de AWS.
+### Forzar redeploy con source_code_hash
 
-### Publicar una nueva versión y ver cómo avanza el alias
-
-Cuando modificas el código y aplicas, Terraform publica una nueva versión y actualiza el alias automáticamente:
+Este es el mecanismo central del laboratorio. Modifica el código fuente y observa cómo Terraform detecta el cambio sin que el nombre del ZIP varíe:
 
 ```bash
-# Añade un comentario al handler para cambiar el hash del ZIP
-echo "# v1.1" >> src/function/handler.py
+# Añade un campo nuevo a la respuesta de GET /items
+# Edita src/function/handler.py y añade "version": "1.1" en el return de la ruta /items
 
+# terraform plan muestra el cambio en source_code_hash
 terraform plan
 # ~ source_code_hash = "aBcDe..." -> "XyZwV..."
-# + function_version: "1" -> "2" (nueva versión publicada)
+# ~ last_modified    = "2025-01-15T10:30:00.000+0000" -> (known after apply)
 
 terraform apply
 
-# Verifica que el alias apunta ahora a la versión 2
-aws lambda get-alias \
-  --function-name "$(terraform output -raw function_name)" \
-  --name live \
-  --query '{Alias:Name,Version:FunctionVersion}'
-
-# Invoca vía el alias "live" — ahora apunta a la versión 2
-# El campo "function_version" en la respuesta debe mostrar "2"
-terraform output -raw invoke_alias_example | bash
+# Verifica que el nuevo campo aparece
+curl -s "$API/items" | python3 -m json.tool
 ```
 
-El alias `live` siempre usa `--qualifier live`, no el número de versión directamente. Eso es correcto: el alias actúa como punto de entrada estable. Lo que cambia en la respuesta es `"function_version": "2"` — el handler expone `context.function_version`, que refleja la versión real que ejecutó AWS.
+Prueba también modificar `utils.py` — Terraform detectará el cambio en la Layer y redespliegará tanto la capa (nueva versión) como la función (nuevo ARN de Layer):
+
+```bash
+# Añade un campo "lab_version": "1.0" en get_metadata() de src/layer/python/utils.py
+terraform apply
+# Verás que TANTO la Layer como la función se actualizan
+```
 
 ---
 
-> **Antes de comenzar los retos**, verifica que la invocación al alias devuelve `"init_type": "provisioned-concurrency"` y que el servicio ECS tiene tareas en estado `RUNNING`.
+> **Antes de comenzar los retos**, asegúrate de que `terraform apply` ha completado sin errores y la API responde correctamente. Ejecuta `curl -s "$API/items"` para confirmarlo.
 
 ## Verificación final
 
 ```bash
-# Verificar que la función Lambda usa Provisioned Concurrency
-aws lambda get-provisioned-concurrency-config \
+# Obtener la URL base de la API
+API_URL=$(terraform output -raw api_endpoint)
+
+# Probar GET /items
+curl -s "${API_URL}/items" | python3 -m json.tool
+# Esperado: {"items": [...], "total": 3, "metadata": {...}}
+
+# Probar GET /items/{id}
+curl -s "${API_URL}/items/2" | python3 -m json.tool
+# Esperado: {"item": {"id": "2", ...}, "metadata": {...}}
+
+# Verificar que la Layer está asociada a la función
+aws lambda get-function-configuration \
   --function-name "$(terraform output -raw function_name)" \
-  --qualifier live \
-  --query 'RequestedProvisionedConcurrentExecutions'
+  --query 'Layers[*].Arn' --output text
 
-# Invocar la función via alias y comprobar init_type
-aws lambda invoke \
-  --function-name "$(terraform output -raw function_name)" \
-  --qualifier live \
-  --payload '{}' \
-  --cli-binary-format raw-in-base64-out \
-  /tmp/response.json && cat /tmp/response.json | python3 -m json.tool
-# Esperado: "init_type": "provisioned-concurrency"
-
-# Verificar tareas ECS en RUNNING
-aws ecs list-tasks \
-  --cluster "$(terraform output -raw cluster_name)" \
-  --query 'taskArns' --output table
-
-# Comprobar la alarma de CloudWatch
-aws cloudwatch describe-alarms \
-  --alarm-names "$(terraform output -raw alarm_name)" \
-  --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue}' \
-  --output table
+# Comprobar que los logs se generan en CloudWatch
+aws logs describe-log-groups \
+  --query 'logGroups[?contains(logGroupName,`lab32`)].logGroupName' \
+  --output text
 ```
 
 ---
 
 ## Retos
 
-### Reto 1 — Lambda Function URL para Invocación Directa
+### Reto 1 — CORS y Throttling
 
-La función Lambda está dentro de una VPC y actualmente solo se puede invocar con `aws lambda invoke`. Añadir una **Lambda Function URL** permite invocarla directamente mediante HTTPS sin necesidad de API Gateway, manteniendo el alias y la Provisioned Concurrency activos.
+La API actual no tiene cabeceras CORS, lo que impide llamarla desde aplicaciones web en el navegador (el navegador bloqueará las peticiones cross-origin). Tampoco tiene limitación de tasa, por lo que un cliente descontrolado podría generar invocaciones masivas de Lambda con coste ilimitado.
 
 **Requisitos**
 
-1. Crea `aws_lambda_function_url` apuntando al alias `"live"` (usa `qualifier = aws_lambda_alias.live.name`).
-   - `authorization_type = "NONE"` para permitir invocaciones sin autenticación (válido para laboratorio; en producción usa `"AWS_IAM"`).
-   - El provider AWS añade automáticamente los permisos necesarios (`lambda:InvokeFunctionUrl` y `lambda:InvokeFunction`) al crear el recurso.
-2. Añade un output `function_url` con la URL generada.
-3. Invoca la URL con `curl` y verifica que `init_type` es `"provisioned-concurrency"`.
+1. Añade un bloque `cors_configuration` en `aws_apigatewayv2_api` que permita:
+   - Headers: `Content-Type`
+   - Métodos: `GET`, `POST`, `OPTIONS`
+   - Orígenes: `*` (en producción se restringiría a dominios concretos)
+   - `max_age = 300` (segundos que el navegador cachea la respuesta preflight)
+2. Añade un bloque `default_route_settings` en `aws_apigatewayv2_stage` con:
+   - `throttling_burst_limit = 100` (peticiones simultáneas máximas)
+   - `throttling_rate_limit  = 50`  (peticiones por segundo sostenidas)
 
 **Criterios de éxito**
 
-- `terraform output -raw function_url` devuelve una URL `https://` válida.
-- `curl -s "$(terraform output -raw function_url)" | python3 -m json.tool` devuelve la respuesta del handler con `"init_type": "provisioned-concurrency"`.
-- Puedes explicar por qué la Function URL debe apuntar al alias y no a `$LATEST` para beneficiarse de la Provisioned Concurrency.
+- Una petición `OPTIONS` a `/items` devuelve 200 con la cabecera `Access-Control-Allow-Origin: *`.
+- La configuración de throttling es visible en la consola de API Gateway o con `aws apigatewayv2 get-stage`.
+- Puedes explicar la diferencia entre `throttling_burst_limit` (capacidad de ráfaga) y `throttling_rate_limit` (tasa sostenida), y qué código HTTP devuelve API Gateway cuando se supera el límite.
 
-### Reto 2 — ECS Auto Scaling con Target Tracking
+### Reto 2 — Lambda Versioning y Alias
 
-El servicio ECS tiene `desired_count` fijo. En producción, el número de tareas debe adaptarse a la carga real. El objetivo es añadir un **Auto Scaling** basado en CPU que escale entre 1 y 6 tareas manteniendo la CPU media por debajo del 60%.
+En producción, la integración de API Gateway no debería apuntar a `$LATEST` (la versión mutable y siempre actualizable de Lambda) sino a un **alias** que apunte a una versión numerada e inmutable. Esto permite hacer rollback a una versión anterior cambiando solo a qué versión apunta el alias, sin modificar la integración de API Gateway.
 
 ### Requisitos
 
-1. Registra el servicio ECS como objetivo escalable con `aws_appautoscaling_target`:
-   - `min_capacity = 1`, `max_capacity = 6`
-   - `resource_id = "service/${cluster_name}/${service_name}"`
-   - `scalable_dimension = "ecs:service:DesiredCount"`
-   - `service_namespace = "ecs"`
-2. Crea `aws_appautoscaling_policy` de tipo `TargetTrackingScaling`:
-   - `target_value = 60` (mantener CPU < 60%)
-   - `predefined_metric_type = "ECSServiceAverageCPUUtilization"`
-   - `scale_in_cooldown = 300`, `scale_out_cooldown = 60`
-3. Añade outputs `autoscaling_min`, `autoscaling_max` y `autoscaling_target_cpu`.
+1. Activa `publish = true` en `aws_lambda_function` para que cada despliegue genere una versión numerada inmutable.
+2. Crea `aws_lambda_alias` con `name = "live"` apuntando a `aws_lambda_function.api.version` (la versión publicada más reciente).
+3. Actualiza `aws_apigatewayv2_integration` para que `integration_uri` apunte al `invoke_arn` del alias.
+4. Actualiza `aws_lambda_permission` para usar `qualifier = aws_lambda_alias.live.name`, de modo que el permiso se aplique sobre el alias y no sobre `$LATEST`.
+5. Añade un output `function_version` con el número de versión publicada más reciente.
 
 **Criterios de éxito**
 
-- `aws application-autoscaling describe-scalable-targets --service-namespace ecs` muestra el servicio registrado con `min = 1` y `max = 6`.
-- `aws application-autoscaling describe-scaling-policies --service-namespace ecs` muestra la política con `TargetValue: 60.0`.
-- Puedes explicar la diferencia entre `scale_in_cooldown` (300 s) y `scale_out_cooldown` (60 s) y por qué se recomienda un cooldown de scale-in más largo.
+- `aws lambda list-versions-by-function` muestra al menos la versión `1` publicada.
+- `aws lambda get-alias --name live` muestra que el alias apunta a esa versión.
+- La API sigue respondiendo correctamente (`curl -s "$API/items"`).
+- Al modificar el código y hacer `terraform apply`, se publica una nueva versión y el alias avanza automáticamente.
+- Puedes explicar por qué el permiso debe usar `qualifier` y no solo `function_name`.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Lambda Function URL para Invocación Directa</strong></summary>
+<summary><strong>Solución al Reto 1 — CORS y Throttling</strong></summary>
 
-### Solución al Reto 1 — Lambda Function URL para Invocación Directa
+### Solución al Reto 1 — CORS y Throttling
 
-Añade en `main.tf`:
+Modifica `aws_apigatewayv2_api` y `aws_apigatewayv2_stage` en `main.tf`:
 
 ```hcl
-resource "aws_lambda_function_url" "live" {
-  function_name      = aws_lambda_function.main.function_name
-  qualifier          = aws_lambda_alias.live.name
-  authorization_type = "NONE"
+resource "aws_apigatewayv2_api" "main" {
+  name          = "${var.project}-api"
+  protocol_type = "HTTP"
+  description   = "HTTP API del lab32 — con CORS y throttling"
+
+  cors_configuration {
+    allow_headers = ["Content-Type", "X-Api-Key", "Authorization"]
+    allow_methods = ["GET", "POST", "OPTIONS"]
+    allow_origins = ["*"]   # en producción: ["https://mi-app.example.com"]
+    max_age       = 300
+  }
+
+  tags = local.tags
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.main.id
+  name        = "$default"
+  auto_deploy = true
+
+  default_route_settings {
+    throttling_burst_limit = 100  # capacidad de ráfaga: peticiones simultáneas máximas
+    throttling_rate_limit  = 50   # tasa sostenida: peticiones por segundo
+  }
+
+  tags = local.tags
 }
 ```
 
-El provider AWS añade automáticamente dos statements en la resource-based policy al crear este recurso con `authorization_type = "NONE"`:
-
-- `lambda:InvokeFunctionUrl` con condición `FunctionUrlAuthType: NONE`
-- `lambda:InvokeFunction` con condición `InvokedViaFunctionUrl: true`
-
-Ambos son necesarios para que la URL funcione. AWS no los elimina al hacer `terraform destroy` — deben borrarse manualmente si se destruye y recrea la función con otro nombre.
-
-Añade en `outputs.tf`:
-
-```hcl
-output "function_url" {
-  description = "URL HTTPS para invocar Lambda directamente (alias 'live')"
-  value       = aws_lambda_function_url.live.function_url
-}
-```
-
-Verifica:
+Verificación:
 
 ```bash
 terraform apply
 
-FURL=$(terraform output -raw function_url)
-echo "Function URL: $FURL"
+API=$(terraform output -raw api_endpoint)
 
-curl -s "$FURL" | python3 -m json.tool
+# El preflight OPTIONS debe devolver 200 con cabeceras CORS
+curl -s -X OPTIONS "$API/items" \
+  -H "Origin: https://mi-app.example.com" \
+  -H "Access-Control-Request-Method: GET" \
+  -D - -o /dev/null | grep -i "access-control"
+# access-control-allow-origin: *
+# access-control-allow-methods: GET,POST,OPTIONS
+
+# Verifica la configuración del stage
+aws apigatewayv2 get-stage \
+  --api-id "$(terraform output -raw api_id)" \
+  --stage-name '$default' \
+  --query 'DefaultRouteSettings.{Burst:ThrottlingBurstLimit,Rate:ThrottlingRateLimit}' \
+  --output table
 ```
 
-La respuesta debe incluir `"init_type": "provisioned-concurrency"` porque la URL está vinculada al alias, que tiene los 5 contenedores pre-calentados.
-
-Si usaras `qualifier = "$LATEST"` o no especificaras qualifier, la URL apuntaría a `$LATEST` y la Provisioned Concurrency no se aplicaría — las primeras invocaciones sufrirían cold start.
+Cuando se supera `throttling_rate_limit`, API Gateway devuelve `429 Too Many Requests` sin invocar Lambda — lo que protege la función de picos de coste.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — ECS Auto Scaling con Target Tracking</strong></summary>
+<summary><strong>Solución al Reto 2 — Lambda Versioning y Alias</strong></summary>
 
-### Solución al Reto 2 — ECS Auto Scaling con Target Tracking
+### Solución al Reto 2 — Lambda Versioning y Alias
 
-Añade en `main.tf`:
+Añade `publish = true` a `aws_lambda_function` y los nuevos recursos en `main.tf`:
 
 ```hcl
-resource "aws_appautoscaling_target" "ecs" {
-  min_capacity       = 1
-  max_capacity       = 6
-  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.app.name}"
-  scalable_dimension = "ecs:service:DesiredCount"
-  service_namespace  = "ecs"
-}
+resource "aws_lambda_function" "api" {
+  function_name    = "${var.project}-function"
+  filename         = data.archive_file.function.output_path
+  source_code_hash = data.archive_file.function.output_base64sha256
+  runtime          = var.runtime
+  handler          = "handler.lambda_handler"
+  role             = aws_iam_role.lambda.arn
+  layers           = [aws_lambda_layer_version.utils.arn]
+  publish          = true   # ← publica una versión numerada en cada cambio de código
 
-resource "aws_appautoscaling_policy" "ecs_cpu" {
-  name               = "${var.project}-ecs-cpu-tracking"
-  policy_type        = "TargetTrackingScaling"
-  resource_id        = aws_appautoscaling_target.ecs.resource_id
-  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
-  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
-
-  target_tracking_scaling_policy_configuration {
-    target_value       = 60
-    scale_in_cooldown  = 300  # espera 5 min antes de reducir tareas (evita thrashing)
-    scale_out_cooldown = 60   # escala rápido hacia arriba ante picos de carga
-
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+  environment {
+    variables = {
+      APP_ENV     = var.app_env
+      APP_PROJECT = var.project
     }
   }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.lambda_basic,
+    aws_cloudwatch_log_group.lambda,
+  ]
+
+  tags = merge(local.tags, { Name = "${var.project}-function" })
+}
+
+# Alias que siempre apunta a la versión publicada más reciente
+resource "aws_lambda_alias" "live" {
+  name             = "live"
+  description      = "Alias de producción — apunta a la última versión publicada"
+  function_name    = aws_lambda_function.api.function_name
+  function_version = aws_lambda_function.api.version   # número de versión publicada
 }
 ```
 
-Añade en `outputs.tf`:
+Actualiza la integración para usar el `invoke_arn` del alias:
 
 ```hcl
-output "autoscaling_min" {
-  value = aws_appautoscaling_target.ecs.min_capacity
-}
-output "autoscaling_max" {
-  value = aws_appautoscaling_target.ecs.max_capacity
-}
-output "autoscaling_target_cpu" {
-  value = 60
+resource "aws_apigatewayv2_integration" "lambda" {
+  api_id                 = aws_apigatewayv2_api.main.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_alias.live.invoke_arn   # ← alias, no $LATEST
+  payload_format_version = "2.0"
 }
 ```
 
-Verifica:
+Actualiza el permiso para usar `qualifier` apuntando al alias:
+
+```hcl
+resource "aws_lambda_permission" "apigw" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  qualifier     = aws_lambda_alias.live.name           # ← permiso sobre el alias
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
+}
+```
+
+Añade a `outputs.tf`:
+
+```hcl
+output "function_version" {
+  description = "Número de la última versión Lambda publicada"
+  value       = aws_lambda_function.api.version
+}
+```
+
+Verificación:
 
 ```bash
 terraform apply
 
-# Objetivo escalable registrado
-aws application-autoscaling describe-scalable-targets \
-  --service-namespace ecs \
-  --query 'ScalableTargets[?ResourceId!=`null`].{ID:ResourceId,Min:MinCapacity,Max:MaxCapacity}'
+FUNCTION=$(terraform output -raw function_name)
 
-# Política de tracking
-aws application-autoscaling describe-scaling-policies \
-  --service-namespace ecs \
-  --query 'ScalingPolicies[*].{Nombre:PolicyName,Tipo:PolicyType,Target:TargetTrackingScalingPolicyConfiguration.TargetValue}'
+# Listar versiones publicadas
+aws lambda list-versions-by-function \
+  --function-name "$FUNCTION" \
+  --query 'Versions[*].{Version:Version,SHA:CodeSha256,Modified:LastModified}' \
+  --output table
+
+# Ver el alias y a qué versión apunta
+aws lambda get-alias \
+  --function-name "$FUNCTION" \
+  --name live \
+  --query '{Nombre:Name,Version:FunctionVersion,ARN:AliasArn}' \
+  --output table
+
+# La API sigue funcionando a través del alias
+API=$(terraform output -raw api_endpoint)
+curl -s "$API/items" | python3 -m json.tool
+
+# Modificar el código y comprobar que la versión avanza
+echo "# version bump" >> src/function/handler.py
+terraform apply -auto-approve
+aws lambda get-alias --function-name "$FUNCTION" --name live --query FunctionVersion
+# "2"  (la versión anterior era "1")
 ```
 
-`scale_in_cooldown = 300` evita que el Auto Scaling reduzca tareas inmediatamente después de un pico, lo que provocaría ciclos continuos de scale-out/scale-in ("thrashing"). `scale_out_cooldown = 60` permite reaccionar rápido ante picos de carga sin esperar.
+El alias `live` avanza automáticamente porque `function_version = aws_lambda_function.api.version` es un atributo dinámico: cada vez que Terraform crea una nueva versión publicada (`publish = true`), `version` devuelve el nuevo número y el alias se actualiza en el mismo `apply`.
 
 </details>
 
@@ -612,34 +685,70 @@ aws application-autoscaling describe-scaling-policies \
 ```bash
 # Desde lab32/aws/
 terraform destroy
-
-# Eliminar el ZIP generado localmente
-rm -f function.zip
 ```
 
-`terraform destroy` elimina en orden correcto: primero la Provisioned Concurrency, luego el alias, luego la función (esto libera las ENIs de la VPC). Las ENIs pueden tardar hasta 15 minutos en eliminarse antes de que la VPC pueda borrarse.
+El `destroy` elimina la función Lambda, todas las versiones de la Layer, la HTTP API, los grupos de logs y los roles IAM. Los archivos ZIP generados localmente se pueden borrar manualmente:
 
-> Si `terraform destroy` se queda esperando en las ENIs de Lambda, es el comportamiento normal. AWS las elimina automáticamente una vez que confirma que Lambda ya no las usa.
+```bash
+rm -f aws/layer.zip aws/function.zip
+```
+
+> El bucket S3 de estado (`terraform-state-labs-<ACCOUNT_ID>`) no se destruye: se reutiliza en otros laboratorios.
+
+---
+
+## LocalStack
+
+Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
+
+LocalStack Community soporta Lambda, IAM y CloudWatch Logs. **API Gateway v2 no está disponible en Community** (requiere licencia Pro) y se ha eliminado de `localstack/main.tf`. El código Python se ejecuta realmente invocando la función con `awslocal lambda invoke`, lo que permite verificar `archive_file`, `source_code_hash` y la Layer sin necesitar AWS real.
+
+---
+
+## Comparativa AWS Real vs LocalStack
+
+| Aspecto | AWS Real | LocalStack |
+|---|---|---|
+| `archive_file` | Genera ZIP localmente (sin llamadas AWS) | Idéntico — operación local, sin diferencias |
+| `source_code_hash` | Detecta cambios y fuerza redeploy | Detecta cambios y fuerza redeploy |
+| Lambda Layer | Versión numerada inmutable; montada en `/opt/python` | El recurso se crea y versiona, pero Community no la monta en el entorno de ejecución; `utils.py` se bundlea en la función como workaround |
+| Lambda Function | Ejecuta Python 3.12 real en infraestructura AWS | Ejecuta Python 3.12 real en contenedor local |
+| Cold start | Latencia real (100-500 ms) | Latencia mínima (entorno local) |
+| API Gateway v2 HTTP API | URL HTTPS pública, stage `$default` funcional | **No disponible** en Community (requiere Pro) |
+| `auto_deploy = true` | Publica cambios de rutas automáticamente | No desplegado |
+| `aws_lambda_permission` | Control de acceso real; sin permiso → 403 | No desplegado (depende de APIGW) |
+| CloudWatch Logs | Logs reales con `aws logs tail` | Logs registrados; `awslocal logs tail` limitado |
+| Payload format 2.0 | Evento con `requestContext.http.method`, `rawPath`… | Funciona al invocar Lambda directamente |
+| Coste aproximado | ~$0 (capa gratuita: 1 M invocaciones/mes, 400 000 GB-s) | Sin coste |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **`base = 1` en FARGATE On-Demand**: garantiza que siempre haya al menos una tarea estable. Sin este mínimo, si AWS reclama toda la capacidad Spot, el servicio puede quedar sin tareas.
-- **Provisioned Concurrency solo sobre alias, nunca sobre `$LATEST`**: `$LATEST` es mutable y cambia con cada despliegue. Configurar Provisioned Concurrency sobre `$LATEST` produciría comportamiento impredecible y costes difíciles de controlar.
-- **Desactiva Provisioned Concurrency fuera de horario**: si tu tráfico tiene un patrón horario claro (pico diurno), usa `aws_lambda_provisioned_concurrency_config` con un scheduled scaling para reducirla por la noche.
-- **`AWSLambdaVPCAccessExecutionRole` es obligatoria**: Lambda necesita permisos para crear y limpiar las ENIs. Sin esta política, el despliegue fallará en la creación de la función o tardará mucho en destruirse.
-- **`evaluation_periods = 2` en alarmas de CPU**: un solo periodo basta para activar una alarma, pero dos periodos consecutivos filtran los picos de arranque de contenedores (que generan CPU momentáneamente alta) sin retrasar la notificación ante problemas reales.
-- **`scale_in_cooldown` largo**: reducir el número de tareas rápidamente ante bajadas de carga puede provocar que el sistema deba escalar de nuevo si la carga sube otro poco. Un cooldown de 300 s es un punto de partida razonable.
+- **Usa siempre `source_code_hash`.** Sin él, Terraform puede no detectar cambios en el contenido del ZIP si el archivo se regenera con el mismo nombre. `output_base64sha256` de `archive_file` garantiza que cualquier modificación en el código fuente se refleja en el estado y dispara el redeploy.
+- **Crea el log group antes que la función.** Sin `depends_on = [aws_cloudwatch_log_group.lambda]`, Lambda crea el grupo automáticamente durante el primer cold start pero sin `retention_in_days`, acumulando logs indefinidamente y generando coste de almacenamiento no planificado.
+- **Separa Layer y función en `archive_file` independientes.** Un cambio en `utils.py` solo redespliega la Layer; un cambio en `handler.py` solo redespliega la función. Si usaras un único ZIP para todo, cualquier cambio menor reemplazaría el artefacto completo.
+- **Usa `source_arn` en `aws_lambda_permission`, nunca lo omitas.** Sin `source_arn`, cualquier API Gateway de la cuenta podría invocar tu función Lambda. Acotar a `${execution_arn}/*/*` limita el permiso a una API concreta — principio de mínimo privilegio.
+- **Prefiere `payload_format_version = "2.0"` para nuevos proyectos.** El formato 2.0 tiene una estructura de evento más limpia (`requestContext.http.method`, `rawPath`, `pathParameters` directamente accesibles) y es el recomendado para HTTP API. El formato 1.0 existe por compatibilidad con REST API v1.
+- **Usa `publish = true` con alias en producción.** Apuntar la integración a `$LATEST` significa que cualquier `terraform apply` que actualice el código es inmediatamente visible en producción. Con `publish = true` y un alias, tienes la posibilidad de hacer rollback en segundos cambiando `function_version` del alias a una versión anterior.
+- **Mantén el stage `$default` con `auto_deploy = true` solo en desarrollo.** En producción, usa `auto_deploy = false` y gestiona `aws_apigatewayv2_deployment` explícitamente para tener control sobre cuándo se publican los cambios de rutas e integraciones.
 
 ---
 
 ## Recursos
 
-- [AWS — Fargate Spot](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-capacity-providers.html)
-- [AWS — Lambda Provisioned Concurrency](https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html)
-- [AWS — Lambda en VPC](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html)
-- [AWS — Container Insights para ECS](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html)
-- [Terraform — aws_ecs_cluster_capacity_providers](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecs_cluster_capacity_providers)
-- [Terraform — aws_lambda_provisioned_concurrency_config](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_provisioned_concurrency_config)
-- [Terraform — aws_appautoscaling_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/appautoscaling_policy)
+- [data source archive_file — Terraform Registry](https://registry.terraform.io/providers/hashicorp/archive/latest/docs/data-sources/file)
+- [aws_lambda_function — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function)
+- [aws_lambda_layer_version — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_layer_version)
+- [aws_lambda_alias — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_alias)
+- [aws_lambda_permission — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_permission)
+- [aws_apigatewayv2_api — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_api)
+- [aws_apigatewayv2_stage — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_stage)
+- [aws_apigatewayv2_integration — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_integration)
+- [aws_apigatewayv2_route — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_route)
+- [Lambda Layers — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/chapter-layers.html)
+- [Working with Lambda functions — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-functions.html)
+- [HTTP API con integración Lambda proxy — AWS Docs](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html)
+- [Payload format 2.0 — AWS Docs](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html#http-api-develop-integrations-lambda.proxy-format)
+- [Lambda versioning — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/configuration-versions.html)
+- [Lambda aliases — AWS Docs](https://docs.aws.amazon.com/lambda/latest/dg/configuration-aliases.html)

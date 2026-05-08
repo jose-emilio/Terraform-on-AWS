@@ -1,171 +1,194 @@
-# Laboratorio 11 — LocalStack: Gestión de Drift y Disaster Recovery
+# Laboratorio 11 — LocalStack: State Splitting (Capas de Infraestructura)
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guía adapta el lab11 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia reside en cómo se simula el drift y cómo se accede al bucket S3 de estado.
+Este directorio contiene la versión LocalStack del laboratorio. La diferencia principal respecto a la versión AWS real está en el backend de estado y en la configuración del provider.
+
+## Diferencias clave respecto a AWS real
+
+| Aspecto | AWS real (`aws/`) | LocalStack (`localstack/`) |
+|---|---|---|
+| Backend de estado | S3 remoto (`backend "s3" {}`) | Local (`terraform.tfstate` en disco) |
+| `terraform_remote_state` (cómputo) | `backend = "s3"` apunta a S3 | `backend = "local"` apunta a un archivo |
+| Provider | Credenciales reales, endpoint AWS | Credenciales `test`, endpoint LocalStack |
+| Creación de bucket previa | Requerida | No requerida |
+
+El concepto de aislamiento de estados es idéntico en ambos casos: dos proyectos Terraform independientes, cada uno con su propio archivo de estado, que se comunican únicamente a través de `outputs` y `terraform_remote_state`.
+
+---
 
 ## Requisitos previos
 
-- LocalStack corriendo: `localstack start -d`
-- lab02/localstack desplegado (crea bucket `terraform-state-labs`)
-- AWS CLI configurado para LocalStack:
-
 ```bash
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_DEFAULT_REGION=us-east-1
-alias awslocal='aws --endpoint-url=http://localhost.localstack.cloud:4566'
+localstack status   # LocalStack debe estar en ejecución
 ```
 
-## Despliegue inicial
+---
 
-```bash
-cd labs/lab-11/localstack
+## Capa de Red
 
-terraform init -backend-config=localstack.s3.tfbackend
+### Código (`localstack/network/`)
 
-terraform apply
-```
-
-Anota los outputs:
-
-```bash
-terraform output
-# vpc_id           = "vpc-xxxxxxxxx"
-# security_group_id = "sg-xxxxxxxxx"
-```
-
-## Fase 1 — Simulación de Drift con awslocal
-
-En LocalStack no hay consola web, por lo que el drift se simula directamente con la CLI.
-
-### Modificar un tag (cambio legítimo)
-
-```bash
-SG_ID=$(terraform output -raw security_group_id)
-
-awslocal ec2 create-tags \
-  --resources $SG_ID \
-  --tags Key=Environment,Value=production
-```
-
-### Abrir un puerto (cambio accidental)
-
-```bash
-awslocal ec2 authorize-security-group-ingress \
-  --group-id $SG_ID \
-  --protocol tcp \
-  --port 22 \
-  --cidr 0.0.0.0/0
-```
-
-### Detectar el drift
-
-```bash
-terraform plan
-```
-
-El plan muestra **únicamente el cambio del tag**. La regla de ingreso del puerto 22 no aparece porque `aws_security_group` sin bloques `ingress` en el código no gestiona las reglas de ingreso.
-
-## Fase 2 — Reconciliación
-
-### Opción A: Terraform gana (revertir el tag al estado deseado)
-
-```bash
-terraform apply
-```
-
-Terraform revierte el tag `Environment` a `"lab"`. La regla del puerto 22 permanece en AWS (no es gestionada por Terraform). Para eliminarla:
-
-```bash
-awslocal ec2 revoke-security-group-ingress \
-  --group-id $SG_ID \
-  --protocol tcp \
-  --port 22 \
-  --cidr 0.0.0.0/0
-```
-
-### Opción B: La realidad gana (actualizar el código para conservar el tag)
-
-```bash
-# Captura el estado real (tag "production" y regla puerto 22)
-terraform apply -refresh-only
-```
-
-Edita `main.tf` para incorporar el tag actualizado:
+**`providers.tf`** — backend local, provider apuntando a LocalStack EC2:
 
 ```hcl
-tags = {
-  Name        = "app-lab11"
-  Environment = "production"   # ← conservamos el cambio válido
-  ManagedBy   = "terraform"
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+  # Sin bloque backend "s3": usa backend local por defecto.
+}
+
+provider "aws" {
+  region                      = "us-east-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+  endpoints {
+    ec2 = "http://localhost.localstack.cloud:4566"
+  }
 }
 ```
 
+**`main.tf`** — idéntico al de `aws/network/`: crea `aws_vpc.main` y `aws_subnet.public`.
+
+**`outputs.tf`** — idéntico al de `aws/network/`: exporta `vpc_id`, `subnet_id` y `vpc_cidr`.
+
+### Despliegue
+
 ```bash
+# Desde lab11/localstack/network/
+terraform fmt
+terraform init
 terraform apply
-# No changes. Your infrastructure matches the configuration.
 ```
 
-La regla del puerto 22 sigue en AWS. Para eliminarla usa CLI (ver Opción A).
-
-## Fase 3 — Disaster Recovery desde S3
-
-### Listar versiones del estado
+El estado se guarda en `localstack/network/terraform.tfstate`. Verifica los outputs:
 
 ```bash
-awslocal s3api list-object-versions \
-  --bucket terraform-state-labs \
-  --prefix lab11/terraform.tfstate \
-  --query 'Versions[*].[VersionId,LastModified]' \
-  --output table
+terraform output
 ```
 
-### Simular corrupción del estado
+Resultado esperado:
 
-```bash
-# Guardar VersionId de la versión sana
-GOOD_VERSION="<VersionId de la versión anterior>"
-
-# Corromper el estado actual (payload no-JSON para que Terraform falle al cargarlo)
-echo 'CORRUPTED' | awslocal s3 cp - s3://terraform-state-labs/lab11/terraform.tfstate
+```
+subnet_id = "subnet-xxxxxxxx"
+vpc_cidr  = "10.0.0.0/16"
+vpc_id    = "vpc-xxxxxxxx"
 ```
 
-Verifica que el estado está corrupto:
+Verifica los recursos en LocalStack:
 
 ```bash
-terraform plan
-# ╷
-# │ Error: Unsupported state file format
-# │
-# │ The state file could not be parsed as JSON: syntax error at byte offset 1.
-# ╵
-# ╷
-# │ Error: Unsupported state file format
-# │
-# │ The state file does not have a "version" attribute, which is required to identify the format version.
-# ╵
+aws --endpoint-url=http://localhost.localstack.cloud:4566 ec2 describe-vpcs \
+  --filters "Name=tag:Layer,Values=network" \
+  --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock}' --output table
 ```
 
-### Restaurar el estado sano
+---
 
-```bash
-awslocal s3api copy-object \
-  --bucket terraform-state-labs \
-  --copy-source "terraform-state-labs/lab11/terraform.tfstate?versionId=$GOOD_VERSION" \
-  --key lab11/terraform.tfstate
+## Capa de Cómputo
+
+### Diferencia clave: `terraform_remote_state` con backend local
+
+En la versión LocalStack, el data source usa `backend = "local"` en lugar de `backend = "s3"`:
+
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "local"
+
+  config = {
+    path = var.network_state_path   # default: "../network/terraform.tfstate"
+  }
+}
 ```
 
-Verifica la restauración:
+La variable `network_state_path` apunta al archivo de estado de la capa de red usando una ruta relativa. No se necesita ninguna variable de bucket.
+
+### Despliegue
 
 ```bash
-terraform plan
-# No changes. Infrastructure matches configuration.
+# Desde lab11/localstack/compute/
+terraform fmt
+terraform init
+terraform apply
 ```
 
-## Limpieza
+Verifica los outputs:
 
 ```bash
+terraform output
+```
+
+Resultado esperado (con los IDs reales de LocalStack):
+
+```
+security_group_id = "sg-xxxxxxxx"
+subnet_id         = "subnet-xxxxxxxx"
+vpc_id            = "vpc-xxxxxxxx"
+```
+
+Nota que `vpc_id` y `subnet_id` coinciden exactamente con los outputs de la capa de red — son los mismos valores leídos desde el estado remoto, no copias hardcodeadas.
+
+---
+
+## Verificación del Aislamiento (Blast Radius)
+
+### Destruir la capa de cómputo
+
+```bash
+# Desde lab11/localstack/compute/
+terraform destroy
+```
+
+Terraform destruye únicamente el security group. La VPC sigue intacta en LocalStack.
+
+### Confirmar que la red no fue afectada
+
+```bash
+# Desde lab11/localstack/network/
+terraform state list
+# aws_subnet.public
+# aws_vpc.main
+```
+
+El estado de la capa de red permanece intacto. La VPC nunca fue tocada por la destrucción de la capa de cómputo.
+
+### Verificar en LocalStack
+
+```bash
+aws --endpoint-url=http://localhost.localstack.cloud:4566 ec2 describe-vpcs \
+  --filters "Name=tag:ManagedBy,Values=terraform" \
+  --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock}' --output table
+```
+
+La VPC sigue apareciendo. El blast radius de la destrucción de cómputo quedó contenido.
+
+### Redesplegar la capa de cómputo
+
+```bash
+# Desde lab11/localstack/compute/
+terraform apply
+```
+
+El security group se crea de nuevo usando el mismo `vpc_id` que ya estaba en el estado de red. No hubo ningún cambio en la capa de red.
+
+---
+
+## Destruir Todos los Recursos
+
+Destruye en orden inverso: primero cómputo (que depende de red), luego red.
+
+```bash
+# Primero la capa de computo
+cd lab11/localstack/compute/
+terraform destroy
+
+# Luego la capa de red
+cd ../network/
 terraform destroy
 ```

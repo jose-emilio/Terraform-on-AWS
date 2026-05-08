@@ -1,69 +1,59 @@
-output "cmk_key_id" {
-  description = "Key ID de la CMK (UUID)"
-  value       = aws_kms_key.main.key_id
+output "iam_group_name" {
+  description = "Nombre del grupo IAM de desarrolladores"
+  value       = aws_iam_group.developers.name
 }
 
-output "cmk_key_arn" {
-  description = "ARN completo de la CMK"
-  value       = aws_kms_key.main.arn
+output "iam_group_arn" {
+  description = "ARN del grupo IAM de desarrolladores"
+  value       = aws_iam_group.developers.arn
 }
 
-output "cmk_alias_name" {
-  description = "Nombre del alias de la CMK"
-  value       = aws_kms_alias.main.name
+output "iam_user_name" {
+  description = "Nombre del usuario IAM dev-01"
+  value       = aws_iam_user.dev01.name
 }
 
-output "cmk_alias_arn" {
-  description = "ARN del alias de la CMK"
-  value       = aws_kms_alias.main.arn
+output "iam_user_arn" {
+  description = "ARN del usuario IAM dev-01"
+  value       = aws_iam_user.dev01.arn
 }
 
-output "ebs_volume_id" {
-  description = "ID del volumen EBS cifrado"
-  value       = aws_ebs_volume.main.id
+output "ec2_role_name" {
+  description = "Nombre del rol IAM para EC2"
+  value       = aws_iam_role.ec2.name
 }
 
-output "ebs_kms_key_id" {
-  description = "Key ID usado por el volumen EBS"
-  value       = aws_ebs_volume.main.kms_key_id
+output "ec2_role_arn" {
+  description = "ARN del rol IAM para EC2"
+  value       = aws_iam_role.ec2.arn
 }
 
-output "s3_bucket_name" {
-  description = "Nombre del bucket S3"
-  value       = aws_s3_bucket.main.id
+output "instance_profile_name" {
+  description = "Nombre del Instance Profile"
+  value       = aws_iam_instance_profile.ec2.name
 }
 
-output "s3_bucket_arn" {
-  description = "ARN del bucket S3"
-  value       = aws_s3_bucket.main.arn
+output "instance_id" {
+  description = "ID de la instancia EC2"
+  value       = aws_instance.app.id
 }
 
-output "verify_cmk_command" {
-  description = "Comando para describir la CMK y verificar la rotación"
-  value       = "aws kms describe-key --key-id ${aws_kms_alias.main.name} --query 'KeyMetadata.{KeyId:KeyId,Enabled:Enabled,KeyRotationStatus:KeyRotationStatus}'"
+output "instance_private_ip" {
+  description = "IP privada de la instancia EC2"
+  value       = aws_instance.app.private_ip
 }
 
-output "verify_rotation_command" {
-  description = "Comando para confirmar que la rotación automática está habilitada"
-  value       = "aws kms get-key-rotation-status --key-id ${aws_kms_key.main.key_id}"
+output "verify_log_command" {
+  description = "Comando SSM para leer el log de verificación de identidad"
+  value       = "aws ssm start-session --target ${aws_instance.app.id} --document-name AWS-StartInteractiveCommand --parameters command='cat /var/log/lab13-verify.log'"
 }
 
-output "verify_ebs_encryption_command" {
-  description = "Comando para confirmar el cifrado del volumen EBS"
-  value       = "aws ec2 describe-volumes --volume-ids ${aws_ebs_volume.main.id} --query 'Volumes[0].{Encrypted:Encrypted,KmsKeyId:KmsKeyId}'"
+output "ssm_session_command" {
+  description = "Comando para abrir una sesión interactiva en la instancia via SSM"
+  value       = "aws ssm start-session --target ${aws_instance.app.id}"
 }
 
-output "verify_s3_encryption_command" {
-  description = "Comando para confirmar la configuración SSE-KMS del bucket"
-  value       = "aws s3api get-bucket-encryption --bucket ${aws_s3_bucket.main.id}"
-}
-
-output "test_encrypt_command" {
-  description = "Comando para cifrar texto plano con la CMK (prueba de uso)"
-  value       = "aws kms encrypt --key-id ${aws_kms_alias.main.name} --plaintext 'hola-lab13' --cli-binary-format raw-in-base64-out --query CiphertextBlob --output text"
-}
-
-output "test_upload_command" {
-  description = "Comando para subir un objeto al bucket con cifrado KMS forzado"
-  value       = "echo 'dato-secreto' | aws s3 cp - s3://${aws_s3_bucket.main.id}/test.txt --sse aws:kms --sse-kms-key-id ${aws_kms_alias.main.name}"
+output "get_caller_identity_command" {
+  description = "Comando para verificar la identidad activa desde tu terminal local"
+  value       = "aws sts get-caller-identity"
 }

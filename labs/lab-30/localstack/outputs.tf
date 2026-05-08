@@ -1,44 +1,39 @@
-output "function_name" {
-  description = "Nombre de la función Lambda"
-  value       = aws_lambda_function.processor.function_name
+output "ecr_repository_url" {
+  description = "URL del repositorio ECR simulado en LocalStack"
+  value       = aws_ecr_repository.app.repository_url
 }
 
-output "orders_queue_url" {
-  description = "URL de la cola SQS de entrada (órdenes)"
-  value       = aws_sqs_queue.orders.url
+output "ecs_cluster_name" {
+  description = "Nombre del cluster ECS"
+  value       = aws_ecs_cluster.main.name
 }
 
-output "dlq_url" {
-  description = "URL de la Dead Letter Queue"
-  value       = aws_sqs_queue.dlq.url
+output "web_service_name" {
+  description = "Nombre del servicio ECS Web"
+  value       = aws_ecs_service.web.name
 }
 
-output "success_queue_url" {
-  description = "URL de la cola de éxitos (Lambda Destination on_success)"
-  value       = aws_sqs_queue.success.url
+output "api_service_name" {
+  description = "Nombre del servicio ECS API"
+  value       = aws_ecs_service.api.name
 }
 
-output "failure_queue_url" {
-  description = "URL de la cola de fallos (Lambda Destination on_failure)"
-  value       = aws_sqs_queue.failure.url
+output "web_task_definition_arn" {
+  description = "ARN de la task definition del servicio Web"
+  value       = aws_ecs_task_definition.web.arn
 }
 
-output "log_group" {
-  description = "Nombre del log group de CloudWatch"
-  value       = aws_cloudwatch_log_group.lambda.name
+output "api_task_definition_arn" {
+  description = "ARN de la task definition del servicio API"
+  value       = aws_ecs_task_definition.api.arn
 }
 
-output "send_premium_example" {
-  description = "Comando para enviar una orden premium a la cola de entrada"
-  value       = "awslocal sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"order_id\":\"ORD-001\",\"order_type\":\"premium\",\"amount\":299.99}'"
+output "ssm_parameter_name" {
+  description = "Nombre del parámetro SSM"
+  value       = aws_ssm_parameter.api_key.name
 }
 
-output "invoke_async_success_example" {
-  description = "Invocación async directa para probar Lambda Destinations (éxito)"
-  value       = "awslocal lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-001\",\"order_type\":\"premium\",\"amount\":500.00}' --cli-binary-format raw-in-base64-out /dev/null"
-}
-
-output "invoke_async_failure_example" {
-  description = "Invocación async directa para probar Lambda Destinations (fallo, amount > 9999)"
-  value       = "awslocal lambda invoke --function-name ${aws_lambda_function.processor.function_name} --invocation-type Event --payload '{\"order_id\":\"ASYNC-002\",\"order_type\":\"premium\",\"amount\":99999.99}' --cli-binary-format raw-in-base64-out /dev/null"
+output "service_connect_namespace" {
+  description = "Namespace de Service Connect"
+  value       = aws_service_discovery_http_namespace.main.name
 }

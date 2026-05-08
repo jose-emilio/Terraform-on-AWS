@@ -1,4 +1,4 @@
-# Laboratorio 29 — Microservicios con ECS Fargate y Malla de Servicios
+# Laboratorio 29 — Escalabilidad y Alta Disponibilidad con Zero Downtime
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,175 +8,107 @@
 
 ## Visión general
 
-En este laboratorio desplegarás dos microservicios dockerizados sin gestionar servidores físicos: un servicio **Web** que sirve una interfaz HTML y un microservicio **API** que responde JSON. El servicio Web llama al API internamente usando Service Connect, adjuntando una clave de API como header `X-API-Key` que el microservicio API valida en cada petición mediante un bloque `map{}` de nginx generado dinámicamente en tiempo de arranque. Combinarás un repositorio ECR con etiquetas inmutables y política de limpieza, dos task definitions definidas con `jsonencode()`, la inyección del secreto compartido desde SSM Parameter Store, Service Connect para la comunicación interna Web→API y el Deployment Circuit Breaker para revertir automáticamente despliegues defectuosos.
+En este laboratorio desplegarás una arquitectura web tolerante a fallos de zona de disponibilidad que se actualiza sin interrupciones de servicio. Combinarás un Launch Template versionado, un Application Load Balancer, un Auto Scaling Group Multi-AZ, una política de Target Tracking y un mecanismo de rolling update mediante `instance_refresh`.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Crear un repositorio ECR con `image_tag_mutability = "IMMUTABLE"` y definir una política de limpieza con `aws_ecr_lifecycle_policy` para mantener solo las 10 imágenes más recientes
-- Usar `jsonencode()` en HCL para definir los `container_definitions` de una task definition de Fargate, asignando límites de CPU y memoria
-- Almacenar una clave de API en SSM Parameter Store como `SecureString` y referenciarla en la task definition para que ECS la inyecte como variable de entorno sin exponerla en el estado
-- Configurar dos servicios ECS con Service Connect: el servicio Web como cliente que llama a `http://api:8080` y el microservicio API como servidor que se registra con ese nombre DNS privado
-- Implementar autenticación basada en header entre microservicios: el servicio Web adjunta `X-API-Key` en cada `proxy_pass` al API; el microservicio API usa un bloque `map{}` de nginx generado en tiempo de arranque para validar el header sin exponer el secreto en configuración estática
-- Habilitar el Deployment Circuit Breaker con `rollback = true` para revertir automáticamente si los nuevos contenedores fallan el health check durante un despliegue
+- Crear un `aws_launch_template` versionado que encapsule la configuración de red, seguridad y `user_data` de la flota
+- Desplegar un ALB con un `aws_lb_listener` que redirija el tráfico HTTP (puerto 80) al puerto de aplicación 8080 de las instancias
+- Configurar un ASG que distribuya instancias en todas las subredes privadas disponibles mediante `vpc_zone_identifier`
+- Aplicar una política de Target Tracking basada en CPU media al 50% para escalar automáticamente
+- Implementar un bloque `instance_refresh` con `min_healthy_percentage = 90` para actualizar la flota sin caída de servicio
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre VPC, ECR, ECS, SSM, IAM y CloudWatch Logs
-- Docker instalado (para hacer push de imágenes a ECR en la sección opcional)
+- Perfil AWS con permisos sobre EC2, VPC, ELB, Auto Scaling e IAM
 - LocalStack en ejecución (para la sección de LocalStack)
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### Ciclo de Vida de Imágenes en ECR
+### Launch Template versionado
 
-`aws_ecr_repository` con `image_tag_mutability = "IMMUTABLE"` rechaza cualquier intento de sobreescribir una etiqueta existente. Si `api:v1.0.0` ya está en el repositorio, un segundo `docker push` con la misma etiqueta falla inmediatamente, garantizando que cada etiqueta corresponde a exactamente un artefacto.
-
-```hcl
-resource "aws_ecr_repository" "app" {
-  name                 = "lab29/api"
-  image_tag_mutability = "IMMUTABLE"
-}
-```
-
-La política de limpieza controla el coste de almacenamiento eliminando imágenes antiguas automáticamente. La regla `imageCountMoreThan` elimina las imágenes más antiguas cuando el total supera el umbral definido:
+`aws_launch_template` es la forma moderna de definir la configuración de las instancias de un ASG. Sustituye a los `aws_launch_configuration` (deprecados). Cada vez que Terraform detecta un cambio en el recurso, genera una nueva versión numerada automáticamente.
 
 ```hcl
-resource "aws_ecr_lifecycle_policy" "app" {
-  repository = aws_ecr_repository.app.name
+resource "aws_launch_template" "web" {
+  name_prefix   = "lab29-web-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = var.instance_type
 
-  policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Mantener solo las 10 imagenes mas recientes"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 10
-      }
-      action = { type = "expire" }
-    }]
-  })
-}
-```
-
-### Definición de Tareas con jsonencode()
-
-`jsonencode()` convierte una estructura HCL nativa a JSON válido para la API de ECS. Frente a un heredoc (`<<EOF`), tiene dos ventajas clave: Terraform valida los tipos en tiempo de `plan` (no en `apply`) y los valores de otros recursos se pueden interpolar directamente sin manipulación de cadenas.
-
-```hcl
-resource "aws_ecs_task_definition" "api" {
-  family                   = "lab29-api"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = "256"   # 0.25 vCPU
-  memory                   = "512"   # 0.5 GB
-
-  container_definitions = jsonencode([{
-    name  = "api"
-    image = var.container_image
-    cpu   = 256
-    memory = 512
-    # ...
-  }])
-}
-```
-
-En Fargate, `cpu` y `memory` se declaran a nivel de tarea (requerido) y opcionalmente a nivel de contenedor. Las combinaciones válidas están documentadas en la referencia de AWS ECS.
-
-### Inyección de Secretos desde SSM
-
-Almacenar secretos en código fuente o variables de entorno en texto plano es un riesgo de seguridad. El flujo correcto con ECS es:
-
-1. El secreto se almacena en SSM Parameter Store como `SecureString` (cifrado con KMS)
-2. La task definition referencia el ARN del parámetro en el bloque `secrets`
-3. El agente ECS descifra el valor con KMS **antes** de lanzar el contenedor
-4. El contenedor recibe el secreto como variable de entorno ya descifrada
-
-```hcl
-resource "aws_ssm_parameter" "api_key" {
-  name  = "/lab29/api-key"
-  type  = "SecureString"   # KMS cifra el valor en reposo con la clave aws/ssm
-  value = var.api_key
-}
-```
-
-En la task definition:
-
-```hcl
-secrets = [{
-  name      = "API_KEY"          # Nombre de la variable de entorno en el contenedor
-  valueFrom = aws_ssm_parameter.api_key.arn  # ARN del parámetro SSM
-}]
-```
-
-El rol de ejecución (`execution_role_arn`) necesita los permisos `ssm:GetParameters` y `kms:Decrypt` sobre el parámetro y la clave KMS correspondiente.
-
-En este laboratorio el mismo parámetro SSM se inyecta en **ambos** microservicios, pero cada uno lo usa de forma diferente:
-
-| Microservicio | Uso de `API_KEY` |
-|---|---|
-| **Web** | `startup.sh` lo incrusta en la config de nginx como `proxy_set_header X-API-Key "$API_KEY"` → se envía en cada petición al API |
-| **API** | `startup-api.sh` lo incrusta en el bloque `map{}` de nginx → valida el header `X-API-Key` en cada petición entrante |
-
-El secreto **nunca aparece en texto plano** en archivos de configuración estáticos ni en el estado de Terraform: el shell lo expande en tiempo de arranque del contenedor y nginx lo recibe ya como cadena literal.
-
-### Malla de Servicios con Service Connect
-
-Service Connect es la solución nativa de ECS para la comunicación entre microservicios. A diferencia de un ALB (que opera en capa 7 y tiene coste por hora), Service Connect usa un proxy Envoy que ECS inyecta automáticamente como sidecar en cada tarea.
-
-| Característica | Service Connect | ALB interno |
-|---|---|---|
-| Coste | Sin cargo adicional | $0.008/hora + datos |
-| Descubrimiento | DNS privado automático | Requiere target group |
-| Balanceo | Envoy (L7) por tarea | ALB entre todas las tareas |
-| Visibilidad | Métricas Envoy en CloudWatch | Métricas ALB en CloudWatch |
-| Uso típico | Comunicación este-oeste (microservicio→microservicio) | Tráfico norte-sur (usuario→API) |
-
-Para configurar un servicio como **servidor** (accesible por nombre DNS), se añade el bloque `service` dentro de `service_connect_configuration`. Para un servicio que solo **consume** otros servicios (cliente puro), basta con `enabled = true` y `namespace` sin bloque `service`.
-
-En este laboratorio, el microservicio **API** se registra como servidor en el puerto 8080:
-
-```hcl
-service_connect_configuration {
-  enabled   = true
-  namespace = aws_service_discovery_http_namespace.main.arn
-
-  service {
-    port_name      = "api-http"    # Debe coincidir con portMappings[].name
-    discovery_name = "api"         # DNS privado: http://api:8080
-
-    client_alias {
-      port     = 8080
-      dns_name = "api"
-    }
+  lifecycle {
+    create_before_destroy = true
   }
 }
 ```
 
-El servicio **Web** también declara el bloque `service` (se registra como `web:80`) y actúa a la vez como **cliente** del API — su nginx hace `proxy_pass http://api:8080/` para enrutar las peticiones del navegador al microservicio API a través del proxy Envoy, sin exponer el puerto 8080 al exterior.
+La política `create_before_destroy = true` garantiza que la nueva versión del template existe antes de que el ASG empiece a sustituir instancias.
 
-El campo `port_name` debe coincidir exactamente con el campo `name` del `portMappings` en el `container_definitions`.
+### Application Load Balancer (ALB)
 
-### Deployment Circuit Breaker
+El ALB opera en capa 7 (HTTP/HTTPS) e inspecciona el contenido de las peticiones para enrutarlas. Sus componentes principales son:
 
-El Circuit Breaker de ECS monitoriza el estado de las nuevas tareas durante un despliegue. Si el porcentaje de fallos supera un umbral (tareas que no pasan al estado `RUNNING` o que fallan el health check), ECS considera el despliegue fallido.
+| Componente | Recurso Terraform | Función |
+|---|---|---|
+| Load Balancer | `aws_lb` | Punto de entrada público; vive en subredes públicas |
+| Target Group | `aws_lb_target_group` | Agrupa instancias y ejecuta health checks al puerto 8080 |
+| Listener | `aws_lb_listener` | Escucha en el puerto 80 y reenvía al target group |
 
-Con `rollback = true`, ECS activa automáticamente un nuevo despliegue usando la revisión anterior de la task definition, restaurando el servicio al último estado conocido bueno sin intervención manual.
+El ASG se registra en el target group mediante `target_group_arns`. Cuando el ASG añade o elimina instancias, el ALB las incorpora o retira del balanceo automáticamente.
+
+### Auto Scaling Group Multi-AZ
+
+El parámetro `vpc_zone_identifier` recibe una lista de subnets. El ASG distribuye instancias entre ellas de forma equilibrada. Si una AZ cae, el ASG lanza nuevas instancias en las AZs disponibles para mantener la capacidad deseada.
 
 ```hcl
-deployment_circuit_breaker {
-  enable   = true
-  rollback = true
+resource "aws_autoscaling_group" "web" {
+  vpc_zone_identifier = aws_subnet.private[*].id
+  # ...
 }
 ```
 
-Sin el Circuit Breaker, un despliegue con un contenedor defectuoso (imagen incorrecta, error de configuración, secreto inválido) dejaría el servicio parcialmente degradado hasta que alguien interviniera manualmente.
+Usando `health_check_type = "ELB"`, el ASG delega la comprobación de salud al ALB: una instancia solo se considera sana si supera los health checks del target group.
+
+### Target Tracking Scaling
+
+La política de Target Tracking es la forma más simple de escalar automáticamente. El ASG añade o elimina instancias para mantener una métrica en torno a un valor objetivo, sin necesidad de definir alarmas de CloudWatch manualmente.
+
+```hcl
+resource "aws_autoscaling_policy" "cpu" {
+  policy_type = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 50.0
+  }
+}
+```
+
+El ASG escala hacia arriba cuando la CPU media supera el 50% y escala hacia abajo cuando cae por debajo, respetando los tiempos de estabilización para evitar oscilaciones.
+
+### Instance Refresh (Rolling Update)
+
+`instance_refresh` permite reemplazar las instancias de un ASG de forma gradual cuando cambia el Launch Template. Con `min_healthy_percentage = 90`, el ASG garantiza que al menos el 90% de la capacidad deseada está sana en todo momento durante la sustitución.
+
+```hcl
+instance_refresh {
+  strategy = "Rolling"
+  preferences {
+    min_healthy_percentage = 90
+    instance_warmup        = 60
+  }
+  triggers = ["launch_template"]
+}
+```
+
+El campo `triggers = ["launch_template"]` le indica a Terraform que debe iniciar un refresh cuando cambie el bloque `launch_template` del ASG. Usando `version = aws_launch_template.web.latest_version` (en lugar de `"$Latest"`), cualquier cambio en el Launch Template provoca un cambio en ese campo y activa el mecanismo.
 
 ---
 
@@ -184,163 +116,68 @@ Sin el Circuit Breaker, un despliegue con un contenedor defectuoso (imagen incor
 
 ```
 lab-29/
-├── diagrama.drawio       # Fuente editable del diagrama de arquitectura
 ├── arch/
 │   └── diagrama.svg      # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── aws.s3.tfbackend   # Parámetros del backend S3 (sin bucket)
-│   ├── providers.tf       # Backend S3, Terraform >= 1.10, provider AWS
-│   ├── variables.tf       # region, project, vpc_cidr, desired_count, container_image, api_key
-│   ├── main.tf            # VPC, ECR, SSM, IAM, ECS Cluster, 2 Task Definitions, 2 Servicios ECS
-│   ├── outputs.tf         # ECR URL, cluster, web/api service, SSM, namespace, logs
-│   ├── startup.sh         # Script de arranque del servicio Web: genera HTML + proxy_pass nginx
-│   └── startup-api.sh     # Script de arranque del microservicio API: genera JSON + nginx:8080
+│   ├── aws.s3.tfbackend  # Parámetros del backend S3 (sin bucket)
+│   ├── providers.tf      # Backend S3, Terraform >= 1.10, provider AWS
+│   ├── variables.tf      # region, project, vpc_cidr, instance_type, sizes, app_version
+│   ├── main.tf           # VPC, ALB, Launch Template, ASG, scaling policy
+│   ├── outputs.tf        # URL del ALB, nombre del ASG, versión del Launch Template
+│   └── user_data.sh      # Script de arranque; templatefile() inyecta app_version
 └── localstack/
-    ├── providers.tf       # Endpoints apuntando a LocalStack
-    ├── variables.tf       # Mismas variables, valores por defecto para entorno local
-    ├── main.tf            # Idéntico a aws/main.tf
+    ├── providers.tf      # Endpoints apuntando a LocalStack
+    ├── variables.tf      # Mismas variables, valores por defecto para entorno local
+    ├── main.tf           # Idéntico a aws/main.tf
     ├── outputs.tf
-    ├── startup.sh         # Copia de aws/startup.sh
-    └── startup-api.sh     # Copia de aws/startup-api.sh
+    └── user_data.sh      # Versión simplificada del script (sin IMDSv2)
 ```
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Arquitectura
 
-![ECS Fargate web + api en subredes públicas, Service Connect HTTP namespace, SSM API_KEY inyectada como secret, ECR IMMUTABLE con lifecycle policy](arch/diagrama.svg)
+![ALB en 2 subredes públicas → ASG con Launch Template versionado en 2 subredes privadas, NAT GW por AZ, instance_refresh Rolling y Target Tracking CPU=50%](arch/diagrama.svg)
 
-Patrón sin ALB: las tareas Fargate viven en subredes públicas con `assign_public_ip = true` y exponen IP directamente. La comunicación interna **web → api** usa Service Connect sobre un `aws_service_discovery_http_namespace` — cada tarea lleva un sidecar Envoy que resuelve `api:8080` a las IPs de las tareas activas con load balancing y reintentos. El `aws_security_group.ecs` admite tcp/80 desde Internet y tcp/{80, 8080, 15000-15010} con `self = true` (Envoy interno). La clave compartida se guarda en `aws_ssm_parameter.api_key` (SecureString cifrado con `alias/aws/ssm`) y se inyecta en ambos servicios como `secrets.API_KEY` — el `execution_role` tiene permiso `ssm:GetParameters` + `kms:Decrypt`. El `deployment_circuit_breaker` con `rollback = true` revierte automáticamente despliegues fallidos a la task definition anterior.
+Cada AZ tiene su propio NAT Gateway: si una zona cae, las instancias de las otras AZs conservan conectividad de salida. Las instancias del ASG nunca reciben tráfico directo de Internet; todo el tráfico entrante pasa por el ALB en el puerto 80, que lo reenvía al puerto 8080 de las instancias. El SG de las instancias usa `security_groups = [aws_security_group.alb.id]` (no CIDR) — solo aceptan tráfico del ALB. El ASG apunta a `aws_launch_template.web.latest_version`, así cualquier cambio (p.ej. `app_version`) dispara un `instance_refresh` Rolling con `min_healthy_percentage = 90`.
 
 ### Código Terraform
 
 **`aws/main.tf`** — Fragmentos clave:
 
-El laboratorio despliega **dos task definitions** que comparten la misma imagen base (`nginx:alpine`), el mismo secreto SSM y los mismos roles IAM, pero ejecutan scripts de arranque distintos y escuchan en puertos diferentes. El campo `command` pasa el contenido del script de arranque al contenedor mediante `file()`:
+El Launch Template usa `latest_version` para que cada cambio de configuración genere una nueva versión y active el instance_refresh:
 
 ```hcl
-# Task definition del servicio Web (startup.sh: HTML + proxy_pass nginx en :80)
-resource "aws_ecs_task_definition" "web" {
-  family = "${var.project}-web"
-  # ...
-  container_definitions = jsonencode([{
-    name    = "web"
-    command = ["/bin/sh", "-c", file("${path.module}/startup.sh")]
-
-    portMappings = [{
-      name          = "web-http"   # Referenciado por service_connect_configuration
-      containerPort = 80
-      appProtocol   = "http"
-    }]
-    # ...
-  }])
-}
-
-# Task definition del microservicio API (startup-api.sh: JSON en :8080)
-resource "aws_ecs_task_definition" "api" {
-  family = "${var.project}-api"
-  # ...
-  container_definitions = jsonencode([{
-    name    = "api"
-    command = ["/bin/sh", "-c", file("${path.module}/startup-api.sh")]
-
-    portMappings = [{
-      name          = "api-http"   # Referenciado por service_connect_configuration
-      containerPort = 8080
-      appProtocol   = "http"
-    }]
-    # ...
-  }])
+launch_template {
+  id      = aws_launch_template.web.id
+  version = aws_launch_template.web.latest_version
 }
 ```
 
-El secreto SSM se inyecta en **ambos** contenedores usando el mismo ARN. Un único parámetro `SecureString` puede ser referenciado por múltiples task definitions; el rol de ejecución compartido tiene el permiso `ssm:GetParameters` necesario:
+El script de arranque vive en `user_data.sh` y se carga con `templatefile()`, que inyecta `app_version` antes de enviarlo a la instancia. Las variables bash (`$TOKEN`, `$AZ`, `$ID`) no usan llaves y no son afectadas por la interpolación de Terraform:
 
 ```hcl
-secrets = [{
-  name      = "API_KEY"
-  valueFrom = aws_ssm_parameter.api_key.arn
-}]
+user_data = base64encode(templatefile("${path.module}/user_data.sh", {
+  app_version = var.app_version
+}))
 ```
 
-El rol de ejecución necesita un permiso adicional explícito para leer el `SecureString`. La política gestionada `AmazonECSTaskExecutionRolePolicy` no incluye acceso a parámetros SSM arbitrarios:
+El script `aws/user_data.sh` instala Apache (`httpd`), lo configura para escuchar en el puerto 8080 y añade la cabecera `Connection: close` para que el navegador cierre la conexión TCP tras cada respuesta — lo que obliga al ALB a balancear en la siguiente recarga. `templatefile()` inyecta `${app_version}` antes de enviar el script; el resto de variables (`$AZ`, `$ID`, `$TYPE`) las resuelve bash en tiempo de ejecución consultando el servicio de metadatos IMDSv2:
 
-```hcl
-resource "aws_iam_role_policy" "ssm_read" {
-  name = "${var.project}-ssm-read"
-  role = aws_iam_role.execution.id
+```bash
+#!/bin/bash
+dnf install -y httpd
+sed -i 's/^Listen 80$/Listen 8080/' /etc/httpd/conf/httpd.conf
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ssm:GetParameters", "kms:Decrypt"]
-      Resource = [
-        aws_ssm_parameter.api_key.arn,
-        "arn:aws:kms:${var.region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"
-      ]
-    }]
-  })
-}
-```
+# Connection: close → el navegador abre una conexión nueva en cada recarga
+echo 'Header always set Connection "close"' > /etc/httpd/conf.d/lab29.conf
 
-**Generación dinámica de configuración nginx con autenticación por header**
+# Genera /var/www/html/index.html con versión, AZ, ID, tipo y timestamp
+# ... (templatefile inyecta ${app_version}; bash resuelve $AZ, $ID, $TYPE)
 
-El microservicio API valida la clave en cada petición usando el bloque `map{}` de nginx, cuyo valor real se incrusta en tiempo de arranque por el shell (`startup-api.sh`):
-
-```sh
-# En startup-api.sh: el shell expande $API_KEY → nginx recibe el valor literal
-cat > /etc/nginx/conf.d/default.conf << CONF
-map \$http_x_api_key \$auth_valid {
-    default    0;
-    "$API_KEY" 1;         # $API_KEY se expande aquí por el shell
-}
-
-server {
-    listen 8080;
-
-    location / {
-        if (\$auth_valid = 0) {
-            return 401 '{"error":"Unauthorized"}';
-        }
-        root /usr/share/nginx/html;
-        try_files /index.json =404;
-    }
-
-    # /health no requiere autenticación → necesario para el Circuit Breaker
-    location /health {
-        return 200 '{"status":"ok","service":"api"}';
-    }
-}
-CONF
-```
-
-El servicio Web incrusta la misma clave en el `proxy_pass` de `startup.sh`:
-
-```sh
-# En startup.sh: nginx adjunta X-API-Key en cada petición al microservicio API
-location /api-data {
-    proxy_pass         http://api:8080/;
-    proxy_set_header   X-API-Key "$API_KEY";   # $API_KEY expande el shell
-    proxy_read_timeout 5s;
-}
-```
-
-> **Por qué `map{}` y no `if` directamente en `location`**: `map{}` debe estar en el contexto `http{}`, que es donde nginx:alpine incluye los archivos de `/etc/nginx/conf.d/`. Evalúa la condición una sola vez por petición y es más eficiente que múltiples bloques `if`.
-
-El security group permite puerto 80 desde Internet (para el servicio Web) y puertos 80 y 8080 entre tareas del mismo grupo (`self = true`) para que Service Connect pueda enrutar el tráfico interno:
-
-```hcl
-resource "aws_security_group" "ecs" {
-  # Puerto 80 desde Internet → servicio Web accesible por el navegador
-  ingress { from_port = 80,   cidr_blocks = ["0.0.0.0/0"] }
-  # Tráfico interno entre tareas (Service Connect)
-  ingress { from_port = 80,   self = true }
-  ingress { from_port = 8080, self = true }
-  ingress { from_port = 15000, to_port = 15010, self = true }  # Envoy
-}
+systemctl enable --now httpd
 ```
 
 ### Inicialización y despliegue
@@ -358,243 +195,151 @@ terraform plan
 terraform apply
 ```
 
+El despliegue completo tarda entre 3 y 5 minutos. El NAT Gateway es el recurso más lento en aprovisionarse.
+
 Al finalizar, los outputs mostrarán:
 
 ```
-api_log_group             = "/ecs/lab29/api"
-api_service_name          = "lab29-api"
-api_task_definition_arn   = "arn:aws:ecs:us-east-1:...:task-definition/lab29-api:1"
-docker_login_cmd          = "aws ecr get-login-password --region us-east-1 | docker login ..."
-ecr_repository_url        = "123456789.dkr.ecr.us-east-1.amazonaws.com/lab29/api"
-ecs_cluster_name          = "lab29-cluster"
-service_connect_namespace = "lab29"
-ssm_parameter_name        = "/lab29/api-key"
-web_log_group             = "/ecs/lab29/web"
-web_service_name          = "lab29-web"
-web_task_definition_arn   = "arn:aws:ecs:us-east-1:...:task-definition/lab29-web:1"
+alb_url                        = "http://lab29-alb-123456789.us-east-1.elb.amazonaws.com"
+asg_name                       = "lab29-asg"
+launch_template_id             = "lt-0a1b2c3d4e5f"
+launch_template_latest_version = 1
+private_subnet_ids             = ["subnet-aaa", "subnet-bbb"]
 ```
 
-### Verificar los servicios y el flujo Web→API
+### Verificar la distribución Multi-AZ y el ALB
 
-**Paso 1** — Comprueba que ambos servicios están estables:
+Espera ~2 minutos a que las instancias superen los health checks del target group.
+
+**Paso 1** — Obtén la URL del ALB:
 
 ```bash
-aws ecs describe-services \
-  --cluster lab29-cluster \
-  --services lab29-web lab29-api \
-  --query 'services[].{Nombre:serviceName,Estado:status,Deseadas:desiredCount,Corriendo:runningCount}' \
+terraform output alb_url
+```
+
+**Paso 2** — Abre la URL en Firefox o Chrome para comprobar que la página carga correctamente con la información de la instancia.
+
+> Si el navegador devuelve "Esta página no está disponible", las instancias aún están arrancando o pasando los health checks. Espera 30 segundos y recarga.
+
+**Paso 3** — Recarga la página con `F5` (o `Cmd+R`). El servidor incluye la cabecera `Connection: close` en cada respuesta, lo que indica al navegador que cierre la conexión TCP tras recibirla. En la siguiente recarga el navegador abre una conexión nueva y el ALB la dirige a una instancia diferente. Observa cómo cambian la **Availability Zone** y el **Instance ID** entre recargas.
+
+**Paso 4** — Confirma el estado de salud de las instancias:
+
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names "$(terraform output -raw asg_name)" \
+  --query 'AutoScalingGroups[0].Instances[].{ID:InstanceId,AZ:AvailabilityZone,Health:HealthStatus}' \
   --output table
 ```
 
-Espera hasta que `runningCount = desiredCount` en ambos servicios (1-2 minutos la primera vez).
+### Demostrar el Rolling Update (Instance Refresh)
 
-**Paso 2** — Obtén la IP pública de una tarea Web y abre la página en el navegador:
+Cambia la versión de la aplicación para generar una nueva versión del Launch Template. El ASG detectará el cambio y reemplazará las instancias gradualmente manteniendo el servicio activo.
 
-```bash
-WEB_TASK=$(aws ecs list-tasks \
-  --cluster lab29-cluster --service-name lab29-web \
-  --query 'taskArns[0]' --output text)
-
-# En Fargate (awsvpc), todos los contenedores comparten la misma ENI e IP
-PRIVATE_IP=$(aws ecs describe-tasks \
-  --cluster lab29-cluster --tasks "$WEB_TASK" \
-  --query 'tasks[0].containers[0].networkInterfaces[0].privateIpv4Address' \
-  --output text)
-
-# La IP pública se obtiene desde EC2 filtrando por IP privada
-WEB_IP=$(aws ec2 describe-network-interfaces \
-  --filters "Name=private-ip-address,Values=$PRIVATE_IP" \
-  --query 'NetworkInterfaces[0].Association.PublicIp' \
-  --output text)
-
-echo "http://$WEB_IP/"
-```
-
-Abre la URL en el navegador. Verás la página con dos tarjetas:
-- **Tarjeta izquierda (cyan)** — datos de la tarea Web: Task ID, Cluster, Family/Revision, Región, API Key enmascarada
-- **Tarjeta derecha (morado)** — datos del microservicio API cargados vía `fetch('/api-data')`, actualizándose cada 15 segundos
-
-> Recarga la página varias veces. El Task ID de la tarjeta API puede cambiar: Service Connect hace round-robin entre las 2 tareas del servicio API, demostrando el balanceo interno sin ALB.
-
-**Paso 3** — Verifica el flujo Service Connect desde el interior del contenedor Web:
+**Paso 1** — Inicia el rolling update cambiando `app_version`:
 
 ```bash
-aws ecs execute-command \
-  --cluster lab29-cluster \
-  --task "$WEB_TASK" \
-  --container web \
-  --interactive \
-  --command "/bin/sh"
+terraform apply -var="app_version=v2"
 ```
 
-Dentro del contenedor:
+Terraform generará un plan con dos cambios:
+1. El Launch Template recibe una nueva versión (`v2` embebida en `user_data`)
+2. El ASG detecta el cambio en `version` y activa un `instance_refresh`
 
-```sh
-# Comprueba que API_KEY fue inyectada desde SSM
-echo $API_KEY
-
-# Sin header → el API devuelve 401 Unauthorized
-wget -qO- http://api:8080/ 2>&1
-# wget: server returned error: HTTP/1.1 401 Unauthorized
-
-# Con header correcto → respuesta JSON con metadatos de la tarea API
-wget -qO- --header "X-API-Key: $API_KEY" http://api:8080/
-# {"service":"api","task_id":"...","cluster":"lab29-cluster",...}
-
-# /health siempre responde 200, sin autenticación (necesario para Circuit Breaker)
-wget -qO- http://api:8080/health
-# {"status":"ok","service":"api"}
-
-exit
-```
-
-> Si `execute-command` falla con "The execute command failed", asegúrate de que el servicio tiene `enable_execute_command = true` y que el rol de tarea tiene los permisos `ssmmessages:*`. Puede tardar 1-2 minutos después del `apply`.
-
-**Paso 4** — Verifica los logs de ambos servicios y del proxy Envoy:
+**Paso 2** — Mientras Terraform aplica, monitoriza el progreso del refresh en otra terminal:
 
 ```bash
-# Logs del servicio Web
-aws logs tail /ecs/lab29/web --log-stream-name-prefix web/ --follow
-
-# Logs del microservicio API
-aws logs tail /ecs/lab29/api --log-stream-name-prefix api/ --follow
-
-# Logs del proxy Envoy del servicio Web (registra cada proxy_pass a la API)
-aws logs tail /ecs/lab29/web --log-stream-name-prefix service-connect-web/ --follow
-```
-
-### Verificar ECR y la política de limpieza
-
-**Paso 1** — Autentica Docker contra ECR:
-
-```bash
-ECR_URL=$(terraform output -raw ecr_repository_url)
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin "$ECR_URL"
-```
-
-**Paso 2** — Intenta hacer push de dos imágenes **distintas** con la misma etiqueta para comprobar IMMUTABLE:
-
-```bash
-# Push de nginx:alpine como v1.0.0
-docker pull nginx:alpine
-docker tag nginx:alpine "$ECR_URL:v1.0.0"
-docker push "$ECR_URL:v1.0.0"
-
-# Intenta sobreescribir v1.0.0 con una imagen diferente — debe fallar
-# (usar la misma imagen no genera error porque Docker omite el push al detectar digest idéntico)
-docker pull nginx:stable-alpine
-docker tag nginx:stable-alpine "$ECR_URL:v1.0.0"
-docker push "$ECR_URL:v1.0.0"
-# Error: tag invalid: The image tag 'v1.0.0' already exists in the 'lab29/api' repository
-#        and cannot be overwritten because the repository is immutable.
-```
-
-**Paso 3** — Confirma la política de limpieza activa:
-
-```bash
-aws ecr get-lifecycle-policy --repository-name lab29/api \
-  --query 'lifecyclePolicyText' --output text | python3 -m json.tool
-```
-
-### Demostrar el Deployment Circuit Breaker
-
-Provoca un despliegue fallido cambiando la imagen a una que no existe para observar el rollback automático.
-
-**Paso 1** — Despliega una imagen inexistente:
-
-```bash
-terraform apply -var="container_image=nginx:esta-etiqueta-no-existe-abc123"
-```
-
-Terraform registrará el cambio en la task definition y ECS intentará lanzar las nuevas tareas.
-
-> **Tiempo hasta activación**: el Circuit Breaker necesita al menos **3 tareas fallidas** (hasta un máximo de 10) con un 50 % de tasa de fallo. Con una imagen inexistente (`ImagePullBackOff`), cada tarea falla en segundos, por lo que el breaker se activa en **3-5 minutos**. Con fallos por health check timeout el proceso puede tardar hasta 15 minutos.
-
-**Paso 2** — Monitoriza ambos servicios en otra terminal (el Circuit Breaker afecta a los dos):
-
-```bash
-watch -n 10 "aws ecs describe-services \
-  --cluster lab29-cluster \
-  --services lab29-web lab29-api \
-  --query 'services[].{Nombre:serviceName,Deployments:length(deployments),Corriendo:runningCount,Fallidas:deployments[0].failedTasks}' \
+watch -n 5 "aws autoscaling describe-instance-refreshes \
+  --auto-scaling-group-name lab29-asg \
+  --query 'InstanceRefreshes[0].{Status:Status,Percentage:PercentageComplete,Remaining:InstancesToUpdate}' \
   --output table"
 ```
 
-**Paso 3** — Comprueba el estado del deployment y los eventos:
+**Paso 3** — Envía peticiones continuas al ALB para observar la transición sin interrupciones:
 
 ```bash
-# Estado del deployment — cuando el Circuit Breaker dispara, rolloutState = FAILED
-aws ecs describe-services \
-  --cluster lab29-cluster \
-  --services lab29-web \
-  --query 'services[0].deployments[*].{ID:id,Estado:rolloutState,Corriendo:runningCount,Fallidas:failedTasks}' \
-  --output table
-
-# Eventos recientes (los más recientes primero)
-aws ecs describe-services \
-  --cluster lab29-cluster \
-  --services lab29-web \
-  --query 'services[0].events[:10].{Tiempo:createdAt,Mensaje:message}' \
-  --output table
+while true; do
+  curl -s "$ALB_URL"
+  echo ""
+  sleep 2
+done
 ```
 
-> El Circuit Breaker necesita **al menos 3 tareas fallidas** con una tasa de fallo ≥ 50 %. Con `CannotPullContainerError` (imagen inexistente) cada intento falla en segundos, pero ECS introduce esperas entre reintentos — espera **8-12 minutos** hasta que `rolloutState` cambie a `FAILED`.
+Durante el proceso verás respuestas mezcladas (`v1` y `v2`) hasta que todas las instancias se hayan reemplazado. En ningún momento el servicio devuelve un error.
 
-Cuando el Circuit Breaker dispara verás en los eventos (orden cronológico inverso):
+**Paso 4** — Cuando el refresh complete, todas las respuestas serán `v2`:
 
 ```
-(service lab29-web) has reached a steady state.
-(service lab29-web) (deployment ecs-svc/AAA) deployment completed.
-(service lab29-web) rolling back to deployment ecs-svc/AAA.
-(service lab29-web) (deployment ecs-svc/BBB) deployment failed: tasks failed to start.
+v2 | AZ: us-east-1a | ID: i-0xyz789
+v2 | AZ: us-east-1b | ID: i-0uvw012
 ```
 
-`BBB` es el deployment fallido (imagen inexistente) y `AAA` es el deployment anterior bueno al que ECS revierte automáticamente.
+### Demostrar el Target Tracking Scaling
 
-> El rollback es automático — no es necesario hacer nada. Sin embargo, el estado de Terraform ha quedado desincronizado (Terraform cree que la imagen es `nginx:esta-etiqueta-no-existe-abc123`). Ejecuta `terraform apply` sin `-var` para reconciliar el estado con la configuración real:
->
-> ```bash
-> terraform apply
-> ```
+Genera carga artificial en una instancia para observar cómo el ASG añade capacidad automáticamente.
+
+**Paso 1** — Identifica el ID de una instancia del ASG:
+
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names lab29-asg \
+  --query 'AutoScalingGroups[0].Instances[0].InstanceId' \
+  --output text
+```
+
+**Paso 2** — Conéctate a la instancia vía SSM Session Manager (no requiere SSH ni bastión):
+
+```bash
+aws ssm start-session --target <INSTANCE_ID>
+```
+
+> Si el perfil IAM de la instancia no tiene permisos de SSM, usa `aws ec2-instance-connect send-ssh-public-key` o lanza una instancia bastion temporal.
+
+**Paso 3** — Desde dentro de la instancia, instala `stress` y genera carga de CPU:
+
+```bash
+sudo dnf install -y stress
+
+# 2 workers de CPU durante 5 minutos (uno por vCPU en t4g.small)
+stress --cpu 2 --timeout 300
+```
+
+> **Nota:** El Target Tracking calcula la CPU **media de todas las instancias del ASG**. Si el ASG tiene dos instancias y solo estreses una, la media puede quedarse en torno al 50% — justo en el umbral — y el escalado no llegará a activarse. Para garantizar el experimento, repite el mismo comando en la segunda instancia (obtenla con el mismo comando del Paso 1 cambiando `Instances[0]` por `Instances[1]`).
+
+**Paso 4** — Monitoriza el escalado desde tu terminal local:
+
+```bash
+watch -n 30 "aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names lab29-asg \
+  --query 'AutoScalingGroups[0].{Min:MinSize,Desired:DesiredCapacity,Max:MaxSize,Instances:length(Instances)}' \
+  --output table"
+```
+
+El ASG aumentará `DesiredCapacity` para mantener la CPU media en torno al 50%. Cuando `stress` finalice tras los 300 segundos, el ASG reducirá la capacidad gradualmente respetando el periodo de enfriamiento.
 
 ---
 
-> **Antes de comenzar los retos**, asegúrate de que todos los cambios de `main.tf` están aplicados y el servicio tiene `runningCount = desiredCount`. Si hay un despliegue en curso, espera a que complete.
+> **Antes de comenzar los retos**, asegúrate de que todos los cambios de `main.tf` están aplicados (`terraform apply`). Si hay modificaciones pendientes en el ASG, se aplicarán junto con el reto y el criterio *"sin cambios en recursos existentes"* no se cumplirá.
 
 ## Verificación final
 
 ```bash
-CLUSTER=$(terraform output -raw ecs_cluster_name)
-WEB_SERVICE=$(terraform output -raw web_service_name)
-API_SERVICE=$(terraform output -raw api_service_name)
+# Obtener la URL del ALB
+ALB_URL=$(terraform output -raw alb_url)
 
-# Verificar que ambos servicios ECS están en RUNNING
-aws ecs describe-services \
-  --cluster "$CLUSTER" \
-  --services "$WEB_SERVICE" "$API_SERVICE" \
-  --query 'services[*].{Name:serviceName,Status:status,Desired:desiredCount,Running:runningCount}' \
+# Probar la aplicación
+curl -s "http://${ALB_URL}" | head -5
+
+# Verificar que el ASG tiene instancias en servicio
+aws autoscaling describe-auto-scaling-groups \
+  --query 'AutoScalingGroups[?contains(AutoScalingGroupName,`lab29`)].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}' \
   --output table
 
-# Probar el servicio Web vía la IP pública de una de sus tareas
-WEB_TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$WEB_SERVICE" --query 'taskArns[0]' --output text)
-PRIVATE_IP=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$WEB_TASK" \
-  --query 'tasks[0].containers[0].networkInterfaces[0].privateIpv4Address' --output text)
-WEB_IP=$(aws ec2 describe-network-interfaces \
-  --filters "Name=private-ip-address,Values=$PRIVATE_IP" \
-  --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
-
-curl -s "http://${WEB_IP}/" | head -20
-# Esperado: HTML con las dos tarjetas (Web + API via Service Connect)
-
-curl -s "http://${WEB_IP}/api-data"
-# Esperado: JSON del microservicio API (proxy_pass + X-API-Key)
-
-# Comprobar que el parámetro SSM está correctamente configurado
-aws ssm get-parameter \
-  --name "$(terraform output -raw ssm_parameter_name)" \
-  --with-decryption \
-  --query 'Parameter.{Name:Name,Type:Type}' \
+# Ver el estado del target group
+TG_ARN=$(terraform output -raw target_group_arn)
+aws elbv2 describe-target-health \
+  --target-group-arn "$TG_ARN" \
+  --query 'TargetHealthDescriptions[*].{ID:Target.Id,State:TargetHealth.State}' \
   --output table
 ```
 
@@ -602,420 +347,168 @@ aws ssm get-parameter \
 
 ## Retos
 
-### Reto 1 — Microservicio Worker como Cliente Puro de Service Connect
+### Reto 1 — Escalado Programado
 
-Ya existen dos servicios: `web` (servidor en puerto 80) y `api` (servidor en puerto 8080). Añade un tercer microservicio `worker` que actúe como **cliente puro** de Service Connect: consume el endpoint `http://api:8080` sin necesitar registrar un nombre DNS propio, lo que demuestra la diferencia entre servidor y cliente en la malla de servicios.
+La política de Target Tracking reacciona a la carga en tiempo real, pero hay patrones de uso predecibles — por ejemplo, un pico de tráfico siempre entre las 08:00 y las 20:00 UTC de lunes a viernes. El escalado programado (`aws_autoscaling_schedule`) ajusta la capacidad del ASG en horarios fijos, complementando al Target Tracking.
 
 **Requisitos**
 
-1. Crea un archivo `worker.tf` en `aws/` con los siguientes recursos:
-   - `aws_cloudwatch_log_group` para `/ecs/lab29/worker`
-   - `aws_ecs_task_definition` para la tarea worker (misma imagen, cpu=256, memory=512)
-   - `aws_ecs_service` para el servicio worker con `desired_count = 1`
-2. El servicio worker debe tener Service Connect **activado como cliente puro** (`enabled = true` y `namespace`, **sin bloque `service {}`** — no necesita nombre DNS propio).
-3. Añade la variable de entorno `API_URL = "http://api:8080"` en el contenedor para documentar la dependencia.
-4. Usa el mismo Security Group (`aws_security_group.ecs`) y subredes públicas que los demás servicios.
-5. Añade el output `worker_service_name` en `outputs.tf`.
+1. Crea un archivo `schedules.tf` en `aws/` con dos recursos `aws_autoscaling_schedule`.
+2. El primero, `scale_up`, debe ejecutarse de lunes a viernes a las **08:00 UTC** y escalar el ASG a `min_size = 4`, `desired_capacity = 4`.
+3. El segundo, `scale_down`, debe ejecutarse de lunes a viernes a las **20:00 UTC** y devolver el ASG a `min_size = var.min_size`, `desired_capacity = var.desired_capacity`.
+4. Ambas acciones deben expresarse en formato cron y referenciar el ASG ya existente sin modificarlo.
 
 **Criterios de éxito**
 
-- `terraform plan` no modifica los servicios `web` ni `api` existentes — solo añade los recursos del worker.
-- `aws ecs describe-services --cluster lab29-cluster --services lab29-worker` muestra el servicio activo.
-- Desde el contenedor worker (`execute-command`), `wget -qO- http://api:8080/health` devuelve `{"status":"ok"}`.
-- Puedes explicar por qué el worker no necesita el bloque `service {}` dentro de `service_connect_configuration`.
+- `terraform plan` no muestra cambios en los recursos existentes — solo añade los dos schedules.
+- `aws autoscaling describe-scheduled-actions --auto-scaling-group-name lab29-asg` lista las dos acciones con los horarios correctos.
+- Puedes explicar por qué `max_size` no se modifica en `scale_up` aunque la capacidad deseada aumente.
 
-### Reto 2 — ALB para Acceso Externo con Subredes Privadas
+### Reto 2 — Alarma CloudWatch y Notificación SNS
 
-Service Connect es excelente para comunicación **este-oeste** (entre microservicios), pero los usuarios externos necesitan acceder al servicio a través de Internet. La arquitectura de producción correcta coloca el ALB en subredes públicas y las tareas ECS en subredes **privadas**: las tareas no tienen IP pública y solo son alcanzables desde el ALB, no desde Internet directamente.
-
-```
-Internet → ALB (subred pública) → Tareas Web (subred privada) → API (subred privada)
-                                        ↑
-                               NAT Gateway (salida a Internet para pull de imágenes)
-```
+El Target Tracking gestiona el escalado, pero no avisa al equipo cuando la carga es anormalmente alta. Un umbral de CPU del 80% sostenido durante 2 minutos podría indicar un problema en la aplicación (bucle infinito, fuga de memoria) más que una demanda legítima.
 
 **Requisitos**
 
-1. Crea un archivo `alb.tf` en `aws/` con los siguientes recursos:
-   - Subredes privadas (una por AZ) con su tabla de rutas apuntando al NAT Gateway
-   - `aws_eip` + `aws_nat_gateway` en una de las subredes públicas existentes
-   - `aws_security_group` para el ALB (acepta HTTP en el puerto 80 desde `0.0.0.0/0`)
-   - `aws_lb` de tipo `application` en las subredes **públicas**
-   - `aws_lb_target_group` con `target_type = "ip"` y health check al puerto 80
-   - `aws_lb_listener` en el puerto 80 que reenvíe al target group
-2. Modifica `aws_ecs_service.web` en `main.tf`:
-   - Cambia `subnets` a las nuevas subredes privadas
-   - Cambia `assign_public_ip` a `false`
-   - Añade el bloque `load_balancer`
-3. Actualiza el security group `ecs`: reemplaza la regla de puerto 80 desde `0.0.0.0/0` por una regla que solo admita tráfico desde el security group del ALB (`security_groups = [aws_security_group.alb.id]`).
-4. Añade a `outputs.tf` el output `alb_url` con la URL pública del ALB.
+1. Crea un archivo `alerts.tf` en `aws/` con los siguientes recursos:
+   - `aws_sns_topic` con nombre `"${var.project}-alerts"`.
+   - `aws_sns_topic_subscription` de tipo `email` a tu dirección de correo.
+   - `aws_cloudwatch_metric_alarm` que se active cuando la **CPU media del ASG supere el 80%** durante **2 periodos consecutivos de 60 segundos** y envíe la notificación al topic SNS.
+2. La alarma debe también enviar una notificación de recuperación (`ok_actions`) cuando la CPU baje del umbral.
+3. Añade a `outputs.tf` la ARN del SNS topic y el nombre de la alarma.
 
 **Criterios de éxito**
 
 - `terraform apply` completa sin errores.
-- `curl $(terraform output -raw alb_url)` devuelve la página HTML con las dos tarjetas.
-- La tarjeta de la API sigue funcionando (el ALB enruta a la tarea Web que internamente llama al API via Service Connect).
-- Las tareas Web **no tienen IP pública** (`assign_public_ip = false`): solo son accesibles a través del ALB.
-- Puedes explicar por qué `target_type = "ip"` es obligatorio para Fargate (y no `instance`) y por qué el NAT Gateway es necesario en subredes privadas.
+- Recibes un correo de confirmación de suscripción SNS de AWS; debes aceptarlo para activar las notificaciones.
+- `aws cloudwatch describe-alarms --alarm-names "lab29-cpu-high"` muestra el estado `OK`.
+- Al generar carga de CPU superior al 80% durante 2 minutos (usando `yes > /dev/null &`), recibes un correo de alerta.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Microservicio Worker como Cliente Puro de Service Connect</strong></summary>
+<summary><strong>Solución al Reto 1 — Escalado Programado</strong></summary>
 
-### Solución al Reto 1 — Microservicio Worker como Cliente Puro de Service Connect
+### Solución al Reto 1 — Escalado Programado
 
-Crea el archivo `aws/worker.tf`:
-
-```hcl
-resource "aws_cloudwatch_log_group" "worker" {
-  name              = "/ecs/${var.project}/worker"
-  retention_in_days = 7
-  tags              = local.tags
-}
-
-resource "aws_ecs_task_definition" "worker" {
-  family                   = "${var.project}-worker"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
-
-  execution_role_arn = aws_iam_role.execution.arn
-  task_role_arn      = aws_iam_role.task.arn
-
-  container_definitions = jsonencode([{
-    name      = "worker"
-    image     = var.container_image
-    essential = true
-    cpu       = 256
-    memory    = 512
-
-    # El worker no expone puertos propios; solo consume el servicio "api".
-    # No se declaran portMappings porque Service Connect no necesita registrarlo.
-    environment = [
-      { name = "APP_ENV",  value = "production" },
-      # URL interna al microservicio API via Service Connect:
-      { name = "API_URL",  value = "http://api:8080" }
-    ]
-
-    secrets = [{
-      name      = "API_KEY"
-      valueFrom = aws_ssm_parameter.api_key.arn
-    }]
-
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.worker.name
-        "awslogs-region"        = var.region
-        "awslogs-stream-prefix" = "worker"
-      }
-    }
-  }])
-
-  tags = merge(local.tags, { Name = "${var.project}-worker-task-def" })
-}
-
-resource "aws_ecs_service" "worker" {
-  name            = "${var.project}-worker"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.worker.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
-
-  enable_execute_command = true
-
-  network_configuration {
-    subnets          = aws_subnet.public[*].id
-    security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = true
-  }
-
-  # Cliente Service Connect: solo necesita enabled = true y el namespace.
-  # Sin bloque service {}: este microservicio NO se registra con nombre DNS propio.
-  # ECS aún inyecta el proxy Envoy para que el worker pueda RESOLVER "api:80".
-  service_connect_configuration {
-    enabled   = true
-    namespace = aws_service_discovery_http_namespace.main.arn
-  }
-
-  deployment_circuit_breaker {
-    enable   = true
-    rollback = true
-  }
-
-  deployment_maximum_percent         = 200
-  deployment_minimum_healthy_percent = 100
-
-  depends_on = [
-    aws_iam_role_policy_attachment.execution_basic,
-    aws_iam_role_policy.ssm_read,
-  ]
-
-  tags = merge(local.tags, { Name = "${var.project}-worker-service" })
-}
-```
-
-Añade a `outputs.tf`:
+Crea el archivo `aws/schedules.tf`:
 
 ```hcl
-output "worker_service_name" {
-  description = "Nombre del servicio ECS worker"
-  value       = aws_ecs_service.worker.name
+resource "aws_autoscaling_schedule" "scale_up" {
+  scheduled_action_name  = "${var.project}-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  recurrence             = "0 8 * * 1-5"   # Lunes–viernes, 08:00 UTC
+  time_zone              = "UTC"
+
+  min_size         = 4
+  max_size         = -1   # -1 significa "no cambiar el valor actual"
+  desired_capacity = 4
+}
+
+resource "aws_autoscaling_schedule" "scale_down" {
+  scheduled_action_name  = "${var.project}-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  recurrence             = "0 20 * * 1-5"  # Lunes–viernes, 20:00 UTC
+  time_zone              = "UTC"
+
+  min_size         = var.min_size
+  max_size         = -1
+  desired_capacity = var.desired_capacity
 }
 ```
 
-El worker no incluye el bloque `service {}` porque no necesita ser **descubierto** por nadie — solo necesita **descubrir** al servicio `api`. El proxy Envoy inyectado por ECS resuelve `api:8080` consultando el namespace Cloud Map sin necesidad de declararlo explícitamente.
-
-**Verificación del microservicio worker**
-
-**Paso 1** — Comprueba que el servicio arrancó correctamente:
-
-```bash
-aws ecs describe-services \
-  --cluster lab29-cluster \
-  --services lab29-worker \
-  --query 'services[0].{Estado:status,Deseadas:desiredCount,Corriendo:runningCount,Deployment:deployments[0].rolloutState}' \
-  --output table
-```
-
-Espera hasta que `runningCount = 1` y `rolloutState = COMPLETED`.
-
-**Paso 2** — Obtén el ARN de la tarea worker y abre una shell interactiva:
-
-```bash
-WORKER_TASK=$(aws ecs list-tasks \
-  --cluster lab29-cluster --service-name lab29-worker \
-  --query 'taskArns[0]' --output text)
-
-aws ecs execute-command \
-  --cluster lab29-cluster \
-  --task "$WORKER_TASK" \
-  --container worker \
-  --interactive \
-  --command "/bin/sh"
-```
-
-**Paso 3** — Desde dentro del contenedor, prueba la conectividad Service Connect:
-
-```sh
-# /health no requiere autenticación — verifica que Service Connect resuelve "api"
-wget -qO- http://api:8080/health
-# {"status":"ok","service":"api"}
-
-# GET / requiere X-API-Key — sin header devuelve 401
-wget -qO- http://api:8080/ 2>&1
-# wget: server returned error: HTTP/1.1 401 Unauthorized
-
-# Con la clave inyectada desde SSM devuelve los metadatos de la tarea API
-wget -qO- --header "X-API-Key: $API_KEY" http://api:8080/
-# {"service":"api","task_id":"...","cluster":"lab29-cluster",...}
-
-exit
-```
-
-**Paso 4** — Verifica los logs del worker:
-
-```bash
-aws logs tail /ecs/lab29/worker --log-stream-name-prefix worker/ --follow
-```
-
-</details>
-
-<details>
-<summary><strong>Solución al Reto 2 — ALB para Acceso Externo con Subredes Privadas</strong></summary>
-
-### Solución al Reto 2 — ALB para Acceso Externo con Subredes Privadas
-
-Crea el archivo `aws/alb.tf`:
-
-```hcl
-# ── Subredes privadas ─────────────────────────────────────────────────────────
-# Las tareas ECS se mueven aquí: sin IP pública, solo accesibles desde el ALB.
-# Usamos los CIDRs x.x.10.x, x.x.11.x (distintos de los públicos x.x.1.x, x.x.2.x).
-
-locals {
-  private_cidrs = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, i + 10)]
-}
-
-resource "aws_subnet" "private" {
-  count             = length(local.azs)
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = local.private_cidrs[count.index]
-  availability_zone = local.azs[count.index]
-
-  tags = merge(local.tags, { Name = "${var.project}-private-${local.azs[count.index]}" })
-}
-
-# ── NAT Gateway ───────────────────────────────────────────────────────────────
-# Las tareas en subredes privadas necesitan salida a Internet para hacer pull
-# de imágenes (Docker Hub / ECR público). El NAT Gateway vive en la subred
-# pública y enruta el tráfico de salida en nombre de las tareas privadas.
-
-resource "aws_eip" "nat" {
-  domain = "vpc"
-  tags   = merge(local.tags, { Name = "${var.project}-nat-eip" })
-}
-
-resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public[0].id   # NAT Gateway en subred pública
-  tags          = merge(local.tags, { Name = "${var.project}-nat" })
-  depends_on    = [aws_internet_gateway.main]
-}
-
-resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main.id
-  }
-
-  tags = merge(local.tags, { Name = "${var.project}-private-rt" })
-}
-
-resource "aws_route_table_association" "private" {
-  count          = length(aws_subnet.private)
-  subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private.id
-}
-
-# ── Security Group del ALB ────────────────────────────────────────────────────
-
-resource "aws_security_group" "alb" {
-  name        = "${var.project}-alb-sg"
-  description = "Permite trafico HTTP desde Internet al ALB"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "HTTP desde Internet"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = merge(local.tags, { Name = "${var.project}-alb-sg" })
-}
-
-# ── ALB en subredes públicas ──────────────────────────────────────────────────
-
-resource "aws_lb" "main" {
-  name               = "${var.project}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id   # ALB siempre en subred pública
-
-  tags = merge(local.tags, { Name = "${var.project}-alb" })
-}
-
-# target_type = "ip" es OBLIGATORIO para Fargate con network_mode = "awsvpc".
-# En awsvpc, cada tarea tiene su propia ENI con IP propia. El ALB se conecta
-# directamente a esa IP, no a la IP de un servidor EC2 como en el modo "instance".
-resource "aws_lb_target_group" "web" {
-  name        = "${var.project}-web-tg"
-  port        = 80
-  protocol    = "HTTP"
-  target_type = "ip"
-  vpc_id      = aws_vpc.main.id
-
-  health_check {
-    path                = "/"
-    protocol            = "HTTP"
-    healthy_threshold   = 3
-    unhealthy_threshold = 3
-    interval            = 30
-    timeout             = 5
-    matcher             = "200"
-  }
-
-  tags = merge(local.tags, { Name = "${var.project}-web-tg" })
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.web.arn
-  }
-}
-```
-
-Modifica `aws_ecs_service.web` en `main.tf` — mueve las tareas a subredes privadas y añade el ALB:
-
-```hcl
-resource "aws_ecs_service" "web" {
-  # ...
-  network_configuration {
-    subnets          = aws_subnet.private[*].id   # ← subredes privadas
-    security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = false                       # ← sin IP pública
-  }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.web.arn
-    container_name   = "web"
-    container_port   = 80
-  }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.execution_basic,
-    aws_iam_role_policy.ssm_read,
-    aws_nat_gateway.main,     # las tareas privadas necesitan el NAT antes de arrancar
-    aws_lb_listener.http,     # el listener debe existir antes de que las tareas se registren
-  ]
-  # ...
-}
-```
-
-Actualiza también la regla de ingreso en el security group `ecs` en `main.tf` para que el puerto 80 solo admita tráfico del ALB (no de toda Internet):
-
-```hcl
-# Reemplaza la regla: ingress { from_port = 80, cidr_blocks = ["0.0.0.0/0"] }
-# por esta:
-ingress {
-  description     = "HTTP desde el ALB"
-  from_port       = 80
-  to_port         = 80
-  protocol        = "tcp"
-  security_groups = [aws_security_group.alb.id]
-}
-```
-
-> Las tareas API y Worker permanecen en subredes públicas con `assign_public_ip = true` (necesitan internet para pull de imágenes y no tienen ALB delante). Solo el servicio Web se mueve a subredes privadas porque es el único con un ALB como punto de entrada.
-
-Añade a `outputs.tf`:
-
-```hcl
-output "alb_url" {
-  description = "URL pública del Application Load Balancer"
-  value       = "http://${aws_lb.main.dns_name}"
-}
-```
+El valor `-1` en `max_size` le indica al ASG que no modifique el máximo vigente en ese momento. Si se pusiera el valor explícito de `var.max_size`, funcionaría igual, pero `-1` es más robusto: si alguien cambia manualmente el máximo fuera de ciclo, la acción programada no lo sobreescribirá.
 
 Verificación:
 
 ```bash
 terraform apply
 
-# Espera ~2 minutos a que las tareas pasen los health checks del ALB
-curl $(terraform output -raw alb_url)
-# Debe devolver la página HTML con las dos tarjetas (Web + API via Service Connect)
+aws autoscaling describe-scheduled-actions \
+  --auto-scaling-group-name lab29-asg \
+  --query 'ScheduledUpdateGroupActions[].{Nombre:ScheduledActionName,Cron:Recurrence,Min:MinSize,Desired:DesiredCapacity}' \
+  --output table
+```
+
+</details>
+
+<details>
+<summary><strong>Solución al Reto 2 — Alarma CloudWatch y Notificación SNS</strong></summary>
+
+### Solución al Reto 2 — Alarma CloudWatch y Notificación SNS
+
+Crea el archivo `aws/alerts.tf`:
+
+```hcl
+resource "aws_sns_topic" "alerts" {
+  name = "${var.project}-alerts"
+  tags = local.tags
+}
+
+resource "aws_sns_topic_subscription" "email" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = "tu-correo@ejemplo.com"   # Sustituye por tu dirección real
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "${var.project}-cpu-high"
+  alarm_description   = "CPU media del ASG por encima del 80% durante 2 minutos"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 80
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.web.name
+  }
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn]
+
+  tags = local.tags
+}
+```
+
+Añade a `outputs.tf`:
+
+```hcl
+output "sns_topic_arn" {
+  description = "ARN del topic SNS de alertas"
+  value       = aws_sns_topic.alerts.arn
+}
+
+output "cloudwatch_alarm_name" {
+  description = "Nombre de la alarma de CPU alta"
+  value       = aws_cloudwatch_metric_alarm.cpu_high.alarm_name
+}
+```
+
+> **Importante:** tras el `terraform apply`, AWS envía un correo a la dirección configurada con un enlace de confirmación. La suscripción queda en estado `PendingConfirmation` hasta que se acepte; sin confirmar, no se reciben notificaciones.
+
+Verificación:
+
+```bash
+terraform apply
+
+# Confirmar que la alarma existe y está en estado OK
+aws cloudwatch describe-alarms \
+  --alarm-names "lab29-cpu-high" \
+  --query 'MetricAlarms[0].{Nombre:AlarmName,Estado:StateValue,Umbral:Threshold}' \
+  --output table
+
+# Generar carga para activar la alarma
+stress --cpu 2 --timeout 300 &
+
+# Monitorizar el estado de la alarma
+watch -n 15 "aws cloudwatch describe-alarms \
+  --alarm-names lab29-cpu-high \
+  --query 'MetricAlarms[0].StateValue' --output text"
 ```
 
 </details>
@@ -1029,16 +522,7 @@ curl $(terraform output -raw alb_url)
 terraform destroy
 ```
 
-El `destroy` elimina el cluster ECS, el servicio, las tareas en ejecución, el repositorio ECR (si está vacío), el parámetro SSM y todos los recursos de red. Si el repositorio ECR tiene imágenes, el destroy fallará — borra las imágenes primero:
-
-```bash
-aws ecr batch-delete-image \
-  --repository-name lab29/api \
-  --image-ids "$(aws ecr list-images \
-    --repository-name lab29/api \
-    --query 'imageIds' \
-    --output json)"
-```
+El destroy elimina recursos en orden inverso. El NAT Gateway, el ALB y las instancias del ASG tardan varios minutos en destruirse completamente.
 
 > El bucket S3 de estado (`terraform-state-labs-<ACCOUNT_ID>`) no se destruye: se reutiliza en otros laboratorios.
 
@@ -1048,7 +532,7 @@ aws ecr batch-delete-image \
 
 Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-LocalStack Community soporta ECR, SSM e IAM completamente. ECS tiene soporte parcial: los recursos (cluster, task definition, service) se crean correctamente en el estado de Terraform, pero las tareas Fargate no se lanzan realmente. Service Connect y el Circuit Breaker se registran sin efecto observable.
+LocalStack Community soporta VPC, subnets y Launch Templates completamente. El ALB y el ASG tienen soporte parcial: los recursos se crean pero las instancias no se lanzan realmente y el DNS del ALB no resuelve a backends funcionales. Para observar el comportamiento dinámico del rolling update y el escalado, se requiere AWS real o LocalStack Pro.
 
 ---
 
@@ -1056,41 +540,37 @@ LocalStack Community soporta ECR, SSM e IAM completamente. ECS tiene soporte par
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| ECR con IMMUTABLE | Rechaza push duplicado realmente | El repositorio se crea; el push no rechaza en Community |
-| Lifecycle policy | Se ejecuta automáticamente | Se almacena pero no se evalúa |
-| SSM SecureString | Cifrado con KMS real | Almacenado, `--with-decryption` devuelve el valor |
-| ECS Task Definition | Registrada en la API de ECS | Registrada correctamente |
-| Tareas Fargate | Se lanzan y ejecutan los contenedores | No se lanzan contenedores reales |
-| Service Connect | Proxy Envoy funcional entre tareas | Configuración registrada, sin proxy real |
-| Circuit Breaker | Detecta fallos y revierte | Se configura, no hay despliegue real que fallar |
-| Execute Command | Funcional con el SSM Agent | No disponible (sin contenedores reales) |
-| startup.sh / startup-api.sh | Generan HTML y JSON en el arranque usando metadatos ECS v4 | Los scripts se ejecutan pero el endpoint de metadatos devuelve vacío |
-| Coste aproximado | ~$0.03/hora × 4 tareas Fargate (2 web + 2 api, 256 CPU / 512 MB c/u) | Sin coste |
+| VPC, subnets, route tables | Infraestructura real | Soportado |
+| NAT Gateway | Activo, con coste por hora y datos | Simulado sin coste |
+| ALB con DNS funcional | Resuelve a instancias reales | DNS simulado, sin backends reales |
+| Instancias EC2 en ASG | Se lanzan, ejecutan `user_data` y pasan health checks | No se lanzan instancias reales |
+| Instance Refresh visible | Reemplaza instancias gradualmente | Registra la operación sin efecto real |
+| Target Tracking Scaling | CloudWatch emite métricas y el ASG escala | Sin métricas reales — no escala |
+| Coste aproximado del lab | ~$0.10–0.20/hora (NAT GW + ALB + EC2) | Sin coste |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Usa `IMMUTABLE` en producción siempre.** Los tags mutables permiten sobreescribir accidentalmente una imagen en producción con otra versión. IMMUTABLE hace que el tag sea un identificador permanente, equivalente a un commit hash en Git.
-- **Referencia parámetros SSM por ARN, no por nombre.** En el bloque `secrets` de la task definition, usar el ARN (`aws_ssm_parameter.api_key.arn`) en lugar del nombre (`:ssm:/lab29/api-key`) evita ambigüedades de región y cuenta, y garantiza que el permiso IAM apunta exactamente al mismo recurso.
-- **Separa el rol de ejecución del rol de tarea.** El `execution_role_arn` solo lo usa el agente ECS para arrancar el contenedor (pull de imagen, inyección de secretos). El `task_role_arn` lo usa el código dentro del contenedor en tiempo de ejecución. Mezclarlos en un solo rol otorga al código de la aplicación permisos que solo debería tener la infraestructura.
-- **`port_name` es el contrato entre Task Definition y Service Connect.** El campo `name` en `portMappings` y el campo `port_name` en `service_connect_configuration.service` deben coincidir exactamente. Un cambio en uno sin actualizar el otro causa un error en el despliegue.
-- **Activa Container Insights en el cluster.** El bloque `setting { name = "containerInsights" value = "enabled" }` publica métricas de uso de CPU y memoria de cada tarea en CloudWatch, permitiendo configurar alarmas y políticas de auto-escalado basadas en consumo real.
-- **Usa `deployment_minimum_healthy_percent = 100` con cuidado.** Con `desired_count = 1`, este valor impide cualquier despliegue porque ECS no puede lanzar una tarea nueva sin terminar la única existente. En ese caso, usa `50` para permitir un despliegue stop-start o aumenta `desired_count` a 2.
-- **Limpia el repositorio ECR antes de `destroy`.** Terraform no puede eliminar un repositorio ECR que contiene imágenes. Añade `force_delete = true` en el recurso si quieres que el `destroy` lo elimine aunque contenga imágenes (útil en entornos de desarrollo, no recomendado en producción).
+- **Un NAT Gateway por AZ.** Este laboratorio crea un NAT Gateway por AZ (`count = length(local.azs)`). Si una zona cae, las instancias de las AZs restantes conservan su conectividad de salida. Usar un único NAT Gateway abarataría el laboratorio, pero convertiría ese recurso en un SPOF de la conectividad de salida.
+- **Usa `version = aws_launch_template.web.latest_version` en lugar de `"$Latest"`.** El puntero `$Latest` no cambia en el estado de Terraform, por lo que no activa el `instance_refresh` al actualizar el template. Referenciar `latest_version` directamente garantiza que Terraform detecta el cambio.
+- **Ajusta `min_healthy_percentage` según tu SLA.** Al 90% con 10 instancias, el ASG puede reemplazar como máximo 1 instancia a la vez. Al 50% puede reemplazar 5 simultáneamente (más rápido, pero con mayor riesgo).
+- **Combina `instance_warmup` con el tiempo real de arranque de tu aplicación.** Si `user_data` tarda 90 segundos en levantar el servicio, configura `instance_warmup = 120` para que el ASG no evalúe la salud antes de que la instancia esté lista.
+- **Habilita `enabled_metrics` en el ASG.** Sin este bloque, CloudWatch solo recibe métricas de instancia individuales con granularidad de 5 minutos. Con `metrics_granularity = "1Minute"` y `enabled_metrics`, el ASG publica métricas propias (instancias en servicio, pendientes, terminando…) cada minuto, lo que acelera la respuesta del Target Tracking y permite monitorizar el escalado en tiempo real desde la consola de CloudWatch.
+- **Usa `health_check_type = "ELB"` siempre que tengas un ALB.** El health check de tipo EC2 solo comprueba que la instancia está encendida; el de tipo ELB comprueba que la aplicación responde correctamente al health check del target group.
+- **Protege las subredes privadas.** Los Security Groups de las instancias solo deben aceptar tráfico del Security Group del ALB, nunca de `0.0.0.0/0`. Así, ningún atacante puede llegar directamente a las instancias aunque conozca su IP.
 
 ---
 
 ## Recursos
 
-- [aws_ecr_repository — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecr_repository)
-- [aws_ecr_lifecycle_policy — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecr_lifecycle_policy)
-- [aws_ecs_task_definition — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecs_task_definition)
-- [aws_ecs_service — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecs_service)
-- [aws_ssm_parameter — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ssm_parameter)
-- [aws_service_discovery_http_namespace — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/service_discovery_http_namespace)
-- [Combinaciones válidas de CPU/Memoria en Fargate — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html)
-- [Service Connect — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect.html)
-- [Deployment Circuit Breaker — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
-- [Pasar datos sensibles a contenedores ECS — AWS Docs](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-ssm-paramstore.html)
-- [ECR Lifecycle Policies — AWS Docs](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html)
+- [aws_launch_template — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/launch_template)
+- [aws_autoscaling_group — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_group)
+- [aws_autoscaling_schedule — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_schedule)
+- [aws_cloudwatch_metric_alarm — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm)
+- [aws_sns_topic — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sns_topic)
+- [aws_lb / aws_lb_listener — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lb)
+- [Instance Refresh — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/asg-instance-refresh.html)
+- [Target Tracking Scaling — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
+- [Scheduled Scaling — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-scheduled-scaling.html)
+- [Multi-AZ ASG — AWS Docs](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-benefits.html)

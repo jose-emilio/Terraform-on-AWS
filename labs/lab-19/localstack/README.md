@@ -1,9 +1,9 @@
-# Laboratorio 19 — LocalStack: Conectividad Punto a Punto con VPC Peering
+# Laboratorio 19 — LocalStack: Seguridad y Control de Trafico en VPC
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guia adapta el lab19 para ejecutarse integramente en LocalStack. LocalStack emula VPC Peering a nivel de API pero **no ejecuta trafico real**. El objetivo es validar la estructura de Terraform: VPCs, peerings, rutas bidireccionales y Security Groups.
+Esta guia adapta el lab19 para ejecutarse integramente en LocalStack. Las diferencias principales son que **ELBv2 (ALB) no esta disponible** en LocalStack Community (requiere licencia de pago) y que **no hay trafico de red real**, por lo que no se puede verificar el bloqueo efectivo de la NACL ni consultar Flow Logs con datos reales. El objetivo es validar la estructura de Terraform (Security Groups, NACLs, Flow Logs).
 
 ## Requisitos previos
 
@@ -32,53 +32,71 @@ Revisa los outputs:
 
 ```bash
 terraform output
-# app_vpc_id       = "vpc-xxxxxxxxx"
-# db_vpc_id        = "vpc-xxxxxxxxx"
-# c_vpc_id         = "vpc-xxxxxxxxx"
-# peering_app_db_id = "pcx-xxxxxxxxx"
-# peering_app_c_id  = "pcx-xxxxxxxxx"
+# alb_sg_id       = "sg-xxxxxxxxx"
+# app_sg_id       = "sg-xxxxxxxxx"
+# public_nacl_id  = "acl-xxxxxxxxx"
+# flow_log_group  = "/vpc/lab19/flow-logs"
 ```
 
 ## Verificacion
 
-### VPCs
+### Security Group del ALB (dynamic ingress)
 
 ```bash
-awslocal ec2 describe-vpcs \
-  --filters Name=tag:Project,Values=lab19 \
-  --query 'Vpcs[].{Name: Tags[?Key==`Name`].Value|[0], CIDR: CidrBlock}' \
-  --output table
-```
+ALB_SG=$(terraform output -raw alb_sg_id)
 
-### Peerings
-
-```bash
-awslocal ec2 describe-vpc-peering-connections \
-  --filters Name=tag:Project,Values=lab19 \
-  --query 'VpcPeeringConnections[].{Name: Tags[?Key==`Name`].Value|[0], ID: VpcPeeringConnectionId, Status: Status.Code}' \
-  --output table
-```
-
-### Rutas con peering
-
-```bash
-awslocal ec2 describe-route-tables \
-  --filters Name=tag:Project,Values=lab19 \
-  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], PeeringRoutes: Routes[?VpcPeeringConnectionId!=null].{Dest: DestinationCidrBlock, Peering: VpcPeeringConnectionId}}' \
+awslocal ec2 describe-security-groups \
+  --group-ids $ALB_SG \
+  --query 'SecurityGroups[].IpPermissions[].{Port: FromPort, CIDR: IpRanges[].CidrIp}' \
   --output json
+```
+
+Deberias ver una regla por cada puerto en `var.alb_ingress_ports` (80 y 443 por defecto).
+
+### Security Group de las EC2 (referencia por SG)
+
+```bash
+APP_SG=$(terraform output -raw app_sg_id)
+
+awslocal ec2 describe-security-groups \
+  --group-ids $APP_SG \
+  --query 'SecurityGroups[].IpPermissions[].{Port: FromPort, SourceSG: UserIdGroupPairs[].GroupId}' \
+  --output json
+```
+
+El unico origen permitido debe ser el SG del ALB (no un CIDR).
+
+### NACL publica (regla deny)
+
+```bash
+awslocal ec2 describe-network-acls \
+  --filters Name=tag:Project,Values=lab19 \
+  --query 'NetworkAcls[].Entries[?RuleAction==`deny` && !Egress].{RuleNum: RuleNumber, CIDR: CidrBlock, Action: RuleAction}' \
+  --output table
+```
+
+Deberias ver la regla 50 con `deny` para la IP bloqueada (`203.0.113.0/32`).
+
+### VPC Flow Logs
+
+```bash
+awslocal logs describe-log-groups \
+  --log-group-name-prefix "/vpc/lab19" \
+  --query 'logGroups[].{Name: logGroupName, Retention: retentionInDays}' \
+  --output table
 ```
 
 ## Limitaciones en LocalStack
 
 | Caracteristica | AWS Real | LocalStack Community |
 |---|---|---|
-| VPC Peering | Tunel privado, trafico real | Emulado, sin trafico |
-| Rutas con peering | Enrutan trafico real | Emuladas |
-| No transitividad | Verificable con ping | No verificable sin trafico |
-| Security Groups | Filtran trafico real | Emulados |
-| Instancias EC2 | Ejecutan user_data | Emuladas |
+| Security Groups | Filtran trafico real | Emulados, sin filtrado |
+| NACLs | Bloquean/permiten trafico real | Emuladas, sin filtrado |
+| ALB (ELBv2) | Distribuye trafico HTTP/HTTPS | **No disponible** (requiere licencia) |
+| VPC Flow Logs | Capturan trafico REJECT real | Emulados, sin datos de trafico |
+| Instancias EC2 | Ejecutan user_data, sirven HTTP | Emuladas, sin proceso real |
 
-Para verificar la no transitividad y la conectividad real, usa la version `aws/`.
+Para probar el ALB, el bloqueo efectivo de la NACL y consultar Flow Logs con datos reales, usa la version `aws/`.
 
 ## Limpieza
 

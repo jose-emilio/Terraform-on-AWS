@@ -1,128 +1,68 @@
-# Laboratorio 28 — LocalStack: Escalabilidad y Alta Disponibilidad con Zero Downtime
+# Laboratorio 28 — LocalStack: Cimientos de EC2: Despliegue Dinámico y Seguro
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Este documento describe cómo ejecutar el laboratorio 28 contra LocalStack. El código Terraform es el mismo que en `aws/`; solo cambia la configuración del provider.
+Esta guía adapta el lab28 para ejecutarse íntegramente en LocalStack. La configuración es idéntica a la de AWS real: data source `aws_ami`, IAM Instance Profile, Security Group e instancia EC2 con IMDSv2. Sólo cambia el `providers.tf`.
 
 ## Requisitos previos
 
-- LocalStack en ejecución: `localstack start -d`
-- Terraform >= 1.10
-
----
-
-## Despliegue en LocalStack
-
-### Limitaciones conocidas
-
-LocalStack Community simula los servicios de AWS con algunas restricciones relevantes para este laboratorio:
-
-| Servicio | Soporte en Community |
-|---|---|
-| VPC, subnets, IGW, NAT GW | Completo |
-| Security Groups | Completo |
-| ALB (`aws_lb`, `aws_lb_listener`) | Parcial — el DNS no resuelve a instancias reales |
-| Auto Scaling Group | Parcial — crea el recurso pero no lanza instancias EC2 reales |
-| Launch Template | Completo |
-| Política Target Tracking | Parcial — se crea el recurso, pero CloudWatch no emite métricas |
-| `instance_refresh` | Parcial — se registra la operación, no hay instancias que reemplazar |
-
-El valor del laboratorio con LocalStack radica en verificar que el código Terraform es válido y que los recursos se crean sin errores de API. Para observar el comportamiento real del ALB, ASG e `instance_refresh`, se requiere AWS real o LocalStack Pro.
-
-### Inicialización y despliegue
-
-Asegúrate de que LocalStack está en ejecución:
+- LocalStack corriendo: `localstack start -d`
+- AWS CLI configurado para LocalStack:
 
 ```bash
-localstack status
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+alias awslocal='aws --endpoint-url=http://localhost.localstack.cloud:4566'
 ```
 
-Desde el directorio `lab28/localstack/`:
+## Diferencias con AWS
+
+### `localstack/providers.tf`
+
+```hcl
+provider "aws" {
+  region                      = "us-east-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+
+  endpoints {
+    ec2 = "http://localhost.localstack.cloud:4566"
+    iam = "http://localhost.localstack.cloud:4566"
+    sts = "http://localhost.localstack.cloud:4566"
+  }
+}
+```
+
+> **Nota:** El data source `aws_ami` en LocalStack devuelve AMIs simuladas. El filtro se mantiene idéntico para validar la sintaxis, pero el ID devuelto no corresponde a una imagen real.
+
+## Despliegue
 
 ```bash
+cd labs/lab-28/localstack
+
 terraform fmt
 terraform init
 terraform plan
 terraform apply
 ```
 
-### Verificación
-
-Comprueba que los recursos se han creado:
+## Verificación
 
 ```bash
-# VPC y subredes
-aws --profile localstack ec2 describe-vpcs \
-  --filters "Name=tag:Project,Values=lab28-local" \
-  --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock}' --output table
-
-aws --profile localstack ec2 describe-subnets \
-  --filters "Name=tag:Project,Values=lab28-local" \
-  --query 'Subnets[].{ID:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone}' --output table
-
-# ALB
-aws --profile localstack elbv2 describe-load-balancers \
-  --query 'LoadBalancers[].{Name:LoadBalancerName,DNS:DNSName,State:State.Code}' \
-  --output table
-
-# ASG
-aws --profile localstack autoscaling describe-auto-scaling-groups \
-  --query 'AutoScalingGroups[].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}' \
-  --output table
-
-# Launch Template
-aws --profile localstack ec2 describe-launch-templates \
-  --query 'LaunchTemplates[].{Name:LaunchTemplateName,Version:LatestVersionNumber}' \
-  --output table
+awslocal ec2 describe-instances --filters "Name=tag:Name,Values=corp-lab28-web"
+awslocal iam list-instance-profiles
+awslocal ec2 describe-security-groups --group-names corp-lab28-web-sg
 ```
-
-### Demostración del Instance Refresh (LocalStack)
-
-Aunque LocalStack no reemplaza instancias reales, puedes verificar que Terraform genera una nueva versión del Launch Template al cambiar `app_version` y que el ASG registra una operación de refresh:
-
-```bash
-# Desde lab28/localstack/
-terraform apply -var="app_version=v2"
-
-# Consultar el historial de instance refreshes del ASG
-aws --profile localstack autoscaling describe-instance-refreshes \
-  --auto-scaling-group-name lab28-local-asg
-```
-
----
 
 ## Limpieza
 
 ```bash
-# Desde lab28/localstack/
 terraform destroy
 ```
 
----
-
-## Comparativa AWS Real vs LocalStack
-
-| Aspecto | AWS Real | LocalStack |
-|---|---|---|
-| ALB con DNS funcional | Sí — resuelve a instancias reales | Parcial — DNS simulado |
-| Instancias EC2 en ASG | Se lanzan y pasan health checks | No se lanzan instancias reales |
-| Instance Refresh visible | Reemplaza instancias gradualmente | Registra la operación sin efecto real |
-| Target Tracking (CPU) | CloudWatch escala el ASG | Sin métricas reales — no escala |
-| Coste | NAT GW + instancias EC2 + ALB | Sin coste |
-
----
-
-## Buenas Prácticas
-
-- Usa LocalStack para validar la sintaxis y los tipos de recursos antes de desplegar en AWS real.
-- Para probar el comportamiento dinámico (scaling, rolling update), usa AWS real o LocalStack Pro.
-- El flag `terraform validate` y `terraform plan` son suficientes para detectar errores de configuración sin necesidad de LocalStack.
-
----
-
-## Recursos Adicionales
-
-- [LocalStack — ELBv2](https://docs.localstack.cloud/aws/services/elb/)
-- [LocalStack — Auto Scaling](https://docs.localstack.cloud/aws/services/autoscaling/)
-- [LocalStack Pro — soporte ampliado](https://docs.localstack.cloud/aws/getting-started/)
+Consulta la guía principal en [../README.md](../README.md) para los conceptos y el despliegue en AWS.

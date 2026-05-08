@@ -1,34 +1,29 @@
-variable "project" {
+# Entorno de despliegue: controla el hardening del script de bootstrap
+# y el tipo de instancia seleccionado.
+variable "env" {
   type    = string
-  default = "lab28-local"
+  default = "dev"
+
+  validation {
+    condition     = contains(["dev", "prod"], var.env)
+    error_message = "El entorno debe ser 'dev' o 'prod'."
+  }
 }
 
-variable "vpc_cidr" {
+variable "app_name" {
   type    = string
-  default = "10.0.0.0/16"
+  default = "corp-lab28"
 }
 
+# Endpoint de la base de datos inyectado en el script de bootstrap via templatefile().
+# En un proyecto real vendría de un output de otro módulo (p. ej. aws_db_instance).
+variable "db_endpoint" {
+  type    = string
+  default = "db.corp-lab28.internal:5432"
+}
+
+# Tipo de instancia EC2. t3.micro está cubierto por la capa gratuita.
 variable "instance_type" {
   type    = string
-  default = "t4g.small"
-}
-
-variable "min_size" {
-  type    = number
-  default = 2
-}
-
-variable "max_size" {
-  type    = number
-  default = 4
-}
-
-variable "desired_capacity" {
-  type    = number
-  default = 2
-}
-
-variable "app_version" {
-  type    = string
-  default = "v1"
+  default = "t3.micro"
 }

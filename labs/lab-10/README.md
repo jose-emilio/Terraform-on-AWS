@@ -1,4 +1,4 @@
-# Laboratorio 10 — Arquitectura de State Splitting (Capas de Infraestructura)
+# Laboratorio 10 — HCP Terraform como Backend Remoto
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,635 +8,1387 @@
 
 ## Visión general
 
-En este laboratorio dividirás un estado monolítico en capas independientes para reducir el **blast radius** (radio de impacto) ante errores o cambios. Aprenderás a publicar valores entre proyectos Terraform mediante `output` y a consumirlos desde otra capa con el data source `terraform_remote_state`, sin duplicar ni hardcodear ningún identificador de recursos.
+En este laboratorio configurarás **HCP Terraform** como backend de
+estado y motor de ejecución remota para un proyecto Terraform real que despliega
+infraestructura en AWS. A diferencia del lab07, donde gestionabas tu propio bucket S3 y
+tabla DynamoDB, aquí delegas toda la operación del estado a la plataforma SaaS de
+HashiCorp: cifrado, versionado, locking y auditoría de runs están incluidos sin
+infraestructura adicional que mantener.
 
-## Objetivos de Aprendizaje
+El laboratorio cubre el ciclo completo: registro de cuenta, creación de organización y
+workspace, configuración de la confianza OIDC entre HCP Terraform y AWS IAM (sin
+credenciales estáticas), migración del bloque `backend` local al bloque `cloud {}`, y
+ejecución de un plan y un apply observando los resultados tanto en el terminal como en
+la UI de HCP Terraform.
 
-Al finalizar este laboratorio serás capaz de:
+## Objetivos de aprendizaje
 
-- Entender qué es el blast radius y por qué el estado monolítico lo amplifica
-- Dividir un proyecto Terraform en capas independientes (red y cómputo)
-- Publicar identificadores de recursos como `output` para que actúen como interfaz pública entre capas
-- Leer el estado de otra capa con el data source `terraform_remote_state`
-- Verificar experimentalmente que un error o destrucción en la capa de cómputo no afecta el estado de la capa de red
-- Aplicar la convención de backends S3 separados por capa (AWS real) y backends locales por directorio (LocalStack)
+- Registrar una cuenta gratuita en HCP Terraform y crear una organización
+- Crear un workspace en modo **CLI-driven**
+- Configurar la autenticación entre HCP Terraform y AWS mediante **OIDC Dynamic
+  Provider Credentials** — sin claves de acceso estáticas en el workspace
+- Crear el IAM OIDC Identity Provider y el IAM Role con la trust policy correcta
+- Reemplazar el bloque `backend "s3"` por el bloque `cloud {}` y ejecutar `terraform init`
+  para migrar el estado
+- Comprender la diferencia entre modo de ejecución **Remote** (plan y apply en agentes
+  de HCP) y **Local** (solo estado remoto)
+- Observar el historial de runs, el estado versionado y los logs desde la UI de
+  HCP Terraform
+- Gestionar variables Terraform directamente desde la UI sin modificar el código
 
 ## Requisitos previos
 
-- **Terraform >= 1.10** instalado
-- Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- LocalStack en ejecución — para la sección LocalStack
+- Cuenta de correo electrónico válida para el registro en HCP Terraform
+- AWS CLI configurado con credenciales válidas (`aws sts get-caller-identity`)
+- Terraform >= 1.1 instalado (versión mínima que soporta el bloque `cloud {}`)
 
----
+```bash
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export REGION="us-east-1"
+export TFC_ORG="terraform-labs-${ACCOUNT_ID}"   # nombre de tu organización HCP
+export TFC_WORKSPACE="lab10-dev"               # nombre del workspace
+```
+
+## Dependencias entre pasos
+
+| Paso | Requiere | Variables que genera |
+|------|----------|----------------------|
+| Paso 1 — Registrar cuenta y organización | Correo electrónico | `TFC_ORG`, `TFC_TOKEN` |
+| Paso 2 — Crear project, workspace y configurar OIDC | Paso 1 | `TFC_PROJECT`, `TFC_WORKSPACE`, `OIDC_ROLE_ARN` |
+| Paso 3 — Configurar bloque `cloud {}` | Paso 1, Paso 2 | — |
+| Paso 4 — Migrar estado y desplegar | Paso 3 | `VPC_ID`, `SUBNET_ID` |
+| Paso 5 — Explorar la UI | Paso 4 | — |
+| Reto 1 | Paso 4 | — |
+| Reto 2 | Paso 4 | — |
+| Reto 3 | Paso 4 | — |
 
 ## Arquitectura
 
-![State splitting: capa de red y capa de cómputo con tfstates aislados, comunicadas vía terraform_remote_state](arch/diagrama.svg)
+![HCP Terraform como backend SaaS + ejecución remota + OIDC Dynamic Credentials → AWS sin secretos estáticos](arch/diagrama.svg)
 
-La solución es separar la infraestructura en proyectos Terraform independientes, cada uno con su propio estado. Cada capa solo gestiona los recursos de su dominio y expone una interfaz pública mínima a través de `output`. Un error o destrucción en la capa de cómputo **no toca** el estado de la capa de red — el blast radius queda contenido al dominio afectado.
+El bloque `cloud {}` en `providers.tf` es el único punto de unión entre el código local y
+la plataforma HCP. Terraform CLI se autentica con el token generado en el Paso 1 y delega
+la ejecución y el almacenamiento del estado al workspace configurado. Con OIDC Dynamic Credentials, los runs en HCP solicitan un JWT que intercambian por credenciales temporales de STS — sin almacenar `AWS_ACCESS_KEY_ID` en el workspace.
 
----
+## Conceptos clave
 
-## Conceptos Clave
+### HCP Terraform vs. Terraform OSS
 
-### Blast radius y el estado monolítico
+Terraform Open Source gestiona el estado localmente o en un backend remoto que tú
+configuras y mantienes (S3, GCS, Azure Blob…). HCP Terraform es la capa SaaS de
+HashiCorp que incluye:
 
-En un proyecto Terraform donde toda la infraestructura (red, cómputo, bases de datos, DNS…) comparte un único archivo de estado, cualquier operación arriesgada tiene un **blast radius máximo**:
+| Característica | Terraform OSS + S3 | HCP Terraform (Free) |
+|---|---|---|
+| Almacenamiento de estado | Bucket S3 (gestionas tú) | Gestionado por HCP |
+| State locking | DynamoDB o lockfile | Nativo, automático |
+| Historial de estados | Versiones S3 | UI con diff entre versiones |
+| Ejecución remota | No (solo local) | Sí (agentes HCP) |
+| Variables sensibles | `terraform.tfvars` o env vars | Vault interno del workspace |
+| Auditoría de runs | No | Log completo por run |
+| RBAC | No | Teams + permisos por workspace |
 
-- Un `terraform destroy` accidental puede eliminar toda la infraestructura de una vez.
-- Un error en el plan de la capa de cómputo bloquea también el despliegue de la capa de red, aunque esta no haya cambiado.
-- Dos equipos trabajando sobre el mismo estado pueden pisarse mutuamente al hacer `apply` en paralelo (condición de carrera en el lock).
+El plan **Free** de HCP Terraform incluye: organizaciones ilimitadas, 500 recursos
+gestionados, runs remotos, estado versionado y un usuario. Es suficiente para todos los
+ejercicios de este laboratorio.
 
-```
-Estado monolítico (un solo tfstate)
-┌─────────────────────────────────────────────┐
-│  aws_vpc + aws_subnet                       │  ← Red
-│  aws_security_group + aws_instance          │  ← Cómputo
-│  aws_db_instance                            │  ← Base de datos
-└─────────────────────────────────────────────┘
-         Un error aquí afecta a todo ↑
-```
+### Tipos de workspace
 
-### `output` como interfaz pública entre capas
+HCP Terraform soporta tres formas de conectar un workspace con el código fuente:
 
-Los outputs de un proyecto Terraform se almacenan en su archivo de estado. Actúan como la **API pública** de esa capa: todo lo que otras capas necesiten saber debe estar en un output; lo que no se exporta permanece encapsulado.
+- **CLI-driven**: el desarrollador ejecuta `terraform plan/apply` desde su terminal. El
+  CLI envía el código al workspace y la ejecución ocurre en los agentes de HCP. Es el
+  modo más parecido al flujo local y el que usamos en este laboratorio.
+- **VCS-driven**: el workspace está conectado a un repositorio Git (GitHub, GitLab…).
+  Cada push a la rama configurada dispara automáticamente un plan. El apply puede ser
+  manual o automático.
+- **API-driven**: el código se sube mediante la API de HCP, típicamente desde un pipeline
+  CI/CD personalizado.
+
+### Bloque `cloud {}` vs. `backend "remote"`
+
+A partir de Terraform 1.1, el bloque `cloud {}` reemplaza al bloque `backend "remote"`,
+que quedó deprecado. Las diferencias prácticas:
 
 ```hcl
-# network/outputs.tf — interfaz pública de la capa de red
-output "vpc_id" {
-  description = "ID de la VPC desplegada por la capa de red."
-  value       = aws_vpc.main.id
-}
-```
-
-### Data source `terraform_remote_state`
-
-Permite leer los outputs del estado remoto de otro proyecto Terraform sin acceder a sus recursos ni a su código. Es de **solo lectura**: nunca modifica el estado que lee.
-
-```hcl
-data "terraform_remote_state" "network" {
-  backend = "s3"                           # o "local" en LocalStack
-
-  config = {
-    bucket = var.network_state_bucket      # bucket S3 de la capa de red
-    key    = "lab10/network/terraform.tfstate"
-    region = "us-east-1"
+# ❌ Forma antigua — deprecada desde TF 1.1
+terraform {
+  backend "remote" {
+    hostname     = "app.terraform.io"
+    organization = "mi-org"
+    workspaces {
+      name = "mi-workspace"
+    }
   }
 }
 
-# Acceder a los outputs de la capa de red:
-local.vpc_id = data.terraform_remote_state.network.outputs.vpc_id
+# ✅ Forma moderna
+terraform {
+  cloud {
+    organization = "mi-org"
+    workspaces {
+      name = "mi-workspace"
+    }
+  }
+}
 ```
 
-Si la capa de red no ha sido desplegada, el data source falla inmediatamente en la capa de cómputo, sin tocar ningún recurso existente ni bloquear el estado de red.
+El bloque `cloud {}` también soporta `tags` en lugar de `name` para seleccionar
+dinámicamente un workspace según las etiquetas asignadas — útil cuando se gestiona
+múltiples workspaces con la misma configuración.
 
-### Tabla comparativa: monolítico vs capas
+### Modos de ejecución
 
-| Aspecto | Estado monolítico | Arquitectura de capas |
-|---|---|---|
-| Blast radius ante un error | Toda la infraestructura en riesgo | Contenido a la capa afectada |
-| Tiempo de `plan` | Crece con cada recurso añadido | Proporcional al tamaño de cada capa |
-| Trabajo en equipo | Un lock bloquea a todos | Cada equipo trabaja en su capa |
-| Granularidad de permisos | Un único rol con acceso a todo | Roles por capa (principio de mínimo privilegio) |
-| Complejidad inicial | Baja (un solo directorio) | Moderada (múltiples proyectos) |
+Cada workspace tiene un **Execution Mode** que determina dónde se ejecuta el plan y el
+apply:
 
----
+- **Remote** (por defecto): Terraform CLI serializa el directorio de trabajo y lo envía
+  a HCP. Los agentes de HCP ejecutan `terraform plan` y `terraform apply`. Las variables
+  de entorno configuradas en el workspace (incluidas las credenciales AWS) son inyectadas
+  automáticamente. Los logs se transmiten en tiempo real al terminal local y quedan
+  almacenados en HCP.
+- **Local**: el plan y el apply se ejecutan en la máquina local, pero el estado se lee y
+  escribe en HCP. Es útil cuando necesitas acceso a recursos de red privada o herramientas
+  locales durante la ejecución.
 
-## Estructura del proyecto
+### Variables en HCP Terraform
+
+El workspace tiene su propio almacén de variables, separado de los ficheros locales:
+
+- **Terraform variables**: equivalen a `TF_VAR_nombre`. Se pasan al plan como inputs.
+  Pueden marcarse como *Sensitive* para que no aparezcan en los logs.
+- **Environment variables**: se inyectan en el entorno del proceso Terraform durante la
+  ejecución. Con autenticación OIDC se usan para `TFC_AWS_PROVIDER_AUTH` y
+  `TFC_AWS_RUN_ROLE_ARN` — **nunca** para `AWS_ACCESS_KEY_ID` ni `AWS_SECRET_ACCESS_KEY`.
+
+### OIDC Dynamic Provider Credentials
+
+La forma tradicional de autenticar HCP Terraform contra AWS es almacenar
+`AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY` como variables de entorno en el workspace.
+Esto funciona, pero presenta dos problemas:
+
+1. **Credenciales de larga duración**: una clave de acceso es válida indefinidamente hasta
+   que se rota manualmente. Si se filtra (logs, historial de runs, error de configuración),
+   el atacante tiene acceso permanente.
+2. **Gestión operativa**: rotar claves en múltiples workspaces es una tarea manual propensa
+   a errores.
+
+**OIDC (OpenID Connect) Dynamic Provider Credentials** resuelve ambos problemas. El flujo
+es el siguiente:
+
+```
+HCP Terraform (agente)
+        │
+        │  1. Genera un JWT firmado por HCP
+        │     con claims sobre la organización,
+        │     workspace y fase del run
+        │
+        ▼
+AWS STS (AssumeRoleWithWebIdentity)
+        │
+        │  2. Verifica el JWT contra el
+        │     OIDC Identity Provider de AWS
+        │     (app.terraform.io)
+        │
+        │  3. Comprueba las condiciones
+        │     de la trust policy del rol IAM
+        │
+        ▼
+Credenciales temporales STS
+(válidas 1 hora, rotación automática)
+        │
+        ▼
+Provider AWS usa las credenciales
+para desplegar infraestructura
+```
+
+Las credenciales STS generadas son **temporales** (TTL de 1 hora), se rotan
+automáticamente en cada run y nunca se almacenan en el workspace. No hay ningún secreto
+que gestionar ni rotar.
+
+**Componentes IAM necesarios:**
+
+- **IAM OIDC Identity Provider**: registra `app.terraform.io` como fuente de identidad
+  de confianza en la cuenta AWS. Incluye el thumbprint TLS del certificado raíz del
+  servidor.
+- **IAM Role con trust policy**: permite que el OIDC provider asuma el rol, con
+  condiciones que acotan exactamente qué workspace (y opcionalmente qué fase del run:
+  `plan` o `apply`) puede hacerlo.
+
+**Variables de control en el workspace:**
+
+| Variable | Tipo | Valor | Descripción |
+|----------|------|-------|-------------|
+| `TFC_AWS_PROVIDER_AUTH` | Environment | `true` | Activa Dynamic Provider Credentials |
+| `TFC_AWS_RUN_ROLE_ARN` | Environment | ARN del rol | Rol que asumirá el agente HCP |
+
+### API Token
+
+Para que el CLI se autentique contra HCP existen tres tipos de token:
+
+| Tipo | Scope | Uso típico |
+|------|-------|------------|
+| **User token** | Todos los workspaces del usuario | Desarrollo local |
+| **Team token** | Workspaces del equipo | CI/CD compartido |
+| **Organization token** | Toda la organización | Automatización admin |
+
+`terraform login` genera y almacena automáticamente un **user token** en
+`~/.terraform.d/credentials.tfrc.json`.
+
+## Estructura objetivo
+
+> El repositorio parte vacío. Los ficheros siguientes se crean paso a paso durante el laboratorio.
 
 ```
 lab-10/
-├── arch/
-│   └── diagrama.svg          # Diagrama de arquitectura (referenciado en este README)
-├── aws/
-│   ├── network/
-│   │   ├── providers.tf      # Backend S3 (parcial) + provider AWS
-│   │   ├── variables.tf      # region, vpc_cidr
-│   │   ├── main.tf           # aws_vpc + aws_subnet
-│   │   ├── outputs.tf        # vpc_id, subnet_id, vpc_cidr
-│   │   └── aws.s3.tfbackend  # key = "lab10/network/terraform.tfstate"
-│   └── compute/
-│       ├── providers.tf      # Backend S3 (parcial) + provider AWS
-│       ├── variables.tf      # region, network_state_bucket, network_state_key
-│       ├── main.tf           # terraform_remote_state + aws_security_group
-│       ├── outputs.tf        # vpc_id, subnet_id, security_group_id
-│       └── aws.s3.tfbackend  # key = "lab10/compute/terraform.tfstate"
-└── localstack/
-    ├── README.md             # Instrucciones específicas de LocalStack
-    ├── network/
-    │   ├── providers.tf      # Backend local + provider LocalStack
-    │   ├── variables.tf      # region, vpc_cidr
-    │   ├── main.tf           # Idéntico a aws/network/
-    │   └── outputs.tf        # Idéntico a aws/network/
-    └── compute/
-        ├── providers.tf      # Backend local + provider LocalStack
-        ├── variables.tf      # network_state_path (ruta relativa al tfstate de red)
-        ├── main.tf           # terraform_remote_state (local) + aws_security_group
-        └── outputs.tf        # Idéntico a aws/compute/
+└── aws/
+    ├── providers.tf    Provider AWS ~>6.0, bloque cloud {} apuntando a HCP
+    ├── variables.tf    Variables: región, entorno, cidr_vpc, cidr_subnet
+    ├── main.tf         VPC + subnet pública + IGW + route table
+    └── outputs.tf      VPC ID, subnet ID, IGW ID
 ```
 
-> **Nota sobre la estructura:** Este laboratorio tiene dos subdirectorios por entorno (`network/` y `compute/`) en lugar del archivo plano de laboratorios anteriores. Cada subdirectorio es un proyecto Terraform independiente con su propio `terraform init`.
+> El IAM OIDC Identity Provider y el IAM Role se crean manualmente desde la consola de
+> AWS en el Paso 2 — no forman parte del estado de Terraform de este laboratorio.
 
 ---
 
-## Despliegue en AWS Real
+## Paso 1 — Registrar cuenta y crear organización
 
-### Prerrequisito: bucket S3 del lab02
+### Crear la cuenta en HCP Terraform
 
-Las capas de red y cómputo almacenan sus estados en el bucket compartido del curso creado en el lab02, bajo claves distintas (`lab10/network/` y `lab10/compute/`).
+1. Abre [app.terraform.io](https://app.terraform.io) en el navegador.
+2. Pulsa **Create an account**.
+3. Introduce nombre de usuario, correo electrónico y contraseña. Acepta los términos.
+4. Verifica el correo electrónico con el enlace que recibirás.
+5. Tras la verificación, la plataforma presenta automáticamente la pantalla
+   **Create an API token**. Introduce una descripción (p.ej. `lab10-token`) y define
+   la **fecha de expiración** del token.
+
+   > La fecha de expiración es una buena práctica de seguridad: un token sin expiración
+   > es válido indefinidamente y si se filtra (historial de shell, portapapeles, logs)
+   > otorga acceso permanente a la cuenta. Para un laboratorio puntual es suficiente con
+   > 7 días; en entornos de equipo se recomienda 30-90 días con rotación automatizada.
+
+6. Pulsa **Generate token** y **copia el valor generado** — la UI solo lo muestra
+   una vez.
+
+### Autenticar el CLI con el token generado
+
+Con el token copiado, ejecuta `terraform login` desde el terminal:
 
 ```bash
-# Exporta el nombre del bucket del lab02
-export STATE_BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
-
-# Verifica que el bucket existe y tiene versionado activo
-aws s3api get-bucket-versioning --bucket $STATE_BUCKET
-# {"Status": "Enabled"}
+terraform login
 ```
 
-Si el bucket no existe, vuelve al lab02 y ejecuta `terraform apply` antes de continuar.
+El CLI pedirá confirmación antes de abrir el navegador:
 
-### Código Terraform
+```
+Terraform will request an API token for app.terraform.io using your browser.
 
-**`aws/network/main.tf`** — Capa de Red:
+If login is successful, Terraform will store the token in plain text in
+the following file for use by subsequent commands:
+    ~/.terraform.d/credentials.tfrc.json
+
+Do you want to proceed?
+  Only 'yes' will be accepted to confirm.
+
+  Enter a value: yes
+```
+
+Introduce `yes`. El CLI abrirá el navegador en la página de tokens de HCP e indicará
+que pegues el token en el terminal:
+
+```
+---------------------------------------------------------------------------------
+
+Terraform must now open a web browser to the tokens page for app.terraform.io.
+
+If a browser does not open this automatically, open the following URL to proceed:
+    https://app.terraform.io/app/settings/tokens?source=terraform-login
+
+---------------------------------------------------------------------------------
+
+Generate a token using your browser, and copy-paste it into this prompt.
+
+Terraform will store the token in plain text in the following file
+for use by subsequent commands:
+    ~/.terraform.d/credentials.tfrc.json
+
+Token for app.terraform.io:
+  Enter a value:
+```
+
+Pega el token que copiaste en el paso anterior y pulsa Enter. Salida esperada:
+
+```
+Retrieved token for user <tu-usuario>
+
+
+---------------------------------------------------------------------------------
+
+                                          -
+                                          -----                           -
+                                          ---------                      --
+                                          ---------  -                -----
+                                           ---------  ------        -------
+                                             -------  ---------  ----------
+                                                ----  ---------- ----------
+                                                  --  ---------- ----------
+   Welcome to HCP Terraform!                       -  ---------- -------
+                                                      ---  ----- ---
+   Documentation: terraform.io/docs/cloud             --------   -
+                                                      ----------
+                                                      ----------
+                                                       ---------
+                                                           -----
+                                                               -
+
+
+   New to HCP Terraform? Follow these steps to instantly apply an example configuration:
+
+   $ git clone https://github.com/hashicorp/tfc-getting-started.git
+   $ cd tfc-getting-started
+   $ scripts/setup.sh
+```
+
+El token queda almacenado en `~/.terraform.d/credentials.tfrc.json` y será usado
+automáticamente por cualquier comando `terraform` que necesite comunicarse con HCP.
+
+### Crear la organización
+
+Una organización es el contenedor raíz en HCP. Todos los workspaces, equipos y políticas
+pertenecen a una organización.
+
+1. En la sección de Organizations del menú principal selecciona **Create organization** y elige **Personal**
+2. Cuando se pida el nombre de la organización, usa `terraform-labs-<ACCOUNT_ID>` (o
+   cualquier nombre único — los nombres de organización son globales en HCP).
+3. Introduce tu correo electrónico como dirección de notificaciones.
+4. Pulsa **Create organization**.
+
+```bash
+# Guarda el nombre de tu organización en la variable de entorno
+export TFC_ORG="<nombre-de-tu-organización>"
+```
+
+### Verificar la autenticación del CLI
+
+Confirma que el token quedó almacenado correctamente:
+
+```bash
+cat ~/.terraform.d/credentials.tfrc.json
+```
+
+```json
+{
+  "credentials": {
+    "app.terraform.io": {
+      "token": "REDACTED"
+    }
+  }
+}
+```
+
+---
+
+## Paso 2 — Crear workspace y configurar OIDC
+
+### Crear el project
+
+En HCP Terraform, un **project** es un agrupador de workspaces dentro de una
+organización. Permite organizar los workspaces por equipo, aplicación o entorno y
+aplicar permisos de acceso a nivel de proyecto en lugar de workspace a workspace.
+
+1. En la UI de HCP, selecciona tu organización.
+2. En el menú lateral, pulsa **Projects** → **+ New project**.
+3. **Name**: `lab10`.
+4. **Description**: `Proyecto para el Laboratorio 10 — HCP Terraform como Backend Remoto`.
+5. Pulsa **Create**.
+
+> El proyecto `Default Project` existe en todas las organizaciones y es donde se asignan
+> los workspaces si no se especifica otro. Para este laboratorio creamos un proyecto
+> propio para ilustrar la separación de recursos, y porque el claim `sub` del JWT OIDC
+> incluye el nombre del proyecto — lo que permite acotar la trust policy del rol IAM
+> a workspaces de un proyecto concreto.
+
+### Crear el workspace CLI-driven
+
+1. Dentro del proyecto `lab10`, pulsa **+ New workspace**.
+2. Elige **CLI-driven workflow**.
+3. **Name**: `lab10-dev`.
+4. **Description**: `Laboratorio 10 — VPC sencilla desplegada desde CLI`.
+5. Verifica que el campo **Project** muestra `lab10`.
+6. En **Add key value tags** añade las etiquetas:
+
+   | Clave | Valor |
+   |-------|-------|
+   | `lab10` | Sin valor |
+   | `environment` | `dev` |
+   | `cloud` | `aws` |
+
+   > Las etiquetas del workspace permiten agrupar y filtrar workspaces en la UI y
+   > son el mecanismo que usa el bloque `cloud { workspaces { tags = [...] } }` para
+   > seleccionar dinámicamente el workspace destino en lugar de fijarlo por nombre
+   > (útil cuando se gestionan múltiples entornos con la misma configuración, como se
+   > verá en el Reto 3).
+
+7. Pulsa **Create**.
+
+### Crear el IAM OIDC Identity Provider desde la consola AWS
+
+Abre la **consola de AWS → IAM → Identity providers → Add provider**.
+
+1. **Provider type**: selecciona **OpenID Connect**.
+2. **Provider URL**: introduce `https://app.terraform.io` y pulsa **Get thumbprint**.
+3. **Audience**: introduce `aws.workload.identity`.
+   Esta es la audiencia que HCP Terraform incluye en el JWT que firma para cada run.
+   Debe coincidir exactamente — es el primer filtro que AWS aplica antes de evaluar
+   la trust policy del rol.
+4. Pulsa **Add provider**.
+
+Una vez creado, la consola mostrará el detalle del Identity Provider. Copia el valor
+del campo **ARN** — lo necesitarás para construir la trust policy del rol en el
+siguiente paso. Tiene el formato:
+
+```
+arn:aws:iam::<ACCOUNT_ID>:oidc-provider/app.terraform.io
+```
+
+### Crear el IAM Role desde la consola AWS
+
+> **Requisito previo:** el Identity Provider `app.terraform.io` debe existir antes de
+> crear el rol. En el formulario de creación del rol, el campo **Identity provider**
+> solo lista los proveedores OIDC ya registrados en la cuenta — si el IdP no está
+> creado, `app.terraform.io` no aparecerá en el desplegable.
+
+Abre la **consola de AWS → IAM → Roles → Create role**.
+
+**Paso 1 — Trusted entity type:**
+
+1. Selecciona **Custom trust policy**.
+2. Sustituye el contenido del editor por la siguiente política, reemplazando los dos
+   valores marcados con el ARN del IdP que copiaste en el paso anterior y el nombre
+   de tu organización HCP:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "<ARN_DEL_IDP>"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "app.terraform.io:aud": "aws.workload.identity"
+                },
+                "StringLike": {
+                    "app.terraform.io:sub": "organization:<TU_ORG>:project:*:workspace:*:run_phase:*"
+                }
+            }
+        }
+    ]
+}
+```
+
+Los wildcards `*` en `project` y `workspace` permiten que cualquier workspace de tu
+organización asuma este rol. En un entorno real se acotan a proyecto y workspace
+concretos para aplicar el principio de mínimo privilegio; para este laboratorio la
+amplitud es suficiente y simplifica la configuración.
+
+3. Pulsa **Next**.
+
+**Paso 2 — Permisos:**
+
+Busca y selecciona la política **AdministratorAccess**.
+
+> ⚠️ **Solo para laboratorio**: en producción nunca se conceden permisos de administrador
+> a un rol de CI/CD. Lo correcto es definir una política de mínimo privilegio con
+> únicamente las acciones que Terraform necesita para los recursos que gestiona. Para
+> este laboratorio se usa `AdministratorAccess` por practicidad, ya que el conjunto de
+> acciones varía según los recursos que se despliegan en cada reto.
+
+**Paso 3 — Name, review and create:**
+
+- **Role name**: `lab10-terraform-cloud-role`
+- **Description**: `Rol asumido por HCP Terraform via OIDC para desplegar recursos.`
+- Pulsa **Create role**.
+
+**Copia el ARN del rol creado.**
+
+### Configurar las variables de control OIDC en el workspace de HCP Terraform
+
+Con el rol creado, vuelve a la **consola de HCP Terraform** y configura las variables
+que activan Dynamic Provider Credentials en el workspace:
+
+1. Ve a `app.terraform.io` → tu organización → workspace `lab10-dev` → **Variables**.
+2. Pulsa **+ Add variable** → selecciona **Environment variable**.
+3. Añade las dos variables siguientes:
+
+| Key | Value | Sensitive |
+|-----|-------|-----------|
+| `TFC_AWS_PROVIDER_AUTH` | `true` | No |
+| `TFC_AWS_RUN_ROLE_ARN` | ARN del rol (p.ej. `arn:aws:iam::123456789012:role/lab10-terraform-cloud-role`) | No |
+
+Estas son las **únicas** variables de entorno que necesita el workspace — no hay ninguna
+clave de acceso que gestionar ni rotar.
+
+> **Cómo funciona en tiempo de run:** cuando HCP Terraform arranca un run, el agente
+> detecta `TFC_AWS_PROVIDER_AUTH=true`, genera un JWT firmado con los claims del
+> workspace (`organization`, `workspace`, `run_phase`) y llama a
+> `sts:AssumeRoleWithWebIdentity` con ese token. AWS verifica la firma contra el OIDC
+> Identity Provider registrado, evalúa las condiciones `StringEquals` (audiencia) y
+> `StringLike` (claim `sub`) de la trust policy y, si todo coincide, devuelve
+> credenciales STS temporales válidas durante 1 hora. El provider AWS las recibe
+> automáticamente sin que el operador haya tocado ninguna clave.
+
+### Flujo de autenticación OIDC
+
+```
+  DESARROLLADOR                  TERRAFORM CLOUD                         AWS
+       │                               │                                  │
+       │  terraform apply              │                                  │
+       ├──────────────────────────────►│                                  │
+       │                               │                                  │
+       │                     ┌─────────┴───────────┐                      │
+       │                     │  Agente HCP genera  │                      │
+       │                     │  JWT firmado con:   │                      │
+       │                     │  · aud: aws.workload│                      │
+       │                     │    .identity        │                      │
+       │                     │  · sub: org/project │                      │
+       │                     │    /workspace/phase │                      │
+       │                     └─────────┬───────────┘                      │
+       │                               │                                  │
+       │                               │  AssumeRoleWithWebIdentity       │
+       │                               │  · RoleArn: TFC_AWS_RUN_ROLE_ARN │
+       │                               │  · WebIdentityToken: <JWT>       │
+       │                               ├─────────────────────────────────►│
+       │                               │                                  │
+       │                               │                    ┌─────────────┴──────────┐
+       │                               │                    │  AWS STS verifica:     │
+       │                               │                    │  1. Firma del JWT      │
+       │                               │                    │     contra el IdP      │
+       │                               │                    │     (app.terraform.io) │
+       │                               │                    │  2. aud == "aws.       │
+       │                               │                    │     workload.          │
+       │                               │                    │     identity"          │
+       │                               │                    │  3. sub coincide con   │
+       │                               │                    │     StringLike de la   │
+       │                               │                    │     trust policy       │
+       │                               │                    └─────────────┬──────────┘
+       │                               │                                  │
+       │                               │  Credenciales STS temporales     │
+       │                               │  · AccessKeyId (TTL: 1 hora)     │
+       │                               │  · SecretAccessKey               │
+       │                               │  · SessionToken                  │
+       │                               │◄─────────────────────────────────┤
+       │                               │                                  │
+       │                     ┌─────────┴───────────┐                      │
+       │                     │  Provider AWS usa   │                      │
+       │                     │  las credenciales   │                      │
+       │                     │  para desplegar     │                      │
+       │                     │  la infraestructura │                      │
+       │                     └─────────┬───────────┘                      │
+       │                               │                                  │
+       │                               │  ec2:CreateVpc, etc.             │
+       │                               ├─────────────────────────────────►│
+       │                               │                                  │
+       │                               │  Recursos creados                │ 
+       │                               │◄─────────────────────────────────┤
+       │                               │                                  │
+       │  Apply complete!              │                                  │
+       │◄──────────────────────────────┤                                  │
+       │                               │                                  │
+```
+
+En ningún momento el desarrollador ni el workspace almacenan credenciales AWS de larga
+duración. Las credenciales STS expiran automáticamente al finalizar el run.
+
+---
+
+## Paso 3 — Configurar el bloque `cloud {}` y migrar el estado
+
+### Código Terraform del laboratorio
+
+Crea los ficheros en `labs/lab-10/aws/`:
+
+**`providers.tf`:**
 
 ```hcl
+terraform {
+  required_version = ">= 1.1"
+
+  # El bloque cloud {} sustituye a backend "s3" del lab07.
+  # La autenticación usa el token almacenado por "terraform login".
+  # No hay credenciales en el código — el token vive en ~/.terraform.d/credentials.tfrc.json
+  cloud {
+    organization = "REEMPLAZA_CON_TU_ORG"
+
+    workspaces {
+      name = "lab10-dev"
+    }
+  }
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = {
+      Lab       = "lab10"
+      ManagedBy = "terraform"
+    }
+  }
+}
+```
+
+> Sustituye `"REEMPLAZA_CON_TU_ORG"` por el nombre de tu organización HCP antes de
+> ejecutar `terraform init`. El nombre de la organización es sensible a mayúsculas.
+
+**`variables.tf`:**
+
+```hcl
+variable "region" {
+  description = "Región AWS donde desplegar los recursos."
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "environment" {
+  description = "Nombre del entorno (dev, staging, prod)."
+  type        = string
+  default     = "dev"
+}
+
+variable "cidr_vpc" {
+  description = "Bloque CIDR de la VPC."
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "cidr_subnet" {
+  description = "Bloque CIDR de la subnet pública."
+  type        = string
+  default     = "10.0.1.0/24"
+}
+```
+
+**`main.tf`:**
+
+```hcl
+# Resuelve la primera AZ disponible de la region sin asumir su sufijo.
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_support   = true
+  cidr_block           = var.cidr_vpc
   enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
-    Name      = "vpc-lab10"
-    ManagedBy = "terraform"
-    Layer     = "network"
+    Name        = "lab10-vpc-${var.environment}"
+    Environment = var.environment
   }
 }
 
 resource "aws_subnet" "public" {
-  vpc_id     = aws_vpc.main.id
-  cidr_block = cidrsubnet(var.vpc_cidr, 8, 1)
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.cidr_subnet
+  map_public_ip_on_launch = true
+  availability_zone       = data.aws_availability_zones.available.names[0]
 
   tags = {
-    Name      = "subnet-public-lab10"
-    ManagedBy = "terraform"
-    Layer     = "network"
+    Name        = "lab10-subnet-public-${var.environment}"
+    Environment = var.environment
   }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "lab10-igw-${var.environment}"
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "lab10-rt-public-${var.environment}"
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
 }
 ```
 
-**`aws/network/outputs.tf`** — Interfaz pública de la capa de red:
+**`outputs.tf`:**
 
 ```hcl
 output "vpc_id" {
-  description = "ID de la VPC desplegada por la capa de red."
+  description = "ID de la VPC desplegada."
   value       = aws_vpc.main.id
 }
 
 output "subnet_id" {
-  description = "ID de la subred pública."
+  description = "ID de la subnet pública."
   value       = aws_subnet.public.id
 }
 
-output "vpc_cidr" {
-  description = "Bloque CIDR de la VPC."
-  value       = aws_vpc.main.cidr_block
+output "igw_id" {
+  description = "ID del Internet Gateway."
+  value       = aws_internet_gateway.main.id
 }
 ```
 
-**`aws/compute/main.tf`** — Capa de Cómputo que consume la red:
-
-```hcl
-data "terraform_remote_state" "network" {
-  backend = "s3"
-
-  config = {
-    bucket = var.network_state_bucket
-    key    = var.network_state_key
-    region = var.region
-  }
-}
-
-locals {
-  vpc_id    = data.terraform_remote_state.network.outputs.vpc_id
-  subnet_id = data.terraform_remote_state.network.outputs.subnet_id
-}
-
-resource "aws_security_group" "app" {
-  name        = "app-lab10"
-  description = "Security group de la capa de computo (Lab10)"
-  vpc_id      = local.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name      = "app-lab10"
-    ManagedBy = "terraform"
-    Layer     = "compute"
-  }
-}
-```
-
-### Despliegue de la Capa de Red
+### Inicializar y migrar el estado
 
 ```bash
-# Desde lab-10/aws/network/
+cd labs/lab-10/aws
 
-terraform fmt
-terraform init \
-  -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=$STATE_BUCKET"
+terraform init
+```
 
+Salida esperada:
+
+```
+Initializing HCP Terraform...
+
+Initializing provider plugins...
+- Finding hashicorp/aws versions matching "~> 6.0"...
+- Installing hashicorp/aws v6.40.0...
+- Installed hashicorp/aws v6.40.0 (signed by HashiCorp)
+
+Terraform has created a lock file .terraform.lock.hcl to record the provider
+selections it made above. Include this file in your version control repository
+so that Terraform can guarantee to make the same selections by default when
+you run "terraform init" in the future.
+
+HCP Terraform has been successfully initialized!
+
+You may now begin working with HCP Terraform. Try running "terraform plan" to
+see any changes that are required for your infrastructure.
+
+If you ever set or change modules or Terraform Settings, run "terraform init"
+again to reinitialize your working directory.
+```
+
+> Si el directorio contiene un `terraform.tfstate` local de una ejecución previa,
+> `terraform init` ofrecerá migrarlo al workspace de HCP. Responde `yes` para transferir
+> el estado existente. Una vez migrado, el fichero local puede eliminarse con seguridad.
+
+---
+
+## Paso 4 — Desplegar la infraestructura
+
+### Plan remoto
+
+```bash
 terraform plan
+```
+
+El CLI serializa el directorio de trabajo, lo envía al workspace de HCP y los logs del
+plan se transmiten en tiempo real al terminal:
+
+```
+Running plan in HCP Terraform. Output will stream here. Pressing Ctrl-C
+will stop streaming the logs, but will not stop the plan running remotely.
+
+Preparing the remote plan...
+
+To view this run in a browser, visit:
+https://app.terraform.io/app/terraform-labs-774126907062/lab10-dev/runs/run-LRaASBFEhxyrwS6J
+
+Waiting for the plan to start...
+
+Terraform v1.14.8
+on linux_amd64
+Initializing plugins and modules...
+
+Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the
+following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # aws_internet_gateway.main will be created
+  + resource "aws_internet_gateway" "main" {
+      + arn      = (known after apply)
+      + id       = (known after apply)
+      + owner_id = (known after apply)
+      + region   = "us-east-1"
+      + tags     = {
+          + "Name" = "lab10-igw-dev"
+        }
+      + tags_all = {
+          + "Lab"       = "lab10"
+          + "ManagedBy" = "terraform"
+          + "Name"      = "lab10-igw-dev"
+        }
+      + vpc_id   = (known after apply)
+    }
+
+  # aws_route_table.public will be created
+  + resource "aws_route_table" "public" {
+      + arn              = (known after apply)
+      + id               = (known after apply)
+      + owner_id         = (known after apply)
+      + propagating_vgws = (known after apply)
+      + region           = "us-east-1"
+      + route            = [
+          + {
+              + cidr_block                 = "0.0.0.0/0"
+              + gateway_id                 = (known after apply)
+                # (11 unchanged attributes hidden)
+            },
+        ]
+      + tags             = {
+          + "Name" = "lab10-rt-public-dev"
+        }
+      + tags_all         = {
+          + "Lab"       = "lab10"
+          + "ManagedBy" = "terraform"
+          + "Name"      = "lab10-rt-public-dev"
+        }
+      + vpc_id           = (known after apply)
+    }
+
+  # aws_route_table_association.public will be created
+  + resource "aws_route_table_association" "public" {
+      + id             = (known after apply)
+      + region         = "us-east-1"
+      + route_table_id = (known after apply)
+      + subnet_id      = (known after apply)
+    }
+
+  # aws_subnet.public will be created
+  + resource "aws_subnet" "public" {
+      + arn                                            = (known after apply)
+      + assign_ipv6_address_on_creation                = false
+      + availability_zone                              = "us-east-1a"
+      + availability_zone_id                           = (known after apply)
+      + cidr_block                                     = "10.0.1.0/24"
+      + enable_dns64                                   = false
+      + enable_resource_name_dns_a_record_on_launch    = false
+      + enable_resource_name_dns_aaaa_record_on_launch = false
+      + id                                             = (known after apply)
+      + ipv6_cidr_block                                = (known after apply)
+      + ipv6_cidr_block_association_id                 = (known after apply)
+      + ipv6_native                                    = false
+      + map_public_ip_on_launch                        = true
+      + owner_id                                       = (known after apply)
+      + private_dns_hostname_type_on_launch            = (known after apply)
+      + region                                         = "us-east-1"
+      + tags                                           = {
+          + "Environment" = "dev"
+          + "Name"        = "lab10-subnet-public-dev"
+        }
+      + tags_all                                       = {
+          + "Environment" = "dev"
+          + "Lab"         = "lab10"
+          + "ManagedBy"   = "terraform"
+          + "Name"        = "lab10-subnet-public-dev"
+        }
+      + vpc_id                                         = (known after apply)
+    }
+
+  # aws_vpc.main will be created
+  + resource "aws_vpc" "main" {
+      + arn                                  = (known after apply)
+      + cidr_block                           = "10.0.0.0/16"
+      + default_network_acl_id               = (known after apply)
+      + default_route_table_id               = (known after apply)
+      + default_security_group_id            = (known after apply)
+      + dhcp_options_id                      = (known after apply)
+      + enable_dns_hostnames                 = true
+      + enable_dns_support                   = true
+      + enable_network_address_usage_metrics = (known after apply)
+      + id                                   = (known after apply)
+      + instance_tenancy                     = "default"
+      + ipv6_association_id                  = (known after apply)
+      + ipv6_cidr_block                      = (known after apply)
+      + ipv6_cidr_block_network_border_group = (known after apply)
+      + main_route_table_id                  = (known after apply)
+      + owner_id                             = (known after apply)
+      + region                               = "us-east-1"
+      + tags                                 = {
+          + "Environment" = "dev"
+          + "Name"        = "lab10-vpc-dev"
+        }
+      + tags_all                             = {
+          + "Environment" = "dev"
+          + "Lab"         = "lab10"
+          + "ManagedBy"   = "terraform"
+          + "Name"        = "lab10-vpc-dev"
+        }
+    }
+
+Plan: 5 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + igw_id    = (known after apply)
+  + subnet_id = (known after apply)
+  + vpc_id    = (known after apply)
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Note: You didn't use the -out option to save this plan, so Terraform can't guarantee to take exactly these actions if
+you run "terraform apply" now.
+```
+
+Fíjate en la línea `To view this run in a browser`. Abre esa URL para ver el run en la
+UI de HCP mientras se ejecuta.
+
+### Apply remoto
+
+```bash
 terraform apply
 ```
 
-Los outputs mostrarán los identificadores que usará la capa de cómputo:
+Con el modo de ejecución **Remote**, el apply también corre en los agentes de HCP.
+Terraform pedirá confirmación en el terminal y, tras aceptar, mostrará la URL de
+seguimiento antes de comenzar la ejecución:
 
 ```
-subnet_id = "subnet-0a1b2c3d4e5f67890"
-vpc_cidr  = "10.0.0.0/16"
-vpc_id    = "vpc-0a1b2c3d4e5f67890"
+Do you want to perform these actions in workspace "lab10-dev"?
+  Terraform will perform the actions described above.
+  Only 'yes' will be accepted to approve.
+
+  Enter a value: yes
 ```
 
-### Despliegue de la Capa de Cómputo
+```
+Running apply in HCP Terraform. Output will stream here. Pressing Ctrl-C
+will cancel the remote apply if it's still pending. If the apply started it
+will stop streaming the logs, but will not stop the apply running remotely.
+
+Preparing the remote apply...
+
+To view this run in a browser, visit:
+https://app.terraform.io/app/terraform-labs-774126907062/lab10-dev/runs/run-wnMVLvkxGZa2rwms
+
+Waiting for the plan to start...
+```
+
+Salida tras el apply exitoso:
+
+```
+aws_vpc.main: Creating...
+aws_vpc.main: Creation complete after 2s [id=vpc-0xxxxxxxxxxxxxxxxx]
+aws_internet_gateway.main: Creating...
+aws_subnet.public: Creating...
+aws_subnet.public: Creation complete after 1s [id=subnet-0xxxxxxxxxxxxxxxxx]
+aws_internet_gateway.main: Creation complete after 1s [id=igw-0xxxxxxxxxxxxxxxxx]
+aws_route_table.public: Creating...
+aws_route_table.public: Creation complete after 1s [id=rtb-0xxxxxxxxxxxxxxxxx]
+aws_route_table_association.public: Creating...
+aws_route_table_association.public: Creation complete after 0s [id=rtbassoc-0xxxxxxxxxxxxxxxxx]
+
+Apply complete! Resources: 5 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+igw_id    = "igw-0xxxxxxxxxxxxxxxxx"
+subnet_id = "subnet-0xxxxxxxxxxxxxxxxx"
+vpc_id    = "vpc-0xxxxxxxxxxxxxxxxx"
+```
+
+Captura los outputs en variables de entorno para usarlos en los pasos siguientes:
 
 ```bash
-# Desde lab-10/aws/compute/
-
-terraform fmt
-terraform init \
-  -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=$STATE_BUCKET"
-
-terraform plan -var="network_state_bucket=$STATE_BUCKET"
-terraform apply -var="network_state_bucket=$STATE_BUCKET"
+VPC_ID=$(terraform output -raw vpc_id)
+SUBNET_ID=$(terraform output -raw subnet_id)
+echo "VPC    : $VPC_ID"
+echo "Subnet : $SUBNET_ID"
 ```
 
-Los outputs confirman que `vpc_id` y `subnet_id` son los mismos valores que exportó la capa de red:
+---
 
-```
-security_group_id = "sg-0a1b2c3d4e5f67890"
-subnet_id         = "subnet-0a1b2c3d4e5f67890"
-vpc_id            = "vpc-0a1b2c3d4e5f67890"
-```
+## Paso 5 — Explorar la UI de HCP Terraform
 
-### Verificación del Aislamiento (Blast Radius)
+### Vista Runs
 
-Esta es la demostración central del laboratorio. Vas a destruir completamente la capa de cómputo y verificar que la capa de red no se ve afectada.
+En `https://app.terraform.io/app/<TU_ORG>/workspaces/lab10-dev/runs` verás el
+historial completo de ejecuciones. Cada run muestra:
 
-**Paso 1** — Destruye la capa de cómputo:
+- Estado: **Applied**, **Planned**, **Errored**, **Discarded**
+- Quién lo inició y desde qué fuente (CLI, VCS, API)
+- Timestamp de inicio y duración
+- El plan completo y los logs del apply
+- Los cambios de estado entre la versión anterior y la actual
+
+Abre el run del apply que acabas de ejecutar y explora las pestañas **Plan** y **Apply**
+para ver los logs completos tal como los vieron los agentes de HCP.
+
+### Vista States
+
+En `https://app.terraform.io/app/<TU_ORG>/workspaces/lab10-dev/states` verás todas
+las versiones del estado. Cada apply genera una nueva versión. Haz clic en cualquier
+versión para ver el contenido completo del estado y el **diff** respecto a la versión
+anterior — qué recursos se añadieron, modificaron o eliminaron.
 
 ```bash
-# Desde lab-10/aws/compute/
-
-terraform destroy -var="network_state_bucket=$STATE_BUCKET"
+# También puedes leer el estado remoto desde el CLI sin descargarlo localmente
+terraform show
 ```
 
-Terraform destruye únicamente el security group. Confirma que el plan muestra:
+### Vista Variables
 
-```
-Plan: 0 to add, 0 to change, 1 to destroy.
-```
+En `https://app.terraform.io/app/<TU_ORG>/workspaces/lab10-dev/variables` puedes
+añadir, editar y eliminar variables sin tocar el código. Las variables Sensitive aparecen
+como `****` — no se pueden leer, solo sobreescribir.
 
-**Paso 2** — Verifica que la capa de red no fue afectada:
+Prueba a añadir una Terraform variable:
 
-```bash
-# Desde lab-10/aws/network/
+1. Pulsa **+ Add variable** → **Terraform variable**
+2. Key: `environment`, Value: `dev`
+3. Deja Sensitive desactivado
+4. Pulsa **Save variable**
 
-terraform state list
-```
+En el próximo plan, esta variable sobreescribirá el valor por defecto definido en
+`variables.tf` sin necesidad de un fichero `.tfvars`.
 
-Resultado esperado:
+### Vista Settings → Execution Mode
 
-```
-aws_subnet.public
-aws_vpc.main
-```
+En **Settings → General** puedes cambiar el Execution Mode del workspace entre
+**Remote** y **Local**. El cambio es inmediato y no requiere `terraform init`. En Local,
+el siguiente `terraform plan` correrá en tu máquina pero el estado seguirá leyéndose y
+escribiéndose en HCP.
 
-El estado de la capa de red permanece intacto. Ningún recurso fue destruido ni modificado.
+### Vista Settings → Notifications
 
-**Paso 3** — Confirma que la VPC sigue existiendo en AWS:
+En **Settings → Notifications** puedes configurar alertas automáticas que HCP Terraform
+enviará cuando ocurran eventos en el workspace. Es útil para mantener informado al
+equipo sin tener que monitorizar la UI manualmente.
 
-```bash
-aws ec2 describe-vpcs \
-  --filters "Name=tag:ManagedBy,Values=terraform" \
-           "Name=tag:Layer,Values=network" \
-  --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock,State:State}' \
-  --output table
-```
+**Tipos de destino disponibles:**
 
-La VPC aparece con `State = available`. El blast radius del destroy de cómputo quedó contenido.
+| Destino | Descripción |
+|---------|-------------|
+| **Email** | Notifica a los miembros de la organización seleccionados |
+| **Slack** | Publica un mensaje en un canal via Incoming Webhook |
+| **Microsoft Teams** | Publica en un canal via Incoming Webhook |
+| **Webhook** | Envía un HTTP POST a una URL arbitraria con el payload del evento |
 
-**Paso 4** — Redespliega la capa de cómputo sin tocar la de red:
+**Eventos configurables:**
 
-```bash
-# Desde lab-10/aws/compute/
+| Evento | Cuándo se dispara |
+|--------|-------------------|
+| `Created` | Se crea un nuevo run |
+| `Planning` | El plan comienza a ejecutarse |
+| `Needs Attention` | El plan completó pero requiere confirmación manual |
+| `Applying` | El apply comienza a ejecutarse |
+| `Completed` | El apply finalizó correctamente |
+| `Errored` | El plan o el apply terminó con error |
 
-terraform apply -var="network_state_bucket=$STATE_BUCKET"
-```
+Para explorar la sección:
 
-El security group se recrea referenciando el mismo `vpc_id` que ya existía. La capa de red nunca fue interrumpida.
+1. Ve a **Settings → Notifications → Create a notification**.
+2. Selecciona **Email** como destino.
+3. En **Triggers**, activa **Completed** y **Errored**.
+4. En **Recipients**, añade tu dirección de correo.
+5. Pulsa **Create notification** — HCP enviará un correo de prueba para verificar
+   la configuración.
 
-### Consultar el Estado Remoto Directamente
-
-Puedes leer los outputs de la capa de red en cualquier momento sin necesidad de estar en el directorio de red:
-
-```bash
-# Desde lab-10/aws/compute/ (o cualquier directorio)
-
-aws s3 cp s3://$STATE_BUCKET/lab10/network/terraform.tfstate - | \
-  python3 -c "import sys,json; s=json.load(sys.stdin); \
-  [print(k,'=',v['value']) for k,v in s['outputs'].items()]"
-```
-
-También puedes verificar que los dos estados son completamente independientes en S3:
-
-```bash
-aws s3 ls s3://$STATE_BUCKET/lab10/ --recursive
-# lab10/network/terraform.tfstate
-# lab10/compute/terraform.tfstate
-```
+> En un entorno de equipo, las notificaciones de tipo **Needs Attention** son
+> especialmente relevantes en workspaces con **Auto Apply** desactivado: alertan a los
+> revisores de que hay un plan pendiente de aprobación sin que tengan que consultar
+> la UI periódicamente.
 
 ---
 
 ## Verificación final
 
 ```bash
-# Verificar que la capa de red esta desplegada
-cd labs/lab-10/aws/network
-terraform output vpc_id
-terraform output subnet_id
+# Verifica que los recursos existen en AWS
+aws ec2 describe-vpcs \
+  --filters "Name=tag:Lab,Values=lab10" \
+  --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock,Estado:State}' \
+  --output table
 
-# Verificar que la capa de computo consume el estado de red
-cd ../compute
-terraform output security_group_id
+aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'Subnets[].{ID:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone}' \
+  --output table
 
-# Confirmar que terraform_remote_state lee correctamente los outputs de red
-terraform console <<'EOF'
-data.terraform_remote_state.network.outputs.vpc_id
-EOF
-
-# Verificar que no hay cambios pendientes en ninguna capa
-cd ../network && terraform plan -detailed-exitcode
-cd ../compute && terraform plan -detailed-exitcode -var="network_state_bucket=$STATE_BUCKET"
+aws ec2 describe-internet-gateways \
+  --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+  --query 'InternetGateways[].{ID:InternetGatewayId,Estado:Attachments[0].State}' \
+  --output table
 ```
+
+| Recurso | ID esperado | Estado |
+|---------|-------------|--------|
+| VPC | `vpc-0xxxxxxxxxxxxxxxxx` | `available` |
+| Subnet pública | `subnet-0xxxxxxxxxxxxxxxxx` | `available` |
+| Internet Gateway | `igw-0xxxxxxxxxxxxxxxxx` | `attached` |
 
 ---
 
 ## Retos
 
-### Reto 1 — Segunda Subred
+### Reto 1 — Cambiar el modo de ejecución a Local
 
-La capa de red actual despliega una sola subred pública. Tu tarea es añadir una segunda subred con un CIDR diferente y actualizar la capa de cómputo para que cree un segundo security group asociado a esa nueva subred.
+Cambia el workspace `lab10-dev` a modo de ejecución **Local** desde la UI
+(**Settings → General → Execution Mode → Local**) y ejecuta de nuevo `terraform plan`.
 
-**Requisitos**
+Observa las diferencias:
+- El plan se ejecuta en tu máquina, no en los agentes de HCP.
+- En la UI del workspace no aparece un nuevo run en la vista Runs.
+- El estado sigue leyéndose y escribiéndose en HCP.
 
-1. En `network/main.tf`, añade un recurso `aws_subnet.private` con `cidrsubnet(var.vpc_cidr, 8, 2)` y el tag `Name = "subnet-private-lab10"`.
+**Pregunta:** ¿En qué escenarios es útil el modo Local frente al modo Remote?
 
-2. En `network/outputs.tf`, añade el output `private_subnet_id` que exponga el ID de la nueva subred.
+**Pistas:**
+- El modo Local es útil cuando el código necesita acceder a recursos de red privada
+  (p.ej. un endpoint privado de RDS) que no son accesibles desde los agentes de HCP.
+- También es útil durante el desarrollo cuando se quiere iterar rápidamente sin
+  consumir tiempo de agente remoto.
 
-3. En `compute/main.tf`, añade un segundo security group `aws_security_group.internal` que referencie la nueva subred usando `data.terraform_remote_state.network.outputs.private_subnet_id`. Asocia el security group a la misma VPC.
+---
 
-4. Aplica los cambios en ambas capas **en orden** (primero red, luego cómputo) y verifica que los outputs de cómputo muestran el ID del nuevo security group.
+### Reto 2 — Variable de entorno vs. variable Terraform
 
-**Criterios de Éxito**
+Actualmente la región está definida en `variables.tf` con un valor por defecto
+(`us-east-1`). El objetivo de este reto es sobreescribirla **desde la UI del workspace**
+sin modificar ningún fichero.
 
-- La capa de red despliega dos subredes con CIDRs `10.0.1.0/24` y `10.0.2.0/24`.
-- La capa de cómputo despliega dos security groups, cada uno asociado a la misma VPC.
-- El output de red `private_subnet_id` es accesible desde la capa de cómputo vía `terraform_remote_state`.
-- Puedes destruir y redesplegar la capa de cómputo sin afectar la capa de red.
+1. En la UI, ve a **Variables** y añade una **Terraform variable**:
+   - Key: `region`, Value: `eu-west-1`
+2. Ejecuta `terraform plan` y observa que el plan propone recrear los recursos en
+   `eu-west-1`.
+3. **No apliques el plan** — pulsa **Discard** en la UI o interrumpe el apply con Ctrl-C.
+4. Elimina la variable del workspace para dejar la configuración en `us-east-1`.
 
-### Reto 2 — Regla de Ingreso Basada en el CIDR de la VPC
+**Pregunta:** ¿Qué diferencia hay entre definir `region` como variable Terraform y como
+variable de entorno `TF_VAR_region` en el workspace?
 
-La capa de red ya exporta `vpc_cidr` como output, pero la capa de cómputo no lo consume: solo usa `vpc_id` y `subnet_id`. El security group actual solo tiene una regla de salida (`egress`), lo que significa que no admite tráfico entrante de ningún origen.
+---
 
-Tu tarea es leer el CIDR de la VPC desde el estado de la capa de red y usarlo para añadir una regla de ingreso al security group que permita todo el tráfico interno de la VPC — **sin modificar ningún archivo de la capa de red**.
+### Reto 3 — Segundo workspace para producción
 
-**Requisitos**
+HCP Terraform permite gestionar múltiples entornos (dev, prod) con la misma
+configuración usando workspaces separados.
 
-1. En `compute/main.tf`, añade `vpc_cidr` al bloque `locals` leyéndolo desde `data.terraform_remote_state.network.outputs.vpc_cidr`.
+1. Crea un segundo workspace `lab10-prod` en la UI con las mismas credenciales AWS.
+2. Modifica el bloque `cloud {}` en `providers.tf` para usar `tags` en lugar de `name`:
 
-2. Añade un bloque `ingress` al recurso `aws_security_group.app` que use `local.vpc_cidr` como fuente de tráfico permitido (todos los puertos y protocolos dentro de la VPC).
+```hcl
+cloud {
+  organization = "<TU_ORG>"
 
-3. En `compute/outputs.tf`, añade un output `vpc_cidr` que exponga el CIDR consumido desde la capa de red.
+  workspaces {
+    tags = ["lab10"]
+  }
+}
+```
 
-4. Aplica el cambio **únicamente en la capa de cómputo** y verifica que los outputs `vpc_cidr` de ambas capas muestran el mismo valor.
+3. Asigna la etiqueta de cadena `lab10` a ambos workspaces desde la UI
+   (**Settings → Tags → Add tag**). Introduce `lab10` como texto plano — **no** uses
+   el formato clave-valor; el filtro `tags` del bloque `cloud {}` solo reconoce
+   etiquetas de cadena simple.
+4. Ejecuta `terraform init` — al cambiar de `name` a `tags` en el bloque `cloud {}`,
+   el CLI necesita reinicializarse para descubrir los workspaces asociados a esa etiqueta:
 
-**Criterios de Éxito**
+   ```bash
+   terraform init
+   ```
 
-- El plan de la capa de cómputo muestra `1 to change` (el security group actualizado con la regla de ingreso).
-- El plan de la capa de red muestra `No changes` — no se ha tocado ningún archivo de red.
-- El output `vpc_cidr` de la capa de cómputo coincide exactamente con el de la capa de red.
-- Destruir y redesplegar la capa de cómputo no afecta al estado de la capa de red.
+5. Ejecuta `terraform workspace list` para ver los workspaces disponibles.
+6. Selecciona `lab10-prod` con `terraform workspace select lab10-prod` y despliega
+   con un `cidr_vpc` diferente (`10.1.0.0/16`).
+
+**Pistas:**
+- Con `tags` en lugar de `name`, el CLI preguntará qué workspace usar en cada ejecución
+  si hay más de uno con ese tag.
+- Puedes fijar el workspace activo con la variable de entorno
+  `TF_WORKSPACE=lab10-prod`.
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Segunda Subred</strong></summary>
+<summary><strong>Solución al Reto 1 — Modo Local vs. Remote</strong></summary>
 
-### Solución al Reto 1 — Segunda Subred
+### Solución al Reto 1
 
-#### Paso 1 — Añadir la subred privada en `network/main.tf`
+**Cuándo usar modo Local:**
 
-```hcl
-resource "aws_subnet" "private" {
-  vpc_id     = aws_vpc.main.id
-  cidr_block = cidrsubnet(var.vpc_cidr, 8, 2)
+- El código de Terraform necesita invocar proveedores que requieren conectividad de red
+  privada (endpoints VPC, servidores on-premise).
+- Se usan herramientas locales en `null_resource` o `local-exec` que no están
+  disponibles en los agentes de HCP.
+- Durante el desarrollo activo, el ciclo plan-apply-fix es más rápido sin la latencia
+  de serializar y enviar el directorio a HCP.
 
-  tags = {
-    Name      = "subnet-private-lab10"
-    ManagedBy = "terraform"
-    Layer     = "network"
-  }
-}
-```
+**Cuándo usar modo Remote:**
 
-#### Paso 2 — Exportar el nuevo ID en `network/outputs.tf`
+- Entornos de equipo donde varios desarrolladores pueden lanzar plans/applies: Remote
+  garantiza que todos usan la misma versión de Terraform y los mismos providers.
+- Pipelines CI/CD: el apply se puede aprobar desde la UI por un revisor.
+- Cuando se quiere auditoría completa de runs con logs persistentes en HCP.
 
-```hcl
-output "private_subnet_id" {
-  description = "ID de la subred privada."
-  value       = aws_subnet.private.id
-}
-```
-
-#### Paso 3 — Aplicar la capa de red
-
-```bash
-# Desde network/
-terraform apply
-```
-
-El plan muestra `1 to add` (la nueva subred). Los recursos existentes no cambian.
-
-#### Paso 4 — Añadir el segundo security group en `compute/main.tf`
-
-```hcl
-resource "aws_security_group" "internal" {
-  name        = "internal-lab10"
-  description = "Security group interno de la capa de computo (Lab10)"
-  vpc_id      = local.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name      = "internal-lab10"
-    ManagedBy = "terraform"
-    Layer     = "compute"
-  }
-}
-```
-
-En `compute/outputs.tf`, añade:
-
-```hcl
-output "internal_security_group_id" {
-  description = "ID del Security Group interno."
-  value       = aws_security_group.internal.id
-}
-```
-
-#### Paso 5 — Aplicar la capa de cómputo
-
-```bash
-# Desde compute/
-# AWS real:
-terraform apply -var="network_state_bucket=$STATE_BUCKET"
-```
-
-El plan muestra `1 to add` (el nuevo security group). El security group existente no cambia y la capa de red no es tocada.
-
-#### Verificación
-
-```bash
-terraform output
-# internal_security_group_id = "sg-xxxxxxxx"
-# security_group_id          = "sg-yyyyyyyy"
-# subnet_id                  = "subnet-xxxxxxxx"
-# vpc_id                     = "vpc-xxxxxxxx"
-```
-
-Ambos security groups están en la misma VPC. La separación de capas permitió añadir la nueva subred y el nuevo security group sin ningún riesgo de afectar los recursos existentes de la capa de red.
+Para volver al modo Remote tras el reto:
+1. UI → **Settings → General → Execution Mode → Remote** → Save.
+2. El siguiente `terraform plan` volverá a ejecutarse en los agentes de HCP.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Regla de Ingreso Basada en el CIDR de la VPC</strong></summary>
+<summary><strong>Solución al Reto 2 — Variable de entorno vs. variable Terraform</strong></summary>
 
-### Solución al Reto 2 — Regla de Ingreso Basada en el CIDR de la VPC
+### Solución al Reto 2
 
-#### Paso 1 — Añadir `vpc_cidr` al bloque `locals` en `compute/main.tf`
+**Cómo llegar a las Variables del workspace:**
 
-```hcl
-locals {
-  vpc_id    = data.terraform_remote_state.network.outputs.vpc_id
-  subnet_id = data.terraform_remote_state.network.outputs.subnet_id
-  vpc_cidr  = data.terraform_remote_state.network.outputs.vpc_cidr
-}
-```
+1. Abre `app.terraform.io` e inicia sesión.
+2. En el menú lateral, selecciona tu organización → **Projects & workspaces**.
+3. Localiza el proyecto `lab10` y pulsa sobre el workspace `lab10-dev`.
+4. En el menú superior del workspace, pulsa **Variables**.
+5. En la sección **Workspace Variables**, pulsa **+ Add variable**.
+6. Selecciona **Terraform variable** (no Environment variable).
+7. Rellena:
+   - **Key**: `region`
+   - **Value**: `eu-west-1`
+   - Deja **Sensitive** desactivado — la región no es un dato sensible.
+8. Pulsa **Save variable**.
 
-El output `vpc_cidr` ya existe en la capa de red desde el inicio del laboratorio. Solo hay que referenciarlo.
+> **Requisito:** el workspace debe estar en modo de ejecución **Remote** para poder
+> definir variables desde la UI. Con el modo Local, la sección Variables queda
+> deshabilitada en la interfaz. Si completaste el Reto 1 y cambiaste el workspace a
+> Local, vuelve a **Settings → General → Execution Mode → Remote** antes de continuar.
 
-#### Paso 2 — Añadir el bloque `ingress` al security group en `compute/main.tf`
-
-```hcl
-resource "aws_security_group" "app" {
-  name        = "app-lab10"
-  description = "Security group de la capa de computo (Lab10)"
-  vpc_id      = local.vpc_id
-
-  ingress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = [local.vpc_cidr]
-    description = "Trafico interno de la VPC"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name      = "app-lab10"
-    ManagedBy = "terraform"
-    Layer     = "compute"
-  }
-}
-```
-
-#### Paso 3 — Añadir el output `vpc_cidr` en `compute/outputs.tf`
-
-```hcl
-output "vpc_cidr" {
-  description = "CIDR de la VPC consumido desde la capa de red."
-  value       = local.vpc_cidr
-}
-```
-
-#### Paso 4 — Aplicar solo la capa de cómputo
-
-```bash
-# Desde compute/
-
-terraform apply -var="network_state_bucket=$STATE_BUCKET"
-```
-
-El plan debe mostrar exactamente:
+Ejecuta `terraform plan` desde el terminal. El plan propone recrear todos los recursos
+en `eu-west-1` porque la variable del workspace sobreescribe el default del código:
 
 ```
-  # aws_security_group.app will be updated in-place
-  ~ resource "aws_security_group" "app" {
-      + ingress {
-          + cidr_blocks = ["10.0.0.0/16"]
-          + description = "Trafico interno de la VPC"
-          + from_port   = 0
-          + protocol    = "-1"
-          + to_port     = 0
-        }
+  # aws_subnet.public must be replaced
+  ~ resource "aws_subnet" "public" {
+      ~ availability_zone = "us-east-1a" -> "eu-west-1a"
+      ...
     }
-
-Plan: 0 to add, 1 to change, 0 to destroy.
 ```
 
-#### Paso 5 — Verificar que ambas capas muestran el mismo CIDR
+**No ejecutes el apply** — pulsa **Discard run** en la UI o interrumpe con Ctrl-C.
 
-```bash
-# Desde compute/
-terraform output vpc_cidr
-# "10.0.0.0/16"
+Para eliminar la variable y restaurar el default:
 
-# Desde network/
-terraform output vpc_cidr
-# "10.0.0.0/16"
+1. En **Variables**, localiza la fila `region`.
+2. Pulsa el icono de papelera → **Delete variable** → confirma.
+3. El siguiente plan usará el valor por defecto de `variables.tf` (`us-east-1`).
+
+---
+
+Cuando se define `region` como **Terraform variable** en el workspace (Key: `region`,
+Value: `eu-west-1`), HCP pasa el valor al plan exactamente igual que si estuviera en un
+fichero `.tfvars`. El plan ve `var.region = "eu-west-1"` y planifica los recursos en esa
+región.
+
+Si se usara `TF_VAR_region` como **Environment variable**, el efecto es idéntico porque Terraform lee la variable de la misma forma. La diferencia es de organización:
+
+| Mecanismo | Visible en el plan | Cifrable como Sensitive |
+|---|---|---|
+| `variable "region"` con default | Sí, valor en el código | No aplica |
+| Terraform variable en workspace | Sí, valor en la UI | Sí (oculta en logs) |
+| Environment variable `TF_VAR_region` | Sí | Sí (si se marca Sensitive) |
+
+</details>
+
+<details>
+<summary><strong>Solución al Reto 3 — Segundo workspace para producción</strong></summary>
+
+### Solución al Reto 3
+
+**`providers.tf` modificado con `tags`:**
+
+```hcl
+terraform {
+  required_version = ">= 1.1"
+
+  cloud {
+    organization = "<TU_ORG>"
+
+    workspaces {
+      tags = ["lab10"]
+    }
+  }
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = {
+      Lab       = "lab10"
+      ManagedBy = "terraform"
+    }
+  }
+}
 ```
 
-Los valores coinciden. La capa de cómputo leyó el CIDR directamente del estado de la capa de red mediante `terraform_remote_state`, sin duplicar ningún valor en el código. Si la capa de red cambiara el CIDR de la VPC en el futuro, la capa de cómputo lo recogería automáticamente en el siguiente `apply`, sin necesidad de modificar ningún archivo de cómputo.
+Después de modificar el bloque `cloud {}`, ejecuta `terraform init` para que el CLI
+recargue la configuración del workspace.
 
-#### Verificación del Aislamiento
-
-Confirma que la capa de red no fue modificada:
+**Seleccionar workspace y desplegar prod:**
 
 ```bash
-# Desde network/
-terraform plan
-# No changes. Your infrastructure matches the configuration.
+# Lista los workspaces disponibles con el tag "lab10"
+terraform workspace list
+
+# Selecciona prod
+terraform workspace select lab10-prod
+terraform apply \
+  -var="cidr_vpc=10.1.0.0/16" \
+  -var="cidr_subnet=10.1.1.0/24" \
+  -var="environment=prod"
+```
+
+**Verificar que los dos workspaces tienen estados independientes:**
+
+```bash
+# Estado de dev
+terraform workspace select lab10-dev
+terraform show
+
+# Estado de prod
+terraform workspace select lab10-prod
+terraform show
+```
+
+Cada workspace tiene su propio fichero de estado en HCP — modificar o destruir prod no
+afecta a dev.
+
+**Limpieza de prod:**
+
+```bash
+terraform workspace select lab10-prod
+terraform destroy
 ```
 
 </details>
@@ -645,63 +1397,142 @@ terraform plan
 
 ## Limpieza
 
-Destruye en orden inverso: primero cómputo (que depende de red), luego red.
+### 1. Destruir la infraestructura en AWS
 
-> Si intentas destruir la capa de red antes que la de cómputo, el security group huérfano seguirá asociado a la VPC e impedirá su eliminación. Destruye siempre de hoja a raíz.
+Asegúrate de estar en el workspace `lab10-dev` antes de destruir. Si completaste el
+Reto 3, destruye también `lab10-prod`:
 
 ```bash
-# Primero la capa de computo
-cd lab-10/aws/compute/
-terraform destroy -var="network_state_bucket=$STATE_BUCKET"
+cd labs/lab-10/aws
 
-# Luego la capa de red
-cd ../network/
+# Destruye dev
+terraform workspace select lab10-dev
 terraform destroy
+```
+
+Salida esperada:
+
+```
+aws_route_table_association.public: Destroying...
+aws_route_table_association.public: Destruction complete after 0s
+aws_route_table.public: Destroying...
+aws_internet_gateway.main: Destroying...
+aws_route_table.public: Destruction complete after 1s
+aws_internet_gateway.main: Destruction complete after 1s
+aws_subnet.public: Destroying...
+aws_subnet.public: Destruction complete after 1s
+aws_vpc.main: Destroying...
+aws_vpc.main: Destruction complete after 1s
+
+Destroy complete! Resources: 5 destroyed.
+```
+
+### 2. Eliminar los workspaces en HCP
+
+> Eliminar un workspace **no destruye** la infraestructura en AWS — solo el estado y el
+> historial de runs en HCP. Ejecuta siempre `terraform destroy` antes de este paso.
+
+Para cada workspace (`lab10-dev` y, si existe, `lab10-prod`):
+
+1. En la UI, selecciona el workspace.
+2. Ve a **Settings → Destruction and Deletion**.
+3. En la sección **Delete workspace**, pulsa el botón, escribe el nombre del workspace
+   para confirmar y pulsa **Delete workspace**.
+
+### 3. Eliminar el IAM Role y el OIDC Identity Provider
+
+Estos recursos se crearon manualmente en el Paso 2 y no forman parte del estado de
+Terraform — hay que eliminarlos también manualmente desde la consola de AWS.
+
+**Eliminar el IAM Role:**
+
+1. Abre **AWS Console → IAM → Roles**.
+2. Busca `lab10-terraform-cloud-role`.
+3. Selecciónalo → **Delete** → escribe el nombre para confirmar → **Delete**.
+
+**Eliminar el OIDC Identity Provider:**
+
+1. Abre **AWS Console → IAM → Identity providers**.
+2. Selecciona `app.terraform.io`.
+3. Pulsa **Delete** → confirma.
+
+### 4. Revocar el API token
+
+1. Ve a `app.terraform.io` → icono de usuario → **User Settings → Tokens**.
+2. Localiza el token generado durante el laboratorio y pulsa **Revoke**.
+
+Para eliminar también las credenciales locales del CLI:
+
+```bash
+terraform logout
 ```
 
 ---
 
-## LocalStack
+## Solución de problemas
 
-Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
+### `Error: Failed to request discovery document`
 
-En LocalStack se usa backend local en lugar de S3 para la capa de remote state. El concepto de aislamiento por capas (red y cómputo independientes) es idéntico.
+**Causa:** el token almacenado en `~/.terraform.d/credentials.tfrc.json` ha caducado o
+fue revocado.
 
----
+**Solución:**
 
-## Comparativa AWS Real vs LocalStack
-
-| Aspecto | AWS Real | LocalStack |
-|---|---|---|
-| Backend de la capa de red | S3 (`lab10/network/terraform.tfstate`) | Local (`network/terraform.tfstate`) |
-| Backend de la capa de cómputo | S3 (`lab10/compute/terraform.tfstate`) | Local (`compute/terraform.tfstate`) |
-| `terraform_remote_state` (cómputo) | `backend = "s3"` + variables de bucket | `backend = "local"` + ruta relativa |
-| Bucket S3 previo necesario | Sí | No |
-| Verificar VPCs | `aws ec2 describe-vpcs` | `aws --endpoint-url=... ec2 describe-vpcs` |
-| Aislamiento de estados | Archivos separados en S3 | Archivos separados en disco |
-| Comportamiento del blast radius | Idéntico | Idéntico |
+```bash
+terraform logout
+terraform login
+```
 
 ---
 
-## Buenas prácticas aplicadas
+### `Error: No workspaces found matching the provided tags`
 
-- **Define la granularidad de las capas según la frecuencia de cambio y el equipo responsable.** La capa de red cambia poco y la gestiona el equipo de plataforma; la capa de cómputo cambia frecuentemente y la gestiona el equipo de aplicaciones. Esta división es natural y reduce la fricción.
-- **Usa outputs con `description` detallada.** Los outputs son la API pública de tu capa; documéntalos como si fueran un contrato de interfaz. Otras capas dependen de ellos y no deben necesitar leer tu código para entenderlos.
-- **No uses `terraform_remote_state` para pasar secretos.** Los valores leídos aparecen en el plan en texto plano. Para secretos, usa AWS Secrets Manager o Parameter Store y léelos con el data source correspondiente.
-- **Destruye siempre de hoja a raíz.** Las capas superiores (cómputo) referencian recursos de las capas inferiores (red). Si destruyes la red primero, dejarás recursos huérfanos que impedirán la eliminación de la VPC.
-- **Un único bucket S3 puede alojar los estados de varias capas usando claves distintas.** La convención `<proyecto>/<capa>/terraform.tfstate` mantiene el orden sin multiplicar los buckets.
-- **El data source `terraform_remote_state` es solo lectura.** Nunca puede modificar el estado que lee. Es seguro usarlo en pipelines de solo lectura (auditorías, dashboards) sin riesgo de alterar la infraestructura.
-- **Considera SSM Parameter Store o HCP Terraform como alternativas.** Para equipos grandes, pasar valores entre capas a través del estado S3 puede ser sustituido por almacenar los outputs clave en SSM Parameter Store, lo que desacopla aún más los proyectos y simplifica los permisos IAM.
+**Causa:** el bloque `cloud {}` usa `tags` pero ningún workspace tiene ese tag asignado,
+o el tag está mal escrito.
+
+**Solución:**
+1. En la UI ve a **Settings → Tags** del workspace y verifica que el tag coincide
+   exactamente con el valor del bloque `cloud {}`.
+2. Alternativamente, usa `name` en lugar de `tags` para evitar ambigüedades.
 
 ---
+
+### `Error: organization not found`
+
+**Causa:** el nombre de la organización en el bloque `cloud {}` no coincide con el nombre
+real en HCP Terraform. Los nombres son sensibles a mayúsculas.
+
+**Solución:**
+
+1. Abre [app.terraform.io](https://app.terraform.io) en el navegador.
+2. En la esquina superior izquierda, haz clic en el nombre de la organización para abrir
+   el menú desplegable.
+3. Selecciona **Organization Settings** (rueda dentada junto al nombre).
+4. En la sección **General**, copia el valor exacto del campo **Name**.
+5. Actualiza el bloque `cloud {}` en `providers.tf` con ese nombre.
+
+---
+
+### Plan correcto pero apply bloqueado esperando confirmación
+
+**Causa:** el workspace tiene **Auto apply** desactivado (configuración por defecto).
+El apply remoto queda en estado **Needs confirmation** hasta que alguien lo aprueba en
+la UI.
+
+**Solución A — aprobar desde la UI:**
+1. Abre la URL del run que aparece en los logs del terminal.
+2. Pulsa **Confirm & Apply**.
+
+**Solución B — habilitar Auto apply:**
+1. UI → **Settings → General → Auto Apply** → activar.
+2. Los siguientes applies se aprobarán automáticamente sin confirmación manual.
 
 ## Recursos
 
-- [Data source `terraform_remote_state`](https://developer.hashicorp.com/terraform/language/state/remote-state-data)
-- [Backend S3 - Documentación de Terraform](https://developer.hashicorp.com/terraform/language/backend/s3)
-- [Backend local - Documentación de Terraform](https://developer.hashicorp.com/terraform/language/backend/local)
-- [Outputs - Documentación de Terraform](https://developer.hashicorp.com/terraform/language/values/outputs)
-- [Recurso aws_vpc](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc)
-- [Recurso aws_subnet](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/subnet)
-- [Recurso aws_security_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group)
-- [Función `cidrsubnet()`](https://developer.hashicorp.com/terraform/language/functions/cidrsubnet)
+- [HCP Terraform — Documentación oficial](https://developer.hashicorp.com/terraform/cloud-docs)
+- [Bloque `cloud {}` — Configuración del backend](https://developer.hashicorp.com/terraform/cli/cloud/settings)
+- [Workspaces — CLI-driven workflow](https://developer.hashicorp.com/terraform/cloud-docs/run/cli)
+- [Variables sensibles y entorno en HCP Terraform](https://developer.hashicorp.com/terraform/cloud-docs/workspaces/variables)
+- [Migración de un backend local/S3 a HCP Terraform](https://developer.hashicorp.com/terraform/cloud-docs/migrate)
+- [Plan de precios y free tier de HCP Terraform](https://www.hashicorp.com/products/terraform/pricing)
+- [API Tokens — Tipos y mejores prácticas](https://developer.hashicorp.com/terraform/cloud-docs/users-teams-organizations/api-tokens)

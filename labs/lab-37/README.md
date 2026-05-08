@@ -1,721 +1,560 @@
-# Laboratorio 37 — Orquestación Imperativa con terraform_data
+# Laboratorio 37 — Arquitectura Moderna NoSQL: DynamoDB con Caché y Eventos
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
 
-[← Módulo 9 — Terraform Avanzado](../../modulos/modulo-09/README.md)
+[← Módulo 8 — Almacenamiento y Bases de Datos con Terraform](../../modulos/modulo-08/README.md)
 
 
 ## Visión general
 
-Terraform es fundamentalmente **declarativo**: describes el estado deseado y el
-motor calcula el plan para alcanzarlo. Sin embargo, hay tareas post-despliegue
-que son inherentemente imperativas — ejecutar un script de configuración,
-notificar a un sistema externo, registrar un evento — y que no encajan bien en
-el modelo declarativo.
+En este laboratorio construirás una capa de datos NoSQL ultra-rápida y orientada a eventos. Desplegarás una **tabla DynamoDB On-Demand** con un **Global Secondary Index** para consultas flexibles, activarás **DynamoDB Streams** y conectarás una **Lambda** que procesa cada cambio en tiempo real. Para acelerar las lecturas, desplegarás un **cluster Redis de ElastiCache** con cifrado en tránsito y autenticación AUTH. Toda la infraestructura se monitoriza con **alarmas de CloudWatch** que notifican vía **SNS**.
 
-`terraform_data` (introducido en Terraform 1.4 para reemplazar `null_resource`)
-es el mecanismo oficial para orquestar estas tareas imperativas sin depender de
-un provider externo. Junto con los provisioners `file`, `remote-exec` y
-`local-exec`, permite configurar servidores remotos directamente desde Terraform
-y controlar exactamente *cuando* se vuelven a ejecutar mediante `triggers_replace`.
+La capa de aplicación es un **Product Catalog** Flask desplegado en EC2 que demuestra en tiempo real la diferencia de latencia entre una lectura desde Redis (< 5 ms) y una lectura directa a DynamoDB (~30-80 ms), con contadores de hits/misses y un feed de eventos CDC en vivo.
 
-> **Advertencia**: los provisioners son el ultimo recurso en Terraform. Cuando
-> sea posible, usa `user_data` para bootstrap inicial o SSM Run Command para
-> configuración posterior. Este laboratorio los usa intencionalmente para
-> entender su funcionamiento y sus limitaciones.
+## Objetivos de aprendizaje
 
-## Objetivos
+Al finalizar este laboratorio serás capaz de:
 
-- Entender el ciclo de vida de `terraform_data` y como difiere de los recursos
-  de infraestructura convencionales.
-- Usar `triggers_replace` para controlar exactamente cuando se re-ejecutan los
-  provisioners.
-- Subir un fichero a un servidor remoto con `provisioner "file"`.
-- Definir un bloque `connection` SSH y ejecutar comandos remotos con `remote-exec`.
-- Usar `provisioner "local-exec"` con `on_failure = continue` para tareas de
-  registro que no deben bloquear el despliegue.
-- Comprender las limitaciones de los provisioners y cuando no usarlos.
+- Crear un `aws_dynamodb_table` con modo `PAY_PER_REQUEST` (On-Demand), Partition Key y Sort Key
+- Añadir un `global_secondary_index` con proyección `ALL` para consultas por atributo secundario
+- Activar `stream_enabled = true` con `stream_view_type = "NEW_AND_OLD_IMAGES"`
+- Conectar un `aws_lambda_event_source_mapping` al stream para procesar cambios en tiempo real
+- Desplegar un `aws_elasticache_replication_group` Redis con `transit_encryption_enabled` y `auth_token`
+- Implementar el patrón **Cache-Aside** en Python: Redis como capa de lectura sobre DynamoDB
+- Crear `aws_cloudwatch_metric_alarm` para `EngineCPUUtilization` y `Evictions` de Redis
+- Usar `aws_sns_topic` como destino de notificaciones de alarmas
+- Medir y visualizar la diferencia de latencia entre cache hit (~2 ms) y cache miss (~50 ms)
 
 ## Requisitos previos
 
-- **Terraform >= 1.10** instalado (`terraform_data`: 1.4, `postcondition`/`check`: 1.5, `use_lockfile` en backend S3: 1.10).
-- AWS CLI configurado con perfil `default`.
-- Par de claves SSH generado localmente (ver Paso 0 del despliegue).
+- **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
+- Perfil AWS con permisos sobre DynamoDB, ElastiCache, Lambda, EC2, S3, Secrets Manager, IAM, CloudWatch y SNS
 
-```bash
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
-```
+---
 
 ## Arquitectura
 
-```
-Maquina local (Terraform)
-┌───────────────────────────────────────────────────────────┐
-│                                                           │
-│  terraform apply                                          │
-│       │                                                   │
-│       ├─► aws_key_pair        → sube clave publica a EC2  │
-│       ├─► aws_security_group  → SSH (tu IP) + HTTP        │
-│       ├─► aws_iam_*           → Instance Profile + SSM    │
-│       ├─► aws_instance        → EC2 con IMDSv2            │
-│       │                                                   │
-│       └─► terraform_data.app_deploy                       │
-│               │                                           │
-│               │  triggers_replace: {app_version,          │
-│               │                     instance_id}          │
-│               │                                           │
-│               ├─[connection SSH]──────────────────────┐   │
-│               │                                       │   │
-│               ├─► provisioner "file"                  │   │
-│               │     scripts/deploy.sh → /tmp/         │   │
-│               │                                       ▼   │
-│               ├─► provisioner "remote-exec"     EC2 remota│
-│               │     chmod + sudo APP_VERSION=... ./deploy │
-│               │                                       │   │
-│               └─► provisioner "local-exec"            │   │
-│                     on_failure = continue             │   │
-│                     >> deployment.log                 │   │
-│                                                       │   │
-└───────────────────────────────────────────────────────┼───┘
-                                                        │
-                              nginx activo en puerto 80 │
-                              /version.json con la      │
-                              version desplegada ◄──────┘
-```
+![DynamoDB On-Demand con GSI + Streams → Lambda CDC → events table con TTL · Redis Multi-AZ con TLS+AUTH · EC2 Flask + Secrets + S3](arch/diagrama.svg)
+
+Tres componentes integrados sobre la misma cuenta:
+
+- **Catálogo en DynamoDB** (`products`, billing On-Demand) con un **GSI** `by-status-index` (`status` + `price_cents`) para consultas alternativas sin escaneo. **DynamoDB Streams** (`NEW_AND_OLD_IMAGES`) emite cada cambio.
+- **Lambda CDC processor** consume el stream (`event_source_mapping LATEST`, batch 10) y escribe cada cambio en una segunda tabla `events` cuyo **TTL** elimina los registros tras 7 días sin consumir WCU — auditoría barata y desacoplada del path crítico.
+- **Caché Redis** Multi-AZ con `automatic_failover`, **TLS** en tránsito, cifrado en reposo y **AUTH token** (`random_password` 32 chars en Secrets Manager). La EC2 lo recupera con `GetSecretValue` y aplica patrón cache-aside contra DynamoDB. Alarmas de `EngineCPUUtilization` y `Evictions` notifican a SNS.
+
+---
 
 ## Conceptos clave
 
-### `terraform_data`
+### DynamoDB On-Demand: sin aprovisionamiento de capacidad
 
-Es un recurso del provider `terraform` integrado — no necesita bloque
-`required_providers`. Su único propósito es agrupar provisioners y disparar su
-ejecución de forma controlada.
-
-Tiene dos atributos principales:
-
-| Atributo | Uso |
-|---|---|
-| `triggers_replace` | Mapa de valores cuyo cambio fuerza la *destrucción y recreación* del recurso (y re-ejecución de provisioners) |
-| `input` | Almacena valores arbitrarios; accesibles en outputs via `output` |
+Con `billing_mode = "PAY_PER_REQUEST"`, DynamoDB escala automáticamente para cualquier volumen de tráfico. No hay que estimar RCU/WCU: pagas por cada operación de lectura/escritura real. Es la opción ideal para cargas impredecibles o laboratorios.
 
 ```hcl
-resource "terraform_data" "ejemplo" {
-  triggers_replace = {
-    version = var.app_version   # Cambia esto → provisioners vuelven a correr
+resource "aws_dynamodb_table" "products" {
+  name         = "lab37-products"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "category"
+  range_key    = "product_id"
+  # ...
+}
+```
+
+### Global Secondary Index: consultas flexibles
+
+Un GSI permite consultar la tabla por atributos que no son la Primary Key. En este lab, el GSI `by-status-index` con `PK=status` y `SK=price_cents` permite obtener todos los productos con un estado concreto, ordenados por precio de menor a mayor:
+
+```python
+# Consulta via GSI: productos activos ordenados por precio
+resp = products_table.query(
+    IndexName="by-status-index",
+    KeyConditionExpression=Key("status").eq("active"),
+)
+```
+
+Sin el GSI, esta consulta requeriría un `Scan` con `FilterExpression`, mucho menos eficiente a medida que crece la tabla.
+
+### DynamoDB Streams y CDC
+
+Al activar `stream_enabled = true`, DynamoDB publica cada INSERT, MODIFY y REMOVE en un stream de tiempo real. El `stream_view_type = "NEW_AND_OLD_IMAGES"` incluye el estado antes y después de cada modificación, lo que permite detectar exactamente qué cambió:
+
+```
+Evento MODIFY:
+  OldImage: { name: "Laptop", price_cents: 99900, status: "active" }
+  NewImage: { name: "Laptop", price_cents: 94900, status: "active" }
+  → El precio bajó de $999 a $949
+```
+
+### Lambda Event Source Mapping
+
+`aws_lambda_event_source_mapping` conecta el stream de DynamoDB con la Lambda. DynamoDB gestiona automáticamente la entrega en batches, los reintentos y el checkpointing del shard. La Lambda solo necesita permisos de `AWSLambdaDynamoDBExecutionRole` para leer del stream:
+
+```hcl
+resource "aws_lambda_event_source_mapping" "dynamodb_stream" {
+  event_source_arn  = aws_dynamodb_table.products.stream_arn
+  function_name     = aws_lambda_function.cdc_processor.arn
+  starting_position = "LATEST"
+  batch_size        = 10
+}
+```
+
+### ElastiCache Redis con TLS y AUTH
+
+`transit_encryption_enabled = true` exige TLS en todas las conexiones (los clientes deben usar `rediss://` en lugar de `redis://`). `auth_token` añade una capa de autenticación: el cliente debe presentar el token además de la conexión TLS.
+
+La combinación de ambas garantiza:
+- **Confidencialidad**: los datos en tránsito van cifrados (TLS)
+- **Autenticación**: solo clientes con el token correcto pueden conectar (AUTH)
+
+```python
+r = redis.Redis(
+    host=REDIS_HOST, port=6379,
+    password=REDIS_AUTH,
+    ssl=True, ssl_cert_reqs=None,
+)
+```
+
+### Patrón Cache-Aside
+
+La aplicación sigue el patrón Cache-Aside (Lazy Loading):
+
+```
+READ:
+  1. Consultar Redis
+  2a. HIT  → devolver datos del cache (< 5 ms)
+  2b. MISS → consultar DynamoDB (~50 ms)
+           → almacenar resultado en Redis con TTL
+           → devolver datos
+
+WRITE/UPDATE/DELETE:
+  1. Escribir en DynamoDB
+  2. Invalidar clave del cache afectada
+```
+
+La invalidación reactiva evita servir datos obsoletos. El TTL de 60 segundos es la red de seguridad final.
+
+### CloudWatch Alarms para Redis
+
+`EngineCPUUtilization` mide el CPU exclusivo del proceso Redis, no del sistema operativo. Redis es single-threaded, por lo que su CPU determina el throughput máximo. Por encima del 65% durante 10 minutos es una señal temprana de saturación:
+
+```hcl
+resource "aws_cloudwatch_metric_alarm" "redis_cpu" {
+  metric_name         = "EngineCPUUtilization"
+  namespace           = "AWS/ElastiCache"
+  threshold           = 65
+  evaluation_periods  = 2
+  period              = 300
+  dimensions = {
+    ReplicationGroupId = aws_elasticache_replication_group.redis.id
   }
 }
 ```
 
-### Por que `triggers_replace` y no `triggers`
+`Evictions` indica que Redis alcanzó su límite de memoria y está expulsando claves. En un cache de aplicación, las evictions generan un pico de cache misses y mayor presión sobre DynamoDB.
 
-`null_resource` usaba `triggers` (un mapa de strings). `terraform_data` usa
-`triggers_replace`, que es conceptualmente mas honesto: cuando cambia el valor,
-el recurso se **reemplaza** — primero se ejecutan los provisioners de destruccion
-(`when = destroy`) y luego los de creacion. Esto hace el ciclo de vida explicito.
-
-### Provisioner `file`
-
-Transfiere un fichero o directorio desde la maquina local al servidor remoto
-via SSH (o WinRM). La conexión la define el bloque `connection` del recurso padre.
-
-```hcl
-provisioner "file" {
-  source      = "${path.module}/../scripts/deploy.sh"  # Ruta local
-  destination = "/tmp/deploy.sh"                        # Ruta en el servidor
-}
-```
-
-**Limitaciones**:
-- El directorio destino debe existir.
-- El usuario de la conexión debe tener permiso de escritura en el destino.
-- `/tmp` es siempre seguro para `ec2-user`.
-
-### Provisioner `remote-exec`
-
-Ejecuta comandos en el servidor remoto via SSH. Tiene tres modos:
-
-| Modo | Descripción |
-|---|---|
-| `inline` | Lista de comandos ejecutados en orden con `/bin/sh -c` |
-| `script` | Sube un script local y lo ejecuta (equivale a `file` + `inline`) |
-| `scripts` | Como `script` pero con múltiples ficheros en orden |
-
-```hcl
-provisioner "remote-exec" {
-  inline = [
-    "chmod +x /tmp/deploy.sh",
-    "sudo APP_VERSION=${var.app_version} /tmp/deploy.sh",
-  ]
-}
-```
-
-Si cualquier comando devuelve un codigo de salida distinto de 0, el provisioner
-falla y el recurso queda marcado como *tainted* — Terraform lo recrea en el
-siguiente apply.
-
-### Bloque `connection`
-
-Define el canal de comunicación entre Terraform y el servidor remoto. Cuando se
-declara a nivel de recurso, todos los provisioners del recurso lo heredan.
-
-```hcl
-connection {
-  type        = "ssh"
-  host        = aws_instance.web.public_ip
-  user        = "ec2-user"
-  private_key = file(var.ssh_private_key_path)
-  timeout     = "5m"  # Tiempo de espera mientras la instancia arranca
-}
-```
-
-El parámetro `timeout` es crítico: una instancia EC2 recien creada tarda 1-2
-minutos en que cloud-init arranque sshd. Sin un timeout suficiente, el
-provisioner fallara antes de que el servidor este listo.
-
-### Provisioner `local-exec`
-
-Ejecuta un comando en la **maquina que corre Terraform** (no en el servidor
-remoto). Util para:
-- Registrar eventos en logs locales o sistemas externos.
-- Invocar scripts de notificación (Slack, PagerDuty...).
-- Actualizar inventarios de CMDB.
-
-```hcl
-provisioner "local-exec" {
-  on_failure  = continue   # Si falla, advertencia en lugar de error
-  interpreter = ["/bin/bash", "-c"]
-  command     = "echo '...' >> deployment.log"
-}
-```
-
-**`on_failure`** puede ser:
-- `fail` (defecto): un fallo aborta el apply y *taint*-ea el recurso.
-- `continue`: el fallo se registra como advertencia y el apply prosigue.
-
-Usa `continue` únicamente para operaciones de registro o notificación que no
-son críticas para el estado de la infraestructura.
-
-### `self` dentro de provisioners
-
-Dentro de un bloque `provisioner`, `self` referencia el recurso que contiene
-el provisioner. En `terraform_data`, permite acceder a los valores de
-`triggers_replace` sin crear dependencias circulares:
-
-```hcl
-# En un provisioner de terraform_data.app_deploy:
-"version=${self.triggers_replace.app_version}"
-```
-
-### El problema del estado de los provisioners
-
-Terraform **no conoce el resultado** de un provisioner — solo sabe si termino
-con exito o con error. Si el provisioner `remote-exec` se ejecuto correctamente
-pero el servidor fallo mas tarde, Terraform no lo detecta. Por eso:
-
-- Incluye validaciones en el propio script (`set -euo pipefail`, checks de HTTP).
-- Usa `output` para exponer URLs verificables post-apply.
-- Considera complementar con healthchecks externos (ALB, Route53 health check).
+---
 
 ## Estructura del proyecto
 
 ```
-lab-37/
-├── aws/
-│   ├── providers.tf          # Terraform >= 1.10 + provider AWS ~> 6.0
-│   ├── variables.tf          # region, project, app_version, ssh_*, instance_type
-│   ├── main.tf               # AMI, key pair, SG, IAM, EC2, terraform_data
-│   ├── outputs.tf            # IPs, URLs, version desplegada, comando SSH
-│   └── aws.s3.tfbackend      # Configuracion parcial del backend S3
-├── scripts/
-│   └── deploy.sh             # Script subido via "file" y ejecutado via "remote-exec"
-└── README.md
-```
-
-## Despliegue en AWS real
-
-### Paso 0 — Generar el par de claves SSH
-
-```bash
-# Genera un par de claves ed25519 sin passphrase (para uso automatizado)
-ssh-keygen -t ed25519 -f ~/.ssh/lab37_key -N ""
-
-# Verificar que se crearon ambos ficheros:
-ls -la ~/.ssh/lab37_key ~/.ssh/lab37_key.pub
-```
-
-La clave privada (`lab37_key`) nunca sale de tu maquina. Terraform sube solo la
-publica (`lab37_key.pub`) a AWS como `aws_key_pair`.
-
-### Paso 1 — Obtener tu IP para restringir SSH
-
-```bash
-# Obtener tu IP publica actual
-MY_IP=$(curl -s https://checkip.amazonaws.com)
-echo "Tu IP: ${MY_IP}"
-```
-
-Abrir el puerto 22 a `0.0.0.0/0` es funcional pero inseguro. Restringirlo a tu
-IP elimina la exposicion a scanners automaticos de Internet.
-
-### Paso 2 — Inicializar y desplegar
-
-```bash
-cd labs/lab-37/aws
-
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
-export MY_IP=$(curl -s https://checkip.amazonaws.com)
-
-terraform init \
-  -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=${BUCKET}"
-
-terraform plan \
-  -var="ssh_allowed_cidr=${MY_IP}/32"
-
-terraform apply \
-  -var="ssh_allowed_cidr=${MY_IP}/32"
-```
-
-**Durante el apply**, observa la secuencia de mensajes:
-
-```
-aws_key_pair.lab: Creating...
-aws_security_group.web: Creating...
-aws_iam_role.ec2: Creating...
-...
-aws_instance.web: Creation complete after 15s
-terraform_data.app_deploy: Creating...
-terraform_data.app_deploy: Provisioning with 'file'...
-terraform_data.app_deploy: Provisioning with 'remote-exec'...
-terraform_data.app_deploy (remote-exec): [2024-...] Iniciando despliegue v1.0.0
-terraform_data.app_deploy (remote-exec): [2024-...] Actualizando paquetes...
-terraform_data.app_deploy (remote-exec): [2024-...] Instalando nginx...
-terraform_data.app_deploy (remote-exec): [2024-...] Despliegue v1.0.0 completado
-terraform_data.app_deploy: Provisioning with 'local-exec'...
-terraform_data.app_deploy: Creation complete
-```
-
-El apply tarda aproximadamente 3-4 minutos: 1-2 min para que la instancia
-arranque sshd y 1-2 min para el script de configuración.
-
-## Verificación final
-
-### Comprobar la aplicacion desplegada
-
-```bash
-PUBLIC_IP=$(terraform output -raw public_ip)
-
-# Pagina principal con la version
-curl http://${PUBLIC_IP}
-# Esperado: HTML con version 1.0.0
-
-# Endpoint JSON de version (para healthchecks automaticos)
-curl http://${PUBLIC_IP}/version.json
-# Esperado: {"project":"lab37","version":"1.0.0","deployed_at":"..."}
-```
-
-### Verificar el log de despliegue local
-
-```bash
-# El local-exec escribe en deployment.log en el directorio desde donde ejecutas terraform
-cat deployment.log
-# Esperado: 2024-...T...Z | version=1.0.0 | instance=i-0abc... | ip=54.xx.xx.xx
-```
-
-### Conectarse al servidor y revisar el log remoto
-
-```bash
-# Usar el comando SSH del output
-$(terraform output -raw ssh_command)
-
-# Una vez dentro, ver el log del script de despliegue
-sudo cat /var/log/lab37-deploy.log
-sudo systemctl status nginx
-```
-
-### Probar triggers_replace — redespliegue sin cambiar la instancia
-
-Cambia la versión de la aplicación y aplica de nuevo:
-
-```bash
-terraform apply \
-  -var="ssh_allowed_cidr=${MY_IP}/32" \
-  -var="app_version=2.0.0"
-```
-
-Terraform mostrara:
-
-```
-terraform_data.app_deploy: Destroying...  ← se destruye el recurso anterior
-terraform_data.app_deploy: Destruction complete
-terraform_data.app_deploy: Creating...    ← se crea uno nuevo
-terraform_data.app_deploy: Provisioning with 'file'...
-terraform_data.app_deploy: Provisioning with 'remote-exec'...
-terraform_data.app_deploy (remote-exec): [2024-...] Iniciando despliegue v2.0.0
-...
-```
-
-La instancia EC2 NO se modifica — solo `terraform_data` se recrea. Al finalizar:
-
-```bash
-curl http://$(terraform output -raw public_ip)/version.json
-# Esperado: {"version":"2.0.0",...}
-
-cat deployment.log
-# Esperado: dos lineas, una por cada version desplegada
-```
-
-## Retos
-
-### Reto 1 — Historial de versiones desplegadas con `terraform_data` e `input`/`output`
-
-Actualmente `terraform_data.app_deploy` solo usa `triggers_replace`. El recurso
-tiene un segundo atributo — `input` — que permite almacenar valores arbitrarios
-en el estado y recuperarlos despues via `output`.
-
-**Objetivo**: construir un historial de las ultimas versiones desplegadas
-combinando `input`/`output` de `terraform_data` con un fichero local que
-persiste entre ejecuciones.
-
-Implementa lo siguiente en `main.tf` y `outputs.tf`:
-
-1. Añade un `local` llamado `previous_version` que lea el contenido del fichero
-   `aws/.last_version` con la función `file()`. Usa `try()` para devolver
-   `"none"` si el fichero no existe aun (primer despliegue).
-
-2. Añade un segundo recurso `terraform_data` llamado `version_history` cuyo
-   `input` sea un objeto con `current = var.app_version` y
-   `previous = local.previous_version`.
-
-3. Añade un `provisioner "local-exec"` en ese recurso que escriba `var.app_version`
-   en el fichero `.last_version` al finalizar cada apply exitoso.
-
-4. Añade un output `version_history` que exponga `terraform_data.version_history.output`.
-
-**Por que no se puede usar una auto-referencia**: Terraform resuelve el grafo
-de dependencias en la fase de plan. Si un recurso se referenciara a si mismo
-(`terraform_data.version_history.output.current` dentro del mismo recurso),
-se crearia un ciclo que el motor no puede resolver — de ahi el error
-`Self-referential block`. El fichero local rompe el ciclo: `file()` es una
-función que se evalúa en local antes del plan, sin depender del grafo.
-
-#### Prueba
-
-```bash
-# Primer despliegue (el fichero .last_version no existe aun)
-terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=1.0.0"
-terraform output version_history
-# Esperado: { current = "1.0.0", previous = "none" }
-
-# El local-exec ha escrito "1.0.0" en aws/.last_version
-cat aws/.last_version
-
-# Segundo despliegue
-terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
-terraform output version_history
-# Esperado: { current = "2.0.0", previous = "1.0.0" }
-
-# Tercer despliegue
-terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=3.0.0"
-terraform output version_history
-# Esperado: { current = "3.0.0", previous = "2.0.0" }
+labs/lab-37/
+├── README.md
+├── diagrama.drawio               # Fuente editable del diagrama de arquitectura
+├── arch/
+│   └── diagrama.svg              # Diagrama de arquitectura (referenciado en este README)
+└── aws/
+    ├── app/
+    │   └── app.py                 # Flask Product Catalog: CRUD DynamoDB + caché Redis
+    ├── lambda/
+    │   └── lambda_function.py     # CDC processor: consume DynamoDB Streams → escribe eventos
+    ├── scripts/
+    │   └── user_data.sh.tpl       # Bootstrap EC2: instala deps, seed DynamoDB, inicia systemd
+    │
+    ├── locals.tf                  # locals (tags, CIDRs) + data sources (AMI, account_id)
+    ├── networking.tf              # VPC, IGW, subnets públicas/privadas, route tables, SGs
+    ├── iam.tf                     # Roles e instance profiles para EC2 y Lambda
+    ├── dynamodb.tf                # Tabla products (GSI + Streams) y tabla events (TTL)
+    ├── elasticache.tf             # random_password, Secrets Manager, subnet group, Redis cluster
+    ├── lambda.tf                  # archive_file, función CDC, event source mapping
+    ├── monitoring.tf              # SNS topic + CloudWatch alarms (CPU y Evictions)
+    ├── ec2.tf                     # S3 bucket/object (app.py) + instancia EC2
+    │
+    ├── outputs.tf                 # 18 outputs con endpoints, ARNs y comandos de verificación
+    ├── providers.tf               # AWS ~> 6.0 + random + archive
+    ├── variables.tf               # region, project, instance_type, redis_node_type, cache_ttl
+    └── aws.s3.tfbackend           # Configuración del backend S3
 ```
 
 ---
 
-### Reto 2 — Verificación del despliegue con `postcondition` y `check`
-
-Actualmente Terraform no tiene forma de saber si `deploy.sh` dejo la aplicacion
-funcionando correctamente — solo sabe que el provisioner termino sin error.
-Un script puede completarse con exit 0 y aun asi dejar nginx caido si las
-verificaciones internas no son suficientes.
-
-Terraform ofrece dos mecanismos nativos para verificar el estado real de la
-infraestructura despues de un apply:
-
-- **`postcondition`**: se evalua dentro del bloque `lifecycle` de un recurso.
-  Si falla, el apply se considera erroneo y el recurso queda marcado como
-  tainted. Se ejecuta despues de crear o actualizar el recurso.
-- **`check`**: bloque de nivel raiz (fuera de cualquier recurso). Se evalua
-  al final del apply. Si falla, emite una advertencia pero **no** aborta el
-  apply ni tainta el recurso — util para healthchecks que no deben bloquear.
-
-**Objetivo**: añade ambos mecanismos a `main.tf`:
-
-1. Un bloque `lifecycle { postcondition {} }` en `aws_instance.web` que
-   verifique que la instancia tiene IP publica asignada antes de que
-   `terraform_data` intente conectarse via SSH.
-
-2. Un bloque `check` de nivel raiz que haga una peticion HTTP a
-   `http://<public_ip>/version.json` y verifique que la respuesta contiene
-   la versión actualmente desplegada (`var.app_version`). Usa un
-   `data "http"` para la peticion.
-
-**Pistas**:
-- El provider `http` necesita declararse en `required_providers`:
-  `hashicorp/http ~> 3.0`.
-- `data "http"` devuelve el cuerpo de la respuesta en `response_body`.
-  La función `strcontains()` permite verificar que contiene un substring.
-- En el bloque `check`, el `data source` se declara dentro del propio bloque.
-
-#### Prueba
+## Despliegue en AWS
 
 ```bash
-terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
-# Al final del apply debe aparecer:
-# Check block "healthcheck_version" passed.  ← si nginx responde con la version correcta
-# o:
-# Warning: Check block assertion failed      ← si nginx no esta listo aun (race condition)
+# Obtén el ID de cuenta para el backend
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Desde labs/lab-37/aws/
+terraform fmt
+terraform init \
+  -backend-config=aws.s3.tfbackend \
+  -backend-config="bucket=terraform-state-labs-$ACCOUNT_ID"
+terraform plan
+terraform apply
 ```
+
+> **Nota**: `terraform apply` puede tardar más de 20 minutos. El cuello de botella es el cluster de Redis — `aws_elasticache_replication_group` con Multi-AZ puede superar los **20 minutos** en pasar a estado `available`. DynamoDB, Lambda y la instancia EC2 se aprovisionan en paralelo en cuestión de segundos.
+
+Una vez completado, obtén la URL:
+
+```bash
+terraform output app_url
+```
+
+---
+
+## Verificación final
+
+### Aplicación web — Product Catalog
+
+```bash
+APP_URL=$(terraform output -raw app_url)
+
+# Health check
+curl -s "$APP_URL/health"
+# {"status": "ok"}
+
+# Abre el dashboard
+echo "$APP_URL"
+```
+
+El dashboard muestra:
+- **Stats bar**: hits, misses, hit rate %, latencia media Redis (ms), latencia media DynamoDB (ms), latencia media escritura
+- **Badge de fuente**: `⚡ REDIS HIT · X ms` o `◎ CACHE MISS — DynamoDB: X ms`
+- **Tabla de productos**: 15 productos precargados, filtrables por categoría y estado
+- **Latencia comparada**: barras visuales de rendimiento en la barra lateral
+- **Feed de eventos CDC**: cambios procesados por Lambda en tiempo real
+
+### Demostración de latencia
+
+```bash
+# Primera carga (CACHE MISS → DynamoDB): ~50-80 ms
+curl -s "$APP_URL/" | grep "src-badge"
+
+# Segunda carga (CACHE HIT → Redis): ~1-5 ms
+curl -s "$APP_URL/" | grep "src-badge"
+```
+
+En el interfaz, recarga la misma página varias veces y observa cómo la latencia cae drásticamente en el segundo request.
+
+### DynamoDB: tabla y schema
+
+```bash
+TABLE=$(terraform output -raw dynamo_table_name)
+
+# Describe la tabla (modo On-Demand, stream, GSI)
+aws dynamodb describe-table \
+  --table-name "$TABLE" \
+  --query 'Table.{Modo:BillingModeSummary.BillingMode,Stream:StreamSpecification,GSI:GlobalSecondaryIndexes[*].{Nombre:IndexName,PK:KeySchema[0].AttributeName,SK:KeySchema[1].AttributeName}}'
+
+# Escanea todos los productos
+aws dynamodb scan --table-name "$TABLE" \
+  --query 'Items[*].{Cat:category.S,Nombre:name.S,Precio:price_cents.N,Estado:status.S}'
+```
+
+### GSI: consulta por estado y precio
+
+```bash
+# Productos activos ordenados por precio (via GSI)
+aws dynamodb query \
+  --table-name "$TABLE" \
+  --index-name by-status-index \
+  --key-condition-expression "#s = :v" \
+  --expression-attribute-names '{"#s":"status"}' \
+  --expression-attribute-values '{":v":{"S":"active"}}' \
+  --query 'Items[*].{Estado:status.S,Precio:price_cents.N,Nombre:name.S}' \
+  --region us-east-1
+# Los items vienen ordenados por price_cents de menor a mayor
+```
+
+### DynamoDB Streams y Lambda CDC
+
+```bash
+LAMBDA=$(terraform output -raw lambda_function_name)
+STREAM_ARN=$(terraform output -raw dynamo_stream_arn)
+
+# Estado del event source mapping
+aws lambda list-event-source-mappings \
+  --function-name "$LAMBDA" \
+  --query 'EventSourceMappings[0].{Estado:State,Fuente:EventSourceArn,Batch:BatchSize}'
+# Estado debe ser "Enabled"
+
+# Crea un producto desde la UI, luego verifica los logs de Lambda
+aws logs describe-log-groups \
+  --log-group-name-prefix "/aws/lambda/$LAMBDA" \
+  --query 'logGroups[0].logGroupName' --output text | \
+  xargs -I{} aws logs tail {} --follow --since 5m
+```
+
+### ElastiCache Redis
+
+```bash
+# Estado del cluster Redis
+aws elasticache describe-replication-groups \
+  --replication-group-id lab37-redis \
+  --query 'ReplicationGroups[0].{Estado:Status,TLS:TransitEncryptionEnabled,AtRest:AtRestEncryptionEnabled,MultiAZ:MultiAZ,Nodos:NodeGroups[0].NodeGroupMembers[*].{ID:CacheClusterId,Rol:CurrentRole,AZ:PreferredAvailabilityZone}}'
+
+# Endpoint primario
+aws elasticache describe-replication-groups \
+  --replication-group-id lab37-redis \
+  --query 'ReplicationGroups[0].NodeGroups[0].PrimaryEndpoint'
+```
+
+### AUTH token de Redis
+
+```bash
+SECRET=$(terraform output -raw redis_secret_name)
+
+# Recupera el AUTH token
+TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id "$SECRET" \
+  --query SecretString --output text)
+
+REDIS_HOST=$(terraform output -raw redis_primary_endpoint)
+
+# Conecta al cluster Redis (desde la instancia EC2 via SSM)
+# En el EC2 (usa el paquete Python redis ya instalado):
+# python3 -c "import redis; r = redis.Redis(host='$REDIS_HOST', port=6379, password='$TOKEN', ssl=True, ssl_cert_reqs=None); print(r.ping())"
+# Debe devolver: True
+```
+
+### CloudWatch Alarms y SNS
+
+```bash
+# Estado de las alarmas
+aws cloudwatch describe-alarms \
+  --alarm-names lab37-redis-cpu-high lab37-redis-evictions \
+  --query 'MetricAlarms[*].{Nombre:AlarmName,Estado:StateValue,Umbral:Threshold,Metrica:MetricName}'
+
+# Suscribirse al topic SNS para recibir notificaciones por email
+SNS_ARN=$(terraform output -raw sns_topic_arn)
+aws sns subscribe \
+  --topic-arn "$SNS_ARN" \
+  --protocol email \
+  --notification-endpoint TU_EMAIL@ejemplo.com \
+  --region us-east-1
+# Confirma el email de verificacion que recibiras
+```
+
+---
+
+## Retos
+
+### Reto 1 — TTL en la tabla de productos
+
+La tabla `lab37-events` tiene TTL configurado (7 días). La tabla de productos no lo tiene: los registros eliminados vía la UI desaparecen de inmediato con `DeleteItem`, pero no existe ningún mecanismo de expiración automática para productos que deberían caducar por tiempo.
+
+**Requisitos**
+
+Modifica únicamente `dynamodb.tf`:
+
+1. Añade un bloque `ttl` en `aws_dynamodb_table.products` que use el atributo `expires_at` (tipo Number, epoch en segundos)
+2. Aplica el cambio con `terraform apply` — DynamoDB activa el TTL sin interrupciones ni recreación de la tabla
+
+**Criterios de éxito**
+
+```bash
+# Debe mostrar TimeToLiveStatus: ENABLED y AttributeName: expires_at
+aws dynamodb describe-time-to-live \
+  --table-name lab37-products \
+  --query 'TimeToLiveDescription'
+
+# Inserta manualmente un item con expires_at en el pasado
+aws dynamodb put-item \
+  --table-name lab37-products \
+  --item '{
+    "category":   {"S": "Test"},
+    "product_id": {"S": "ttl-test-01"},
+    "name":       {"S": "Producto caducado"},
+    "status":     {"S": "inactive"},
+    "price_cents":{"N": "0"},
+    "stock":      {"N": "0"},
+    "expires_at": {"N": "1"}
+  }'
+# En las proximas 24-48h el item desaparece automaticamente (TTL es eventual)
+```
+
+- `terraform plan` muestra `~ update in-place` — no hay destroy/create de la tabla
+- La tabla de eventos sigue funcionando con su TTL propio de 7 días sin cambios
+
+### Reto 2 — Point-in-Time Recovery en la tabla de productos
+
+La tabla de productos almacena el catálogo activo del negocio. Actualmente no tiene ninguna protección frente a borrados accidentales masivos — un `terraform apply` erróneo o un bug en la aplicación podría eliminar todos los productos de forma irrecuperable. **Point-in-Time Recovery (PITR)** activa backups continuos y permite restaurar la tabla a cualquier segundo dentro de los últimos 35 días.
+
+**Requisitos**
+
+Modifica únicamente `dynamodb.tf`:
+
+1. Añade un bloque `point_in_time_recovery` en `aws_dynamodb_table.products` con `enabled = true`
+2. Aplica con `terraform apply` — DynamoDB activa PITR sin interrupciones ni recreación de la tabla
+3. Con la CLI, simula una recuperación restaurando la tabla a su estado de hace 5 minutos en una tabla nueva `lab37-products-restored`
+4. Verifica el contenido de la tabla restaurada y elimínala al terminar
+
+**Criterios de éxito**
+
+```bash
+# PITR debe aparecer como ENABLED con ventana de 35 dias
+aws dynamodb describe-continuous-backups \
+  --table-name lab37-products \
+  --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription'
+# {
+#   "PointInTimeRecoveryStatus": "ENABLED",
+#   "EarliestRestorableDateTime": "...",
+#   "LatestRestorableDateTime":  "..."
+# }
+
+# Restaura a "ahora mismo" en una tabla nueva (tarda ~3-5 min)
+aws dynamodb restore-table-to-point-in-time \
+  --source-table-name lab37-products \
+  --target-table-name lab37-products-restored \
+  --use-latest-restorable-time
+
+aws dynamodb wait table-exists --table-name lab37-products-restored
+
+# Verifica que los productos estan intactos en la tabla restaurada
+aws dynamodb scan \
+  --table-name lab37-products-restored \
+  --select COUNT \
+  --query 'Count'
+# Debe devolver 15
+
+# Limpieza
+aws dynamodb delete-table --table-name lab37-products-restored
+```
+
+- `terraform plan` muestra `~ update in-place` — la tabla no se destruye ni recrea
+- La tabla `lab37-events` **no** requiere PITR (los eventos tienen TTL de 7 días y son regenerables por el stream)
+
+---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Historial de versiones con terraform_data input/output</strong></summary>
+<summary><strong>Solución al Reto 1 — TTL en la tabla de productos</strong></summary>
 
-### Solución al Reto 1 — Historial de versiones con terraform_data input/output
+### Solución al Reto 1 — TTL en la tabla de productos
 
-Añade en `main.tf`:
-
-```hcl
-locals {
-  # file() se evalua en local antes del plan — no participa en el grafo
-  # de dependencias, por lo que no crea ciclos.
-  # try() devuelve "none" si el fichero no existe aun (primer despliegue).
-  previous_version = try(trimspace(file("${path.module}/.last_version")), "none")
-}
-
-resource "terraform_data" "version_history" {
-  # input se evalua durante el plan con los valores actuales de las variables
-  # y del fichero local. Terraform lo persiste en el estado como "output"
-  # una vez que el apply termina con exito.
-  input = {
-    current  = var.app_version
-    previous = local.previous_version
-  }
-
-  # Despues de cada apply exitoso, escribe la version actual en el fichero.
-  # El proximo plan leerá este valor como "previous" via local.previous_version.
-  provisioner "local-exec" {
-    command = "printf '%s' '${var.app_version}' > '${path.module}/.last_version'"
-  }
-}
-```
-
-Añade en `outputs.tf`:
+En `aws/dynamodb.tf`, añade el bloque `ttl` dentro de `aws_dynamodb_table.products`:
 
 ```hcl
-output "version_history" {
-  description = "Version actual y version desplegada anteriormente"
-  value       = terraform_data.version_history.output
+resource "aws_dynamodb_table" "products" {
+  # ... resto de la configuracion sin cambios ...
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  tags = local.tags
 }
 ```
 
-Añade `.last_version` al `.gitignore` del repositorio para no versionar el
-fichero de estado local:
+Aplica y verifica:
 
 ```bash
-echo "labs/lab-37/aws/.last_version" >> .gitignore
+terraform apply
+
+aws dynamodb describe-time-to-live \
+  --table-name lab37-products \
+  --query 'TimeToLiveDescription'
+# { "TimeToLiveStatus": "ENABLED", "AttributeName": "expires_at" }
 ```
 
-**Por que funciona — flujo entre ejecuciones**:
-
-```
-Apply 1.0.0                          Apply 2.0.0
-─────────────────────────────────────────────────────────────
-Plan:                                Plan:
-  local.previous_version = "none"      local.previous_version = "1.0.0"
-  input = { current="1.0.0"           input = { current="2.0.0"
-             previous="none" }                   previous="1.0.0" }
-         │                                      │
-         ▼ apply                                ▼ apply
-  output = { current="1.0.0"          output = { current="2.0.0"
-              previous="none" }                   previous="1.0.0" }
-         │                                      │
-         ▼ local-exec                           ▼ local-exec
-  .last_version = "1.0.0"             .last_version = "2.0.0"
-```
-
-`file()` lee el fichero *antes* del plan — siempre contiene el valor escrito
-por el `local-exec` del apply anterior. Si el apply falla antes de llegar al
-`local-exec`, el fichero no se actualiza y el siguiente plan seguira viendo
-la versión anterior correcta.
-
-**Verificacion**:
-
-```bash
-# Primer despliegue
-terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=1.0.0"
-terraform output version_history
-# { "current" = "1.0.0", "previous" = "none" }
-cat .last_version   # 1.0.0
-
-# Segundo despliegue
-terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
-terraform output version_history
-# { "current" = "2.0.0", "previous" = "1.0.0" }
-
-# Ver lo que Terraform guarda en el estado
-terraform state show terraform_data.version_history
-```
-
-**Limitacion**: el fichero `.last_version` es local a la maquina que ejecuta
-Terraform. En un equipo con backend remoto, cada miembro tendría su propio
-fichero. Para un historial compartido, la alternativa es persistir la versión
-en SSM Parameter Store con `aws_ssm_parameter` y leerla con un `data source`
-en el siguiente plan.
+> DynamoDB activa el TTL como operación `in-place`: no hay downtime ni recreación de la tabla. Los items sin el atributo `expires_at` no se ven afectados.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Verificación del despliegue con postcondition y check</strong></summary>
+<summary><strong>Solución al Reto 2 — Point-in-Time Recovery en la tabla de productos</strong></summary>
 
-### Solución al Reto 2 — Verificación del despliegue con postcondition y check
+### Solución al Reto 2 — Point-in-Time Recovery en la tabla de productos
 
-**Paso 1 — Declarar el provider `http` en `providers.tf`**:
+En `aws/dynamodb.tf`, añade el bloque `point_in_time_recovery` dentro de `aws_dynamodb_table.products`:
 
 ```hcl
-terraform {
-  required_version = ">= 1.10"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 6.0"
-    }
-    http = {
-      source  = "hashicorp/http"
-      version = "~> 3.0"
-    }
+resource "aws_dynamodb_table" "products" {
+  # ... resto de la configuracion sin cambios ...
+
+  point_in_time_recovery {
+    enabled = true
   }
-  backend "s3" {}
+
+  tags = local.tags
 }
 ```
 
-**Paso 2 — `postcondition` en `aws_instance.web`**:
-
-Añade un bloque `lifecycle` al recurso `aws_instance.web`:
-
-```hcl
-resource "aws_instance" "web" {
-  # ... resto de argumentos sin cambios ...
-
-  lifecycle {
-    create_before_destroy = true
-
-    # postcondition se evalua despues de crear o actualizar el recurso.
-    # Si falla, el apply falla y el recurso queda tainted — se recrea
-    # en el siguiente apply.
-    # Aqui verificamos que la instancia tiene IP publica antes de que
-    # terraform_data intente abrir la conexion SSH.
-    postcondition {
-      condition     = self.public_ip != ""
-      error_message = "La instancia ${self.id} no tiene IP publica asignada. Verifica que associate_public_ip_address = true y que la subred tiene auto-assign IP habilitado."
-    }
-  }
-}
-```
-
-`self` dentro de `postcondition` referencia el recurso al que pertenece el
-bloque `lifecycle` — en este caso `aws_instance.web`. Es la única excepción
-en Terraform donde `self` esta disponible fuera de un provisioner.
-
-**Paso 3 — bloque `check` de nivel raiz**:
-
-```hcl
-# check se evalua al FINAL del apply, despues de que todos los recursos
-# esten creados. Usa un data source interno para hacer la peticion HTTP.
-# Si el assert falla, emite una advertencia pero NO aborta el apply
-# ni tainta ningun recurso — ideal para healthchecks post-despliegue.
-check "healthcheck_version" {
-  data "http" "version_json" {
-    url = "http://${aws_instance.web.public_ip}/version.json"
-  }
-
-  assert {
-    condition = data.http.version_json.status_code == 200
-    error_message = "El endpoint /version.json respondio con HTTP ${data.http.version_json.status_code} en lugar de 200."
-  }
-
-  assert {
-    condition     = strcontains(data.http.version_json.response_body, var.app_version)
-    error_message = "La respuesta de /version.json no contiene la version '${var.app_version}'. Puede que el despliegue no haya terminado aun."
-  }
-}
-```
-
-**Diferencia clave entre `postcondition` y `check`**:
-
-| | `postcondition` | `check` |
-|---|---|---|
-| Ubicacion | Dentro de `lifecycle {}` de un recurso | Bloque raiz independiente |
-| Cuando se evalua | Justo despues de crear/actualizar ese recurso | Al final del apply, tras todos los recursos |
-| Si falla | Apply falla, recurso tainted | Advertencia, apply continua |
-| Acceso a recursos | Solo `self` | Cualquier recurso o data source |
-| Uso tipico | Invariantes del recurso (IP asignada, ARN valido) | Healthchecks externos, validaciones E2E |
-
-**Verificacion**:
+Aplica y verifica:
 
 ```bash
-terraform init   # necesario para descargar el provider http
-terraform apply -var="ssh_allowed_cidr=${MY_IP}/32" -var="app_version=2.0.0"
+terraform apply
 
-# Salida esperada al final del apply:
-# ...
-# Check block "healthcheck_version":
-#   "healthcheck_version" passed.   ← ambos asserts OK
-
-# Si nginx aun no ha arrancado cuando check se evalua:
-# Warning: Check block assertion failed
-#   The endpoint /version.json respondio con HTTP 000 ...
-# (no es un error — el apply termina correctamente)
+aws dynamodb describe-continuous-backups \
+  --table-name lab37-products \
+  --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription'
 ```
 
+Restaura y comprueba la integridad:
+
+```bash
+aws dynamodb restore-table-to-point-in-time \
+  --source-table-name lab37-products \
+  --target-table-name lab37-products-restored \
+  --use-latest-restorable-time
+
+aws dynamodb wait table-exists --table-name lab37-products-restored
+
+aws dynamodb scan --table-name lab37-products-restored --select COUNT --query 'Count'
+
+aws dynamodb delete-table --table-name lab37-products-restored
+```
+
+> PITR se activa como operación `in-place` — no hay downtime. DynamoDB mantiene backups continuos incrementales; la restauración genera una tabla nueva independiente, sin afectar a la tabla de origen.
+
 </details>
+
+---
 
 ## Limpieza
 
 ```bash
-cd labs/lab-37/aws
-
-terraform destroy \
-  -var="ssh_allowed_cidr=${MY_IP}/32"
-
-# Borrar el log local de despliegues (opcional)
-rm -f deployment.log
+# Desde labs/lab-37/aws/
+terraform destroy
 ```
+
+> ElastiCache tarda ~5-10 minutos en eliminarse. DynamoDB y Lambda se eliminan en segundos.
+
+---
 
 ## Buenas prácticas aplicadas
 
-- **Provisioners como ultimo recurso**: el lab los usa para aprender su
-  funcionamiento, pero en producción prefiere `user_data` para el bootstrap
-  inicial y SSM Run Command o Ansible para configuración posterior.
-- **`timeout` en `connection`**: evita que el apply falle si sshd no esta listo
-  inmediatamente. Un timeout de 5 minutos cubre la mayoria de escenarios de
-  arranque lento.
-- **SSH restringido por IP**: `ssh_allowed_cidr` permite abrir el puerto 22 solo
-  desde la IP del operador, no desde todo Internet.
-- **`on_failure = continue` solo para tareas no criticas**: el log local y el
-  webhook son operaciones de observabilidad; un fallo en ellas no debe impedir
-  el despliegue de la infraestructura.
-- **IMDSv2 obligatorio**: `http_tokens = "required"` en la instancia previene
-  ataques SSRF contra el metadata service.
-- **`triggers_replace` con `instance_id`**: garantiza que si la instancia se
-  reemplaza (por un `taint` o un cambio de AMI), los provisioners se vuelven a
-  ejecutar automáticamente sobre la nueva instancia.
-- **Endpoint `/version.json`**: expone la versión actualmente desplegada en un
-  formato machine-readable, util para healthchecks automaticos y verificacion
-  post-despliegue.
+- **Cache-Aside vs Write-Through**: Cache-Aside es más simple pero puede servir datos obsoletos durante el TTL. Write-Through actualiza el cache en cada escritura — reduce misses pero aumenta la latencia de escritura.
+- **TTL del cache**: Un TTL de 60 segundos es conservador. Para datos que cambian poco (catálogo de productos), puedes aumentarlo a 5-15 minutos. Para datos financieros o de inventario, mantenlo bajo (10-30s).
+- **`ssl_cert_reqs=None`** en el cliente Redis de laboratorio: en producción usa `ssl_cert_reqs=ssl.CERT_REQUIRED` con el certificado de la CA de AWS (`AmazonRootCA1.pem`).
+- **Nunca expongas el AUTH token en variables de entorno del proceso**: guárdalo en Secrets Manager y recupéralo al arrancar, como hace este lab.
+- **GSI no es gratis**: en modo On-Demand, un GSI duplica el costo de escritura porque cada write a la tabla base se replica al índice. Crea solo los GSI que vayas a usar.
+- **DynamoDB Streams tiene 24 horas de retención**: si la Lambda falla durante más de 24 horas, los registros del stream se pierden. Considera DLQ (Dead Letter Queue) para capturar errores.
+- **Evictions = problema de memoria**: si ves evictions frecuentes, aumenta el `node_type` del cluster Redis o reduce el TTL del cache para liberar memoria antes.
+
+---
 
 ## Recursos
 
-- [terraform_data — Documentacion oficial](https://developer.hashicorp.com/terraform/language/resources/terraform-data)
-- [Provisioners — Documentacion oficial](https://developer.hashicorp.com/terraform/language/provisioners)
-- [Provisioner file](https://developer.hashicorp.com/terraform/language/provisioners)
-- [Provisioner remote-exec](https://developer.hashicorp.com/terraform/language/provisioners)
-- [Provisioner local-exec](https://developer.hashicorp.com/terraform/language/provisioners)
-- [Bloque connection](https://developer.hashicorp.com/terraform/language/provisioners)
-- [Migracion de null_resource a terraform_data](https://developer.hashicorp.com/terraform/language/resources/terraform-data#migration-from-null_resource)
+- [DynamoDB On-Demand — AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/capacity-mode.html)
+- [Global Secondary Indexes — AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html)
+- [DynamoDB Streams — AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html)
+- [ElastiCache for Redis — Auth Token](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth.html)
+- [Cache-Aside Pattern — Microsoft](https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside)
+- [Terraform: aws_dynamodb_table](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dynamodb_table)
+- [Terraform: aws_elasticache_replication_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elasticache_replication_group)
+- [Terraform: aws_lambda_event_source_mapping](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_event_source_mapping)

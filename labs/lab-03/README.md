@@ -10,7 +10,7 @@
 
 En este laboratorio crearás una red base en AWS usando variables con tipos complejos, la función `cidrsubnet()` para calcular subredes automáticamente y bloques dinámicos para generar reglas de firewall. El objetivo es eliminar el _hardcoding_ de valores y escribir infraestructura reutilizable y validada.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
@@ -25,7 +25,7 @@ Al finalizar este laboratorio serás capaz de:
 - Laboratorio 02 completado (flujo básico de Terraform)
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
 ### Variables con Tipos Complejos
 
@@ -143,7 +143,7 @@ Una VPC con CIDR parametrizado (`var.vpc_cidr`, validado contra RFC 1918), 4 sub
 
 ---
 
-## Despliegue en AWS Real
+## Despliegue en AWS
 
 ### Código Terraform
 

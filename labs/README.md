@@ -26,40 +26,39 @@ labs/
 ├── lab-05/  # templatefile(), file() y generación de configuraciones
 ├── lab-06/  # Auditoría con data sources y reportes exportables
 ├── lab-07/  # Backend remoto con S3, DynamoDB y state locking
-├── lab-07b/ # HCP Terraform como Backend Remoto
 ├── lab-08/  # Refactorización declarativa: import, moved y removed
 ├── lab-09/  # Gestión de entornos con workspaces
-├── lab-10/  # State splitting: capas de infraestructura independientes
-├── lab-11/  # Gestión de Drift y Disaster Recovery (3-2-1)
-├── lab-12/  # Gestión de Identidades y Acceso Seguro para EC2
-├── lab-13/  # Cifrado Transversal con KMS y Jerarquía de Llaves
-├── lab-14/  # Automatización de Secretos "Zero-Touch"
-├── lab-15/  # Blindaje del Pipeline DevSecOps
-├── lab-16/  # Construcción de una Red Multi-AZ Robusta y Dinámica
-├── lab-17/  # Optimización de Salida a Internet y "NAT Tax"
-├── lab-18/  # Seguridad y Control de Tráfico en VPC
-├── lab-19/  # Conectividad Punto a Punto con VPC Peering
-├── lab-20/  # Hub-and-Spoke con Transit Gateway y RAM
-├── lab-21/  # Zonas Hospedadas Privadas y Resolución DNS
-├── lab-22/  # Módulos reutilizables: S3 con estándares corporativos
-├── lab-23/  # Módulos con validación, precondiciones y postcondiciones
-├── lab-24/  # Composición de Módulos Públicos con Estándares Corporativos
-├── lab-25/  # Testing de infraestructura con terraform test
-├── lab-26/  # Gobernanza, Documentación y Publicación "Lean"
-├── lab-27/  # Cimientos de EC2: Despliegue Dinámico y Seguro
-├── lab-28/  # Escalabilidad y Alta Disponibilidad con Zero Downtime
-├── lab-29/  # Microservicios con ECS Fargate y Malla de Servicios
-├── lab-30/  # Procesamiento Asíncrono y Resiliencia de Eventos
-├── lab-31/  # API Serverless: Lambda, API Gateway v2 y Layers
-├── lab-32/  # FinOps y Rendimiento: Optimización de Cómputo
-├── lab-33/  # El Data Lake Blindado: S3 con Seguridad y Ciclo de Vida
-├── lab-34/  # Almacenamiento Híbrido: EBS de Alto Rendimiento y EFS Compartido
-├── lab-35/  # Base de Datos Relacional Crítica: RDS Multi-AZ y Replicación
-├── lab-36/  # Arquitectura Moderna NoSQL: DynamoDB con Caché y Eventos
-├── lab-37/  # Orquestación Imperativa con terraform_data
-├── lab-38/  # Ingeniería de Datos y Resiliencia con Lifecycle
-├── lab-39/  # Despliegue Global y Adopción de Infraestructura Existente
-├── lab-40/  # Refactorización y Optimización de Performance
+├── lab-10/  # HCP Terraform como Backend Remoto
+├── lab-11/  # State splitting: capas de infraestructura independientes
+├── lab-12/  # Gestión de Drift y Disaster Recovery (3-2-1)
+├── lab-13/  # Gestión de Identidades y Acceso Seguro para EC2
+├── lab-14/  # Cifrado Transversal con KMS y Jerarquía de Llaves
+├── lab-15/  # Automatización de Secretos "Zero-Touch"
+├── lab-16/  # Blindaje del Pipeline DevSecOps
+├── lab-17/  # Construcción de una Red Multi-AZ Robusta y Dinámica
+├── lab-18/  # Optimización de Salida a Internet y "NAT Tax"
+├── lab-19/  # Seguridad y Control de Tráfico en VPC
+├── lab-20/  # Conectividad Punto a Punto con VPC Peering
+├── lab-21/  # Hub-and-Spoke con Transit Gateway y RAM
+├── lab-22/  # Zonas Hospedadas Privadas y Resolución DNS
+├── lab-23/  # Módulos reutilizables: S3 con estándares corporativos
+├── lab-24/  # Módulos con validación, precondiciones y postcondiciones
+├── lab-25/  # Composición de Módulos Públicos con Estándares Corporativos
+├── lab-26/  # Testing de infraestructura con terraform test
+├── lab-27/  # Gobernanza, Documentación y Publicación "Lean"
+├── lab-28/  # Cimientos de EC2: Despliegue Dinámico y Seguro
+├── lab-29/  # Escalabilidad y Alta Disponibilidad con Zero Downtime
+├── lab-30/  # Microservicios con ECS Fargate y Malla de Servicios
+├── lab-31/  # Procesamiento Asíncrono y Resiliencia de Eventos
+├── lab-32/  # API Serverless: Lambda, API Gateway v2 y Layers
+├── lab-33/  # FinOps y Rendimiento: Optimización de Cómputo
+├── lab-34/  # El Data Lake Blindado: S3 con Seguridad y Ciclo de Vida
+├── lab-35/  # Almacenamiento Híbrido: EBS de Alto Rendimiento y EFS Compartido
+├── lab-36/  # Base de Datos Relacional Crítica: RDS Multi-AZ y Replicación
+├── lab-37/  # Arquitectura Moderna NoSQL: DynamoDB con Caché y Eventos
+├── lab-38/  # Orquestación Imperativa con terraform_data
+├── lab-39/  # Ingeniería de Datos y Resiliencia con Lifecycle
+├── lab-40/  # Despliegue Global Multi-Región con configuration_aliases y KMS Multi-Region
 ├── lab-41/  # Gobernanza y Control de Versiones en CodeCommit
 ├── lab-42/  # Repositorio Privado de Módulos Terraform con CodeArtifact
 ├── lab-43/  # Canalización CI de IaC con CodeBuild y ECR
@@ -88,38 +87,39 @@ La mayoría de laboratorios contienen dos subdirectorios:
 | [lab-05](lab-05/README.md) | Plantillas de Sistema | `templatefile()`, `file()`, directivas `%{if}` y `%{for}`, `merge()`, `local_file` |
 | [lab-06](lab-06/README.md) | Auditoría y Conectividad | Data sources de solo lectura, `aws_vpc/subnets/instances`, `sensitive = true`, reportes exportables |
 | [lab-07](lab-07/README.md) | Backend Remoto Profesional | `backend "s3"`, S3 Versioning, Public Access Block, DynamoDB state locking, `encrypt = true`, migración de estado |
-| [lab-07b](lab-07b/README.md) | HCP Terraform como Backend Remoto | `cloud {}`, HCP Terraform, workspaces CLI-driven, ejecución remota, variables sensibles, historial de runs |
 | [lab-08](lab-08/README.md) | Refactorización Declarativa | `import {}`, `-generate-config-out`, `moved {}`, `removed {}`, adopción de recursos existentes |
 | [lab-09](lab-09/README.md) | Gestión de Entornos con Workspaces | `terraform workspace`, `terraform.workspace`, `lookup()`, `check {}`, `lifecycle { precondition }` |
-| [lab-10](lab-10/README.md) | State Splitting: Capas de Infraestructura | `terraform_remote_state`, state splitting, blast radius, `output` como interfaz entre capas, backends S3 por capa |
-| [lab-11](lab-11/README.md) | Gestión de Drift y Disaster Recovery | Detección de drift, `terraform apply -refresh-only`, reconciliación, restauración de estado desde S3 versioning |
-| [lab-12](lab-12/README.md) | Gestión de Identidades y Acceso Seguro para EC2 | `aws_iam_group`, `aws_iam_user`, `aws_iam_user_group_membership`, `aws_iam_role`, Trust Policy, `aws_iam_instance_profile`, IMDSv2, SSM Session Manager |
-| [lab-13](lab-13/README.md) | Cifrado Transversal con KMS y Jerarquía de Llaves | `aws_kms_key`, `enable_key_rotation`, `aws_kms_alias`, Key Policy segregada, `aws_ebs_volume` cifrado, `aws_s3_bucket_server_side_encryption_configuration`, `bucket_key_enabled`, Bucket Policy SSE forzoso |
-| [lab-16](lab-16/README.md) | Red Multi-AZ Robusta y Dinámica | `for_each`, `cidrsubnet()`, `merge()`, `lifecycle` / `postcondition`, Tags EKS, Multi-AZ |
-| [lab-17](lab-17/README.md) | Optimización de Salida a Internet y "NAT Tax" | Internet Gateway, NAT Gateway, Instancia NAT, `source_dest_check`, VPC Gateway Endpoint, FinOps |
-| [lab-18](lab-18/README.md) | Seguridad y Control de Tráfico en VPC | Security Groups, NACLs, bloques `dynamic`, `source_security_group_id`, VPC Flow Logs, ALB |
-| [lab-19](lab-19/README.md) | Conectividad Punto a Punto con VPC Peering | VPC Peering, rutas bidireccionales, no transitividad, referencia por CIDR en SG, auto_accept |
-| [lab-20](lab-20/README.md) | Hub-and-Spoke con Transit Gateway y RAM | Transit Gateway, TGW Attachments, TGW Route Tables, Hub-and-Spoke, AWS RAM, Appliance Mode |
-| [lab-21](lab-21/README.md) | Zonas Hospedadas Privadas y Resolución DNS | Route 53 PHZ, registro Alias, registro A, resolución interna, split-horizon DNS |
-| [lab-22](lab-22/README.md) | Módulos Reutilizables: S3 Corporativo | Módulos locales, `variable` con validación, `output`, `locals`, `merge()`, convenciones de módulos |
-| [lab-23](lab-23/README.md) | Módulos con Validación y Condiciones | `precondition`, `postcondition`, `check {}`, `variable` validation, error messages, contratos de módulo |
-| [lab-24](lab-24/README.md) | Composición de Módulos Públicos con Estándares Corporativos | Módulo wrapper, Terraform Registry, composición de módulos, `moved {}`, parámetros hardcoded |
-| [lab-25](lab-25/README.md) | Testing de Infraestructura | `terraform test`, `.tftest.hcl`, `run {}`, `mock_provider`, `override_resource`, test unitario vs integración |
-| [lab-26](lab-26/README.md) | Gobernanza, Documentación y Publicación | `terraform-docs`, `pre-commit`, catálogo de ejemplos, versionado semántico, Git tags, `?ref=` |
-| [lab-27](lab-27/README.md) | Cimientos de EC2: Despliegue Dinámico y Seguro | `data "aws_ami"`, IAM Instance Profile, IMDSv2 (`http_tokens`), `templatefile()`, `metadata_options`, SSM |
-| [lab-28](lab-28/README.md) | Escalabilidad y Alta Disponibilidad con Zero Downtime | `aws_launch_template`, ALB, ASG Multi-AZ, Target Tracking, `instance_refresh`, `aws_autoscaling_schedule` |
-| [lab-29](lab-29/README.md) | Microservicios con ECS Fargate y Malla de Servicios | `aws_ecr_repository` IMMUTABLE, `aws_ecr_lifecycle_policy`, `jsonencode()` en task definitions, SSM `SecureString`, Service Connect, Deployment Circuit Breaker |
-| [lab-30](lab-30/README.md) | Procesamiento Asíncrono y Resiliencia de Eventos | `aws_lambda_event_source_mapping`, `batch_size`, `filter_criteria`, `aws_lambda_function_event_invoke_config`, Lambda Destinations, `aws_sqs_queue`, `redrive_policy`, DLQ, `report_batch_item_failures` |
-| [lab-31](lab-31/README.md) | API Serverless: Lambda, API Gateway v2 y Layers | `data "archive_file"`, `source_code_hash`, `aws_lambda_layer_version`, `aws_apigatewayv2_api` HTTP API, `auto_deploy`, `AWS_PROXY`, `payload_format_version`, `aws_lambda_permission` |
-| [lab-32](lab-32/README.md) | FinOps y Rendimiento: Optimización de Cómputo | `aws_ecs_cluster_capacity_providers`, FARGATE_SPOT, `publish = true`, `aws_lambda_alias`, `aws_lambda_provisioned_concurrency_config`, `vpc_config`, `AWSLambdaVPCAccessExecutionRole`, Container Insights, `aws_cloudwatch_metric_alarm`, `aws_sns_topic` |
-| [lab-33](lab-33/README.md) | El Data Lake Blindado: S3 con Seguridad y Ciclo de Vida | `aws_s3_bucket_public_access_block`, SSE-KMS, Bucket Key, `aws_s3_bucket_versioning`, `aws_s3_bucket_lifecycle_configuration`, VPC Gateway Endpoint, `aws:sourceVpce`, módulos locales |
-| [lab-34](lab-34/README.md) | Almacenamiento Híbrido: EBS de Alto Rendimiento y EFS Compartido | `aws_ebs_volume` gp3, `iops`/`throughput`, `aws_dlm_lifecycle_policy`, `aws_efs_file_system` Elastic, `aws_efs_mount_target`, `aws_efs_access_point`, `posix_user`, módulos locales |
-| [lab-35](lab-35/README.md) | Base de Datos Relacional Crítica: RDS Multi-AZ y Replicación | `aws_db_subnet_group`, `aws_db_parameter_group`, `multi_az`, `max_allocated_storage`, `iam_database_authentication_enabled`, `aws_secretsmanager_secret_rotation`, read replica |
-| [lab-36](lab-36/README.md) | Arquitectura Moderna NoSQL: DynamoDB con Caché y Eventos | `aws_dynamodb_table`, `billing_mode = PAY_PER_REQUEST`, `global_secondary_index`, `stream_view_type`, `aws_lambda_event_source_mapping`, `aws_elasticache_replication_group`, `transit_encryption_enabled`, `auth_token`, Cache-Aside, `aws_cloudwatch_metric_alarm` |
-| [lab-37](lab-37/README.md) | Orquestación Imperativa con terraform_data | `terraform_data`, `triggers_replace`, `provisioner "file"`, `provisioner "remote-exec"`, `provisioner "local-exec"`, `on_failure = continue`, bloque `connection`, `aws_key_pair`, `self.triggers_replace` |
-| [lab-38](lab-38/README.md) | Ingeniería de Datos y Resiliencia con Lifecycle | Flatten Pattern, `flatten()`, `merge()`, `optional()`, `try()`, `can()`, `precondition`, `postcondition`, `check {}`, `lifecycle { ignore_changes }`, `default_tags` |
-| [lab-39](lab-39/README.md) | Despliegue Global y Adopción de Infraestructura Existente | Alias de proveedor, despliegue multi-región, `terraform plan -refresh-only`, drift, bloque `import {}`, `-generate-config-out` |
-| [lab-40](lab-40/README.md) | Refactorización y Optimización del Rendimiento | `moved {}`, `count` → `for_each`, extracción a módulos, `plugin_cache_dir`, `-parallelism`, `terraform_remote_state`, state splitting |
+| [lab-10](lab-10/README.md) | HCP Terraform como Backend Remoto | `cloud {}`, HCP Terraform, workspaces CLI-driven, ejecución remota, variables sensibles, historial de runs |
+| [lab-11](lab-11/README.md) | State Splitting: Capas de Infraestructura | `terraform_remote_state`, state splitting, blast radius, `output` como interfaz entre capas, backends S3 por capa |
+| [lab-12](lab-12/README.md) | Gestión de Drift y Disaster Recovery | Detección de drift, `terraform apply -refresh-only`, reconciliación, restauración de estado desde S3 versioning |
+| [lab-13](lab-13/README.md) | Gestión de Identidades y Acceso Seguro para EC2 | `aws_iam_group`, `aws_iam_user`, `aws_iam_user_group_membership`, `aws_iam_role`, Trust Policy, `aws_iam_instance_profile`, IMDSv2, SSM Session Manager |
+| [lab-14](lab-14/README.md) | Cifrado Transversal con KMS y Jerarquía de Llaves | `aws_kms_key`, `enable_key_rotation`, `aws_kms_alias`, Key Policy segregada, `aws_ebs_volume` cifrado, `aws_s3_bucket_server_side_encryption_configuration`, `bucket_key_enabled`, Bucket Policy SSE forzoso |
+| [lab-15](lab-15/README.md) | Automatización de Secretos "Zero-Touch" | `random_password`, `aws_secretsmanager_secret`, `aws_secretsmanager_secret_version`, `jsonencode()`, CMK compartida (RDS + Secrets Manager + S3 backend), inyección directa a `aws_db_instance`, hardening del state |
+| [lab-16](lab-16/README.md) | Blindaje del Pipeline DevSecOps | `aws_iam_openid_connect_provider`, `AssumeRoleWithWebIdentity`, Trust Policy con `StringLike` y `sub`, GitHub Actions OIDC, credenciales STS efímeras, Checkov, Trivy, OPA/Rego como gate bloqueante |
+| [lab-17](lab-17/README.md) | Red Multi-AZ Robusta y Dinámica | `for_each`, `cidrsubnet()`, `merge()`, `lifecycle` / `postcondition`, Tags EKS, Multi-AZ |
+| [lab-18](lab-18/README.md) | Optimización de Salida a Internet y "NAT Tax" | Internet Gateway, NAT Gateway, Instancia NAT, `source_dest_check`, VPC Gateway Endpoint, FinOps |
+| [lab-19](lab-19/README.md) | Seguridad y Control de Tráfico en VPC | Security Groups, NACLs, bloques `dynamic`, `source_security_group_id`, VPC Flow Logs, ALB |
+| [lab-20](lab-20/README.md) | Conectividad Punto a Punto con VPC Peering | VPC Peering, rutas bidireccionales, no transitividad, referencia por CIDR en SG, auto_accept |
+| [lab-21](lab-21/README.md) | Hub-and-Spoke con Transit Gateway y RAM | Transit Gateway, TGW Attachments, TGW Route Tables, Hub-and-Spoke, AWS RAM, Appliance Mode |
+| [lab-22](lab-22/README.md) | Zonas Hospedadas Privadas y Resolución DNS | Route 53 PHZ, registro Alias, registro A, resolución interna, split-horizon DNS |
+| [lab-23](lab-23/README.md) | Módulos Reutilizables: S3 Corporativo | Módulos locales, `variable` con validación, `output`, `locals`, `merge()`, convenciones de módulos |
+| [lab-24](lab-24/README.md) | Módulos con Validación y Condiciones | `precondition`, `postcondition`, `check {}`, `variable` validation, error messages, contratos de módulo |
+| [lab-25](lab-25/README.md) | Composición de Módulos Públicos con Estándares Corporativos | Módulo wrapper, Terraform Registry, composición de módulos, `moved {}`, parámetros hardcoded |
+| [lab-26](lab-26/README.md) | Testing de Infraestructura | `terraform test`, `.tftest.hcl`, `run {}`, `mock_provider`, `override_resource`, test unitario vs integración |
+| [lab-27](lab-27/README.md) | Gobernanza, Documentación y Publicación | `terraform-docs`, `pre-commit`, catálogo de ejemplos, versionado semántico, Git tags, `?ref=` |
+| [lab-28](lab-28/README.md) | Cimientos de EC2: Despliegue Dinámico y Seguro | `data "aws_ami"`, IAM Instance Profile, IMDSv2 (`http_tokens`), `templatefile()`, `metadata_options`, SSM |
+| [lab-29](lab-29/README.md) | Escalabilidad y Alta Disponibilidad con Zero Downtime | `aws_launch_template`, ALB, ASG Multi-AZ, Target Tracking, `instance_refresh`, `aws_autoscaling_schedule` |
+| [lab-30](lab-30/README.md) | Microservicios con ECS Fargate y Malla de Servicios | `aws_ecr_repository` IMMUTABLE, `aws_ecr_lifecycle_policy`, `jsonencode()` en task definitions, SSM `SecureString`, Service Connect, Deployment Circuit Breaker |
+| [lab-31](lab-31/README.md) | Procesamiento Asíncrono y Resiliencia de Eventos | `aws_lambda_event_source_mapping`, `batch_size`, `filter_criteria`, `aws_lambda_function_event_invoke_config`, Lambda Destinations, `aws_sqs_queue`, `redrive_policy`, DLQ, `report_batch_item_failures` |
+| [lab-32](lab-32/README.md) | API Serverless: Lambda, API Gateway v2 y Layers | `data "archive_file"`, `source_code_hash`, `aws_lambda_layer_version`, `aws_apigatewayv2_api` HTTP API, `auto_deploy`, `AWS_PROXY`, `payload_format_version`, `aws_lambda_permission` |
+| [lab-33](lab-33/README.md) | FinOps y Rendimiento: Optimización de Cómputo | `aws_ecs_cluster_capacity_providers`, FARGATE_SPOT, `publish = true`, `aws_lambda_alias`, `aws_lambda_provisioned_concurrency_config`, `vpc_config`, `AWSLambdaVPCAccessExecutionRole`, Container Insights, `aws_cloudwatch_metric_alarm`, `aws_sns_topic` |
+| [lab-34](lab-34/README.md) | El Data Lake Blindado: S3 con Seguridad y Ciclo de Vida | `aws_s3_bucket_public_access_block`, SSE-KMS, Bucket Key, `aws_s3_bucket_versioning`, `aws_s3_bucket_lifecycle_configuration`, VPC Gateway Endpoint, `aws:sourceVpce`, módulos locales |
+| [lab-35](lab-35/README.md) | Almacenamiento Híbrido: EBS de Alto Rendimiento y EFS Compartido | `aws_ebs_volume` gp3, `iops`/`throughput`, `aws_dlm_lifecycle_policy`, `aws_efs_file_system` Elastic, `aws_efs_mount_target`, `aws_efs_access_point`, `posix_user`, módulos locales |
+| [lab-36](lab-36/README.md) | Base de Datos Relacional Crítica: RDS Multi-AZ y Replicación | `aws_db_subnet_group`, `aws_db_parameter_group`, `multi_az`, `max_allocated_storage`, `iam_database_authentication_enabled`, `aws_secretsmanager_secret_rotation`, read replica |
+| [lab-37](lab-37/README.md) | Arquitectura Moderna NoSQL: DynamoDB con Caché y Eventos | `aws_dynamodb_table`, `billing_mode = PAY_PER_REQUEST`, `global_secondary_index`, `stream_view_type`, `aws_lambda_event_source_mapping`, `aws_elasticache_replication_group`, `transit_encryption_enabled`, `auth_token`, Cache-Aside, `aws_cloudwatch_metric_alarm` |
+| [lab-38](lab-38/README.md) | Orquestación Imperativa con terraform_data | `terraform_data`, `triggers_replace`, `provisioner "file"`, `provisioner "remote-exec"`, `provisioner "local-exec"`, `on_failure = continue`, bloque `connection`, `aws_key_pair`, `self.triggers_replace` |
+| [lab-39](lab-39/README.md) | Ingeniería de Datos y Resiliencia con Lifecycle | Flatten Pattern, `flatten()`, `merge()`, `optional()`, `try()`, `can()`, `precondition`, `postcondition`, `check {}`, `lifecycle { ignore_changes }`, `default_tags` |
+| [lab-40](lab-40/README.md) | Despliegue Global Multi-Región con `configuration_aliases` y KMS Multi-Region | `provider` con `alias` y `assume_role` (multi-cuenta simulada), `configuration_aliases = [aws.this, aws.shared]` en módulos, `providers = { ... }` al instanciar, `aws_kms_key` con `multi_region = true`, `aws_kms_replica_key`, hosted zone privada Route53 compartida cross-region, `terraform providers lock -platform` |
 | [lab-41](lab-41/README.md) | Gobernanza y Control de Versiones en CodeCommit | `aws_codecommit_repository`, `aws_codecommit_approval_rule_template`, `aws_codestar_notifications_notification_rule`, IAM Deny explícito, `StringLikeIfExists`, `sts:AssumeRole` pool de aprobadores, EventBridge auditoría, `terraform_data` bootstrap |
 | [lab-42](lab-42/README.md) | Repositorio Privado de Módulos Terraform con CodeArtifact | `aws_codeartifact_domain`, `aws_codeartifact_repository`, `aws_codeartifact_domain_permissions_policy`, `aws_codeartifact_repository_permissions_policy`, CMK con `enable_key_rotation`, `aws:SourceAccount`, Generic Package con namespace, `get-package-version-asset`, separación publisher/consumer, inmutabilidad semántica, VPC endpoint Interface con `aws:SourceVpce` |
 | [lab-43](lab-43/README.md) | Canalización CI de IaC con CodeBuild y ECR | `aws_ecr_repository` IMMUTABLE, `scan_on_push`, `aws_ecr_lifecycle_policy`, `aws_ecr_repository_policy`, `aws_codebuild_project`, `image_pull_credentials_type = "SERVICE_ROLE"`, `buildspec` embebido, patrón Fail Fast, `on-failure: ABORT`, Dockerfile multi-stage, SHA-256 verification, TFLint + Trivy + Checkov, `--exit-code 1` |

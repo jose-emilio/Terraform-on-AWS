@@ -1,40 +1,28 @@
-# Laboratorio 25 — LocalStack: Framework de Pruebas
+# Laboratorio 25 — LocalStack: El "Wrapper" Corporativo: RDS + VPC
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-## Tests unitarios (sin AWS ni LocalStack)
+## No disponible en LocalStack Community
 
-Los tests unitarios con `mock_provider` **no necesitan ningún proveedor real**. Funcionan en cualquier máquina con Terraform >= 1.7:
+Este laboratorio **no tiene versión LocalStack** porque depende de servicios que no están disponibles en la edición Community:
 
-```bash
-cd labs/lab-25/aws
-
-terraform init -backend=false
-terraform test -filter=tests/unit_naming.tftest.hcl
-```
-
-Esto ejecuta los tests de nombrado y etiquetado sin conectarse a AWS ni a LocalStack.
-
-## Tests de integración en LocalStack
-
-Los tests de integración (`integration.tftest.hcl`, `idempotency.tftest.hcl`) crean recursos reales. Para ejecutarlos contra LocalStack en lugar de AWS, necesitarías sobreescribir la configuración del proveedor en los archivos de test. Esto **no es posible directamente** porque:
-
-1. `terraform test` usa la configuración del proveedor de `providers.tf`
-2. Los archivos `.tftest.hcl` pueden definir un `provider`, pero no pueden configurar endpoints custom de forma práctica para LocalStack
-
-## Alternativas
-
-| Tipo de test | ¿Funciona sin AWS? | Cómo |
+| Servicio | LocalStack Community | Requerido por |
 |---|---|---|
-| Análisis estático (checkov/trivy) | Sí | No necesita proveedor |
-| Unit test (mock_provider) | Sí | No necesita proveedor |
-| Integration test | No directamente | Requiere AWS o provider override |
-| Idempotencia | No directamente | Requiere AWS o provider override |
+| **RDS** | No disponible | Módulo `terraform-aws-modules/rds/aws` |
+| **Secrets Manager (RDS managed)** | Parcial | `manage_master_user_password = true` |
+| **VPC completa** | Emulación parcial | Módulo `terraform-aws-modules/vpc/aws` (NAT GW, route tables) |
 
-## Recomendación
+## Alternativa
 
-Para un pipeline sin coste:
-1. `checkov -d modules/` — análisis estático
-2. `terraform test -filter=tests/unit_*` — tests unitarios con mock
-3. Los tests de integración e idempotencia se ejecutan solo en la cuenta de AWS de sandbox
+Para practicar los conceptos de este laboratorio sin coste de AWS:
+
+1. **Composición de módulos y encadenamiento de outputs**: revisa el lab22 (módulos S3) y lab23 (módulos con validación) en sus versiones localstack
+2. **Parámetros hardcoded**: el concepto se puede practicar con cualquier módulo que use S3 o VPC básica
+3. **`moved {}` blocks**: funciona con cualquier recurso de Terraform, incluso con recursos locales (`local_file`, `null_resource`)
+
+## Ejecución en AWS
+
+Este laboratorio requiere una cuenta de AWS real. Consulta la guía principal en [../README.md](../README.md).
+
+> **Aviso de coste:** La instancia RDS `db.t4g.micro` tiene coste por hora. Destruye los recursos al finalizar.

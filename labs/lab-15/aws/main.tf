@@ -1,93 +1,162 @@
-# ── Data sources ─────────────────────────────────────────────────────────────
-data "aws_caller_identity" "current" {}
-
-# ── OIDC Provider: GitHub Actions ────────────────────────────────────────────
-# Desde julio 2023 AWS valida automáticamente los JWT de GitHub Actions contra
-# el JWKS público (https://token.actions.githubusercontent.com/.well-known/jwks)
-# sin necesidad de configurar thumbprint_list. El provider Terraform lo soporta
-# desde 5.x: el campo es opcional. Antes era obligatorio y todo el mundo
-# hardcodeaba el thumbprint del DigiCert root CA, requiriendo actualizaciones
-# manuales cada vez que GitHub rotaba el certificado.
-resource "aws_iam_openid_connect_provider" "github" {
-  url            = "https://token.actions.githubusercontent.com"
-  client_id_list = ["sts.amazonaws.com"]
-
-  tags = {
-    Name      = "${var.project}-github-oidc"
-    Project   = var.project
-    ManagedBy = "terraform"
+# ── Locals ──────────────────────────────────────────────────────────────────
+locals {
+  common_tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
   }
+
+  # AZs explícitas para garantizar que las dos subredes privadas caen en
+  # zonas distintas. RDS exige al menos 2 AZs distintas en el subnet group.
+  azs = ["${var.region}a", "${var.region}b"]
 }
 
-# ── Trust Policy: sólo el repositorio y la ref autorizados pueden asumir el rol ─
-data "aws_iam_policy_document" "github_actions_trust" {
-  statement {
-    sid     = "AllowGitHubOIDC"
-    effect  = "Allow"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
+# ── KMS: Clave maestra para cifrar secretos y almacenamiento ─────────────────
+# Esta clave cifra tres capas: Secrets Manager, el almacenamiento RDS y,
+# una vez exportada su ARN, el backend S3 con el .tfstate.
+resource "aws_kms_key" "secrets" {
+  description             = "CMK para ${var.project_name}: cifra Secrets Manager, RDS y el backend de Terraform"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
 
-    principals {
-      type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-
-    condition {
-      test     = "StringLike"
-      variable = "token.actions.githubusercontent.com:sub"
-      # Formato: repo:<org>/<repo>:<ref>
-      # Ejemplos:
-      #   allowed_ref = "*"                      → cualquier rama o tag
-      #   allowed_ref = "ref:refs/heads/main"    → sólo la rama main
-      values = ["repo:${var.github_org}/${var.github_repo}:${var.allowed_ref}"]
-    }
-  }
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-secrets-cmk"
+  })
 }
 
-# ── IAM Role: identidad efímera para el pipeline ─────────────────────────────
-resource "aws_iam_role" "github_actions" {
-  name               = "${var.project}-github-actions"
-  description        = "Rol asumido por GitHub Actions via OIDC - sin llaves de acceso permanentes"
-  assume_role_policy = data.aws_iam_policy_document.github_actions_trust.json
-
-  tags = {
-    Name      = "${var.project}-github-actions"
-    Project   = var.project
-    ManagedBy = "terraform"
-  }
+resource "aws_kms_alias" "secrets" {
+  name          = "alias/${var.project_name}-secrets"
+  target_key_id = aws_kms_key.secrets.key_id
 }
 
-# ── Permisos del rol: PowerUserAccess ────────────────────────────────────────
-#
-# Para simplificar el laboratorio adjuntamos la política gestionada por AWS
-# `PowerUserAccess`, que concede acceso a casi todos los servicios (S3, KMS,
-# EC2, Lambda, etc.) excluyendo la gestión de IAM, organizaciones y account
-# settings. Es la política "todoterreno" que permite que el pipeline ejecute
-# Terraform contra prácticamente cualquier recurso sin tener que ampliar la
-# policy cada vez que el alumno cambia el demo.
-#
-# ⚠️ EN PRODUCCIÓN NO se usa así.
-#
-# El principio de privilegio mínimo (PoLP) exige conceder solo los permisos
-# imprescindibles para el caso de uso concreto. Una política inline restringida
-# a, por ejemplo:
-#
-#   - s3:Get*/Put*/List* solo sobre el bucket de estado
-#   - kms:Encrypt/Decrypt solo sobre la CMK del proyecto
-#   - ec2:Describe* y los Create/Delete específicos para los recursos del módulo
-#
-# reduce el blast radius si las credenciales temporales se vieran filtradas:
-# un atacante con esas credenciales solo podría tocar lo que el rol gestiona,
-# no exfiltrar otros servicios o cuentas. Esto es lo que un equipo real
-# despliega — y cuesta mantener cada vez que la infraestructura crece, motivo
-# por el que el lab simplifica con PowerUserAccess. Ver el [Reto 2] del README
-# para el ejercicio de convertir esto a privilegio mínimo real.
-resource "aws_iam_role_policy_attachment" "github_actions_poweruser" {
-  role       = aws_iam_role.github_actions.name
-  policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
+# ── Contraseña criptográficamente segura ────────────────────────────────────
+# random_password genera entropía real del sistema operativo subyacente.
+# El resultado se almacena cifrado en el estado de Terraform; nunca aparece
+# en variables del operador ni en la salida del plan.
+resource "random_password" "db" {
+  length  = 32
+  special = true
+  # Excluimos caracteres que rompen cadenas de conexión MySQL/JDBC:
+  # @, ', ", /, \, `, ^, ~, |, espacio
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+# ── Secrets Manager: contenedor del secreto ─────────────────────────────────
+resource "aws_secretsmanager_secret" "db" {
+  name        = "${var.project_name}/rds/master-credentials"
+  description = "Credenciales maestras de RDS para ${var.project_name} - gestionadas por Terraform"
+  kms_key_id  = aws_kms_key.secrets.key_id
+
+  # En entorno de lab se elimina sin período de recuperación para facilitar
+  # redeployments. En producción usa recovery_window_in_days = 30.
+  recovery_window_in_days = 0
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-db-credentials"
+  })
+}
+
+# ── Secrets Manager: versión con credenciales en formato JSON ────────────────
+# El secreto incluye todos los datos necesarios para conectar a la base de
+# datos. Las aplicaciones recuperan este JSON sin conocer la contraseña en
+# tiempo de despliegue.
+resource "aws_secretsmanager_secret_version" "db" {
+  secret_id = aws_secretsmanager_secret.db.id
+
+  secret_string = jsonencode({
+    username = var.db_username
+    password = random_password.db.result
+    engine   = "mysql"
+    host     = aws_db_instance.main.address
+    port     = 3306
+    dbname   = var.db_name
+  })
+}
+
+# ── Red mínima para RDS ─────────────────────────────────────────────────────
+
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(local.common_tags, { Name = "${var.project_name}-vpc" })
+}
+
+resource "aws_subnet" "private" {
+  count = 2
+
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.vpc_cidr, 8, count.index)
+  availability_zone = local.azs[count.index]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-private-${local.azs[count.index]}"
+    Tier = "private"
+  })
+}
+
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project_name}-db-subnet-group"
+  subnet_ids = aws_subnet.private[*].id
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-db-subnet-group"
+  })
+}
+
+resource "aws_security_group" "rds" {
+  name        = "${var.project_name}-rds-sg"
+  description = "Acceso a RDS restringido al CIDR interno de la VPC"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 3306
+    to_port     = 3306
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "MySQL desde la VPC"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Salida sin restricciones"
+  }
+
+  tags = merge(local.common_tags, { Name = "${var.project_name}-rds-sg" })
+}
+
+# ── RDS: inyección directa de la contraseña desde random_password ────────────
+# La contraseña nunca aparece como variable de entrada del operador.
+# Terraform la genera, la cifra en el estado (via KMS si el backend está
+# configurado correctamente) y la inyecta directamente en RDS y en el secreto.
+resource "aws_db_instance" "main" {
+  identifier = "${var.project_name}-db"
+
+  engine         = "mysql"
+  engine_version = "8.0"
+  instance_class = "db.t3.micro"
+
+  allocated_storage     = 20
+  max_allocated_storage = 100
+  storage_encrypted     = true
+  kms_key_id            = aws_kms_key.secrets.arn
+
+  db_name  = var.db_name
+  username = var.db_username
+  password = random_password.db.result # <- Zero-Touch: inyeccion directa
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+
+  # Configuración simplificada para entorno de lab
+  skip_final_snapshot     = true
+  deletion_protection     = false
+  backup_retention_period = 0
+  multi_az                = false
+
+  tags = merge(local.common_tags, { Name = "${var.project_name}-db" })
 }

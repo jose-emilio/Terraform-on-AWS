@@ -1,9 +1,9 @@
-# Laboratorio 13 — LocalStack: Cifrado Transversal con KMS y Jerarquía de Llaves
+# Laboratorio 13 — LocalStack: Gestión de Identidades y Acceso Seguro para EC2
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Entorno local con LocalStack para practicar los recursos KMS y S3 del laboratorio
+Entorno local con LocalStack para practicar los recursos IAM del laboratorio
 sin necesidad de una cuenta de AWS.
 
 > Para la guía completa (conceptos, arquitectura, retos y buenas prácticas)
@@ -13,20 +13,19 @@ sin necesidad de una cuenta de AWS.
 
 | Aspecto | LocalStack Community |
 |---------|---------------------|
-| CMK (`aws_kms_key`) | Soportada |
-| Alias KMS | Soportado |
-| Cifrado/descifrado con la CMK | Soportado |
-| Key Policy con segregación de roles | Policy simplificada (sin `data.aws_caller_identity`) |
-| Rotación automática (`enable_key_rotation`) | Aceptada, no ejecutada realmente |
-| S3 con SSE-KMS | Soportado |
-| Volumen EBS cifrado | **Omitido** — EBS no está disponible en LocalStack Community |
-| Política de bucket con `StringNotEqualsIfExists` | **Omitida** — condición no implementada en LocalStack Community |
+| Recursos IAM (grupo, usuario, rol, profile) | Soportados |
+| Instancia EC2 | **Omitida** — LocalStack Community no propaga el Instance Profile antes de `RunInstances` (error 404) |
+| Ejecución de `user_data.sh` | **No soportada** |
+| IMDSv2 y credenciales temporales en IMDS | **No disponible** |
+| SSM Session Manager | **No disponible** |
+
+La verificación de credenciales temporales requiere AWS real.
+Este entorno cubre únicamente la creación y validación de los recursos IAM.
 
 ## Requisitos previos
 
 - LocalStack CLI instalado y Docker en ejecución.
 - **Terraform >= 1.10**.
-- AWS CLI con perfil configurado para LocalStack (`AWS_ENDPOINT_URL`).
 
 ## Despliegue
 
@@ -42,34 +41,36 @@ terraform apply
 
 ## Verificación en LocalStack
 
+### Confirmar recursos IAM creados
+
 ```bash
+# Usar el endpoint local de LocalStack
 export AWS_ENDPOINT_URL=http://localhost.localstack.cloud:4566
 
-# Describir la CMK
-aws kms describe-key --key-id alias/lab13-main
+aws iam get-group --group-name lab13-developers
+aws iam get-user --user-name lab13-dev-01
+aws iam get-role --role-name lab13-ec2-role
+aws iam get-instance-profile --instance-profile-name lab13-ec2-profile
+```
 
-# Verificar estado de rotación
-aws kms get-key-rotation-status \
-  --key-id $(terraform output -raw cmk_key_id)
+### Verificar la Trust Policy del rol
 
-# Cifrar texto plano con la CMK
-# --cli-binary-format raw-in-base64-out: necesario en AWS CLI v2 para texto plano
-CIPHER=$(aws kms encrypt \
-  --key-id alias/lab13-main \
-  --plaintext "hola-lab13" \
-  --cli-binary-format raw-in-base64-out \
-  --query CiphertextBlob --output text)
-echo "Cifrado: $CIPHER"
+```bash
+aws iam get-role --role-name lab13-ec2-role \
+  --query 'Role.AssumeRolePolicyDocument' --output json
+```
 
-# Descifrar (round-trip)
-# $CIPHER ya es base64 — decrypt no necesita --cli-binary-format
-aws kms decrypt \
-  --ciphertext-blob "$CIPHER" \
-  --query Plaintext --output text | base64 -d
+### Verificar membresía del grupo
 
-# Verificar configuración SSE del bucket
-aws s3api get-bucket-encryption \
-  --bucket $(terraform output -raw s3_bucket_name)
+```bash
+aws iam list-groups-for-user --user-name lab13-dev-01 \
+  --query 'Groups[].GroupName'
+```
+
+### Ver outputs de Terraform
+
+```bash
+terraform output
 ```
 
 ## Limpieza

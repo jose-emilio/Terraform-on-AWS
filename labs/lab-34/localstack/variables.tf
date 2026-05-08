@@ -3,12 +3,12 @@ variable "project" {
   default = "lab34-local"
 }
 
-variable "app_uid" {
+variable "transition_days" {
   type    = number
-  default = 1001
+  default = 90
 }
 
-variable "app_gid" {
+variable "expiration_days" {
   type    = number
-  default = 1001
+  default = 365
 }

@@ -1,4 +1,4 @@
-# Laboratorio 34 — Almacenamiento Híbrido: EBS de Alto Rendimiento y EFS Compartido
+# Laboratorio 34 — El Data Lake Blindado: S3 con Seguridad y Ciclo de Vida
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,448 +8,461 @@
 
 ## Visión general
 
-En este laboratorio implementarás las dos formas principales de almacenamiento persistente en AWS: **EBS** para discos individuales de alta velocidad y **EFS** para sistemas de archivos compartidos entre múltiples instancias. Aprenderás a desacoplar IOPS y throughput del tamaño del volumen con **gp3**, a automatizar respaldos basados en etiquetas con **Data Lifecycle Manager**, a crear un sistema de archivos elástico cifrado con **EFS Elastic Throughput**, a desplegar mount targets en múltiples AZs y a aislar datos de aplicaciones con un **EFS Access Point** que impone identidad POSIX.
+En este laboratorio implementarás un bucket S3 de nivel empresarial que cubre privacidad, cifrado, resiliencia y ahorro automático de costes. Aprenderás a bloquear el acceso público con los cuatro controles de `aws_s3_bucket_public_access_block`, a cifrar con una **CMK propia** activando el **Bucket Key** para reducir un 99% las llamadas a KMS, a habilitar el **versionado** como escudo contra ransomware y errores humanos, a configurar un **ciclo de vida** que mueve datos a Glacier a los 90 días y los elimina al año, y a restringir el acceso mediante un **VPC Gateway Endpoint** con una bucket policy que deniega todo tráfico que no provenga del endpoint.
 
-La infraestructura se organiza en tres **módulos locales reutilizables**: `modules/vpc` gestiona la VPC y las subnets, `modules/ec2-client` encapsula la instancia, su acceso SSM y el volumen EBS, y `modules/efs-share` gestiona el file system EFS, los mount targets y el Access Point. El módulo raíz orquesta los tres módulos y gestiona directamente la política DLM.
+Toda la configuración del bucket se encapsula en un **módulo local reutilizable** (`modules/secure-bucket`), de forma que puede aplicarse a cualquier bucket del proyecto con un único bloque `module`.
 
-## Objetivos de Aprendizaje
+## Objetivos de aprendizaje
 
 Al finalizar este laboratorio serás capaz de:
 
-- Estructurar la infraestructura en tres módulos locales (`vpc`, `ec2-client`, `efs-share`) con interfaces claras de variables y outputs
-- Crear un volumen `aws_ebs_volume` de tipo gp3 configurando IOPS y throughput de forma independiente al tamaño
-- Adjuntar el volumen a una instancia con `aws_volume_attachment`
-- Definir una política `aws_dlm_lifecycle_policy` que automatiza snapshots EBS diarios con retención de 14 días basada en etiquetas
-- Crear un `aws_efs_file_system` cifrado con `throughput_mode = "elastic"`
-- Desplegar `aws_efs_mount_target` en cada subnet privada con `for_each` sobre una lista de IDs
-- Configurar el Security Group del EFS para permitir TCP 2049 exclusivamente desde el Security Group de las instancias EC2
-- Implementar un `aws_efs_access_point` con `posix_user` y `root_directory` para aislar los datos de una aplicación
+- Crear un módulo local Terraform con variables, recursos y outputs propios, e invocarlo desde el módulo raíz
+- Aplicar `aws_s3_bucket_public_access_block` con los cuatro controles activos y entender qué bloquea cada uno
+- Configurar cifrado SSE-KMS con `aws_kms_key` (CMK propia) y activar `bucket_key_enabled = true` para reducir el coste de llamadas a KMS
+- Habilitar `aws_s3_bucket_versioning` y entender por qué las versiones protegen contra ransomware y borrados accidentales
+- Definir una `aws_s3_bucket_lifecycle_configuration` con transición a Glacier y expiración para versiones actuales y no actuales
+- Crear un `aws_vpc_endpoint` de tipo Gateway para S3 y asociar una bucket policy con la condición `aws:sourceVpce` que restringe el acceso al endpoint
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado (necesario para `use_lockfile` en el backend S3)
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-- Perfil AWS con permisos sobre EC2, EBS, EFS, IAM y DLM
+- Perfil AWS con permisos sobre S3, KMS, EC2 (VPC) e IAM
 - LocalStack en ejecución (para la sección de LocalStack)
 
 ---
 
 ## Arquitectura
 
-![EBS gp3 alto rendimiento adjunto a EC2 + EFS Multi-AZ con mount targets en 2 subredes + DLM con snapshots automáticos por tag](arch/diagrama.svg)
+![Data Lake S3 con KMS CMK, SSE-KMS Bucket Key, versionado, lifecycle a Glacier y bucket policy que exige VPC Gateway Endpoint](arch/diagrama.svg)
 
-Una VPC con subredes privadas en 2 AZs aloja una **EC2 cliente** con un volumen **EBS gp3** dedicado (100 GB, 6000 IOPS, 400 MB/s) — almacenamiento rápido single-AZ por instancia. En paralelo, un **EFS** proporciona sistema de archivos compartido con **mount targets en cada AZ** (replicación automática) y un Access Point que fija UID/GID para la app. El SG de NFS solo admite 2049 desde el SG de la EC2 — sin CIDRs hardcodeados. Una política de **Data Lifecycle Manager** toma snapshots diarios a las 03:00 UTC de cualquier volumen con `tag Backup = true` (retención 14 snapshots), independientemente del código de la app.
+El módulo `secure-bucket` encapsula todas las capas de defensa: una **CMK** dedicada con rotación anual cifra los objetos vía **SSE-KMS con Bucket Key** (1 sola llamada a KMS por bucket en lugar de por objeto). El bloqueo público con los 4 controles, el **versionado** anti-ransomware y la **lifecycle rule** que transiciona a Glacier y luego expira completan la fortificación. La **bucket policy** deniega `s3:*` cuando `aws:sourceVpce ≠ endpoint` **Y** `aws:PrincipalAccount ≠ cuenta` (AND lógico): así los principales de la propia cuenta acceden con normalidad y los accesos externos solo funcionan a través del **VPC Gateway Endpoint** desde la subred privada.
 
 ---
 
-## Conceptos Clave
+## Conceptos clave
 
-### gp3: desacoplamiento de rendimiento y capacidad
+### Módulo local: encapsulación de controles de seguridad
 
-`gp2` escala IOPS automáticamente con el tamaño del volumen (3 IOPS/GB, máximo 16 000). Un volumen de 100 GB tiene 300 IOPS baseline — insuficiente para cargas de trabajo intensivas. `gp3` rompe esta dependencia: puedes configurar hasta 16 000 IOPS y 1 000 MB/s de throughput en cualquier tamaño de volumen, sin coste adicional hasta 3 000 IOPS y 125 MB/s.
-
-```
-gp2 de 100 GB → 300 IOPS fijos (no configurable)
-gp3 de 100 GB → 6 000 IOPS + 400 MB/s (configuración independiente)
-```
-
-El coste de almacenamiento base de gp3 ($0.08/GB/mes) es un 20% inferior a gp2 ($0.10/GB/mes). El IOPS adicional se factura por separado (primeros 3 000 gratis).
-
-### Data Lifecycle Manager (DLM)
-
-DLM automatiza el ciclo de vida de snapshots EBS. En lugar de un script de cron o Lambda, defines una política declarativa que selecciona volúmenes por etiquetas, programa la creación de snapshots y gestiona la retención automática.
-
-La política requiere dos recursos: un rol IAM que DLM asume para crear snapshots en tu cuenta, y la propia política con sus reglas de programación:
+Un módulo local agrupa recursos relacionados bajo una interfaz clara (variables + outputs). En este laboratorio, `modules/secure-bucket` encapsula los seis recursos de seguridad del bucket. El módulo raíz (`main.tf`) lo invoca con un bloque `module`, pasando únicamente los parámetros que varían:
 
 ```hcl
-# Rol IAM que DLM asume para operar en tu cuenta
-resource "aws_iam_role" "dlm" {
-  name = "${var.project}-dlm-role"
+module "datalake" {
+  source = "./modules/secure-bucket"
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "dlm.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  bucket_name     = local.bucket_name
+  project         = var.project
+  tags            = local.tags
+  vpc_endpoint_id = aws_vpc_endpoint.s3.id
+  transition_days = var.transition_days
+  expiration_days = var.expiration_days
 }
+```
 
-resource "aws_iam_role_policy_attachment" "dlm" {
-  role       = aws_iam_role.dlm.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
-}
+El módulo puede reutilizarse para crear un segundo bucket (por ejemplo, `logs`) añadiendo otro bloque `module` con distintos valores, sin duplicar código.
 
-# Política DLM
-resource "aws_dlm_lifecycle_policy" "ebs_backup" {
-  description        = "Snapshots diarios EBS - etiqueta Backup true - retencion 14 dias"
-  execution_role_arn = aws_iam_role.dlm.arn
-  state              = "ENABLED"
+### Bloqueo de acceso público: cuatro controles
 
-  policy_details {
-    resource_types = ["VOLUME"]
+`aws_s3_bucket_public_access_block` aplica cuatro controles independientes:
 
-    # Selecciona todos los volúmenes EBS con la etiqueta Backup=true
-    target_tags = {
-      Backup = "true"
-    }
+| Control | Qué bloquea |
+|---|---|
+| `block_public_acls` | Rechaza `PutBucketAcl` y `PutObjectAcl` que otorguen acceso público |
+| `ignore_public_acls` | Ignora ACLs públicas ya existentes en el bucket |
+| `block_public_policy` | Rechaza `PutBucketPolicy` si la política concede acceso público |
+| `restrict_public_buckets` | Bloquea el acceso anónimo aunque la política lo permita |
 
-    schedule {
-      name = "daily-14d"
+Los cuatro activos en conjunto garantizan que ningún objeto sea accesible públicamente, incluso si se aplica una ACL o política errónea.
 
-      create_rule {
-        interval      = 24
-        interval_unit = "HOURS"
-        times         = ["03:00"]   # hora UTC de inicio de la ventana
-      }
+### SSE-KMS con Customer Managed Key y Bucket Key
 
-      retain_rule {
-        count = 14   # conserva los 14 snapshots más recientes; elimina el resto
-      }
+Con `sse_algorithm = "aws:kms"` y una CMK propia, cada objeto se cifra con una **Data Encryption Key** (DEK) generada por KMS. La CMK cifra la DEK — nunca el objeto directamente.
 
-      tags_to_add = {
-        SnapshotCreator = "DLM"
-        Project         = var.project
-      }
+**Bucket Key** (`bucket_key_enabled = true`) cambia este modelo: S3 genera una Bucket Key derivada de la CMK y la almacena en el bucket. Las llamadas a KMS se hacen solo para obtener o renovar la Bucket Key, no por objeto. Resultado: hasta un 99% menos de llamadas a KMS, con el consiguiente ahorro en costes y reducción de latencia.
 
-      copy_tags = true   # hereda las etiquetas del volumen origen
-    }
+```hcl
+rule {
+  bucket_key_enabled = true
+  apply_server_side_encryption_by_default {
+    sse_algorithm     = "aws:kms"
+    kms_master_key_id = aws_kms_key.s3.arn
   }
 }
 ```
 
-La política selecciona volúmenes por etiqueta (`Backup = "true"`), no por ID. Esto significa que cualquier volumen nuevo que lleve esa etiqueta queda cubierto automáticamente sin modificar la política. El rol `AWSDataLifecycleManagerServiceRole` ya incluye los permisos necesarios (`ec2:CreateSnapshot`, `ec2:DeleteSnapshot`, `ec2:DescribeVolumes`, etc.) — no es necesario crear una política IAM personalizada.
+### Versionado: protección contra ransomware y errores humanos
 
-### EFS Elastic Throughput
-
-EFS ofrece tres modos de throughput:
-
-| Modo | Comportamiento | Uso recomendado |
-|---|---|---|
-| `bursting` | Throughput proporcional al tamaño del FS; acumula créditos | File systems pequeños con acceso esporádico |
-| `provisioned` | Throughput fijo garantizado; facturado por MB/s | Cargas predecibles y constantes |
-| `elastic` | Throughput automático hasta 3 GB/s lecturas / 1 GB/s escrituras | Cargas variables o desconocidas |
-
-`elastic` es el modo recomendado para la mayoría de nuevos deployments: solo pagas por los MB/s consumidos, sin aprovisionar capacidad de antemano.
-
-### Mount Targets y AZs
-
-Un mount target es el punto de entrada de red de EFS en una subnet. Para alta disponibilidad y latencia óptima, se despliega uno por AZ. EFS replica los datos de forma transparente entre todas las AZs de la región; cada instancia se conecta al mount target de su propia AZ:
+Con versionado habilitado, S3 preserva todas las versiones de cada objeto. Un ataque de ransomware (que cifra y sobreescribe los objetos) crea nuevas versiones con el contenido cifrado, pero las versiones originales permanecen intactas y recuperables. Un borrado accidental crea un "delete marker" — la versión anterior se restaura eliminando el marker.
 
 ```hcl
-resource "aws_efs_mount_target" "main" {
-  for_each = toset(var.subnet_ids)   # una iteración por subnet/AZ
-
-  file_system_id  = aws_efs_file_system.main.id
-  subnet_id       = each.value
-  security_groups = [aws_security_group.efs.id]
+resource "aws_s3_bucket_versioning" "main" {
+  bucket = aws_s3_bucket.main.id
+  versioning_configuration {
+    status = "Enabled"
+  }
 }
 ```
 
-El Security Group del EFS debe permitir TCP 2049 (protocolo NFS) exclusivamente desde el Security Group de las instancias EC2. Usar `source_security_group_id` en lugar de CIDR es más seguro y escala automáticamente cuando se añaden nuevas instancias.
+### Ciclo de vida: FinOps automático
 
-### EFS Access Point
+`aws_s3_bucket_lifecycle_configuration` define reglas que AWS aplica automáticamente. La regla de este laboratorio actúa sobre todos los objetos (`filter {}`) y sobre sus versiones no actuales:
 
-Un Access Point virtualiza un directorio raíz dentro del EFS y aplica una identidad POSIX fija a todos los accesos:
+```hcl
+transition {
+  days          = 90    # versión actual → Glacier tras 90 días
+  storage_class = "GLACIER"
+}
 
-- **`posix_user`**: UID y GID que el sistema operativo impone en cada operación de fichero, independientemente del usuario real del proceso.
-- **`root_directory.path`**: el proceso ve este directorio como `/`, no puede navegar fuera de él.
-- **`creation_info`**: si el directorio no existe, EFS lo crea con el propietario y permisos indicados.
+expiration {
+  days = 365            # versión actual → eliminada tras 365 días
+}
 
-Esto permite que múltiples aplicaciones compartan el mismo EFS con aislamiento total: cada una tiene su propio Access Point apuntando a su directorio, con su UID/GID, sin posibilidad de acceder a los datos de las demás.
+noncurrent_version_transition {
+  noncurrent_days = 90  # versiones antiguas → Glacier
+  storage_class   = "GLACIER"
+}
+
+noncurrent_version_expiration {
+  noncurrent_days = 365 # versiones antiguas → eliminadas
+}
+```
+
+Glacier Flexible Retrieval cuesta ~$0.004/GB/mes frente a ~$0.023/GB/mes de S3 Standard — un ahorro del 83% para datos de acceso infrecuente.
+
+### VPC Gateway Endpoint y bucket policy con sourceVpce
+
+Un Gateway Endpoint de S3 es **gratuito** (a diferencia del Interface Endpoint). Inyecta una ruta en la route table de la subred para que el tráfico S3 no salga a internet. Su ID puede usarse en la bucket policy como condición:
+
+```hcl
+Condition = {
+  StringNotEquals = {
+    "aws:sourceVpce" = "vpce-xxxxxxxxxxxxxxxxx"
+  }
+}
+```
+
+Con `Effect = "Deny"` y esta condición, cualquier petición que no provenga del endpoint es denegada, incluso si el principal tiene permisos IAM suficientes. Es la forma más efectiva de garantizar que solo el tráfico interno de la VPC pueda acceder a los datos.
+
+> **Nota**: la bucket policy de este laboratorio incluye una excepción para cualquier principal de la propia cuenta (condición `aws:PrincipalAccount = ACCOUNT_ID` evaluada con `StringNotEquals` junto a `aws:sourceVpce`). El `Deny` sólo se activa cuando el principal **no** pertenece a la cuenta **y** el tráfico **no** viene del endpoint, lo que permite a Terraform gestionar el bucket desde fuera de la VPC. En producción, sustituye `aws:PrincipalAccount` por `aws:PrincipalArn` con el ARN específico del rol de despliegue para reducir el alcance al mínimo.
 
 ---
 
 ## Estructura del proyecto
 
 ```
-labs/lab-34/
-├── README.md
+lab-34/
 ├── arch/
-│   └── diagrama.svg                       # Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg              # Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf
-│   ├── variables.tf
-│   ├── main.tf
-│   ├── outputs.tf
-│   ├── aws.s3.tfbackend
+│   ├── aws.s3.tfbackend      # Parámetros del backend S3 (sin bucket)
+│   ├── providers.tf          # Backend S3, Terraform >= 1.10, provider AWS
+│   ├── variables.tf          # region, project, transition_days, expiration_days
+│   ├── main.tf               # VPC, subred, route table, VPC endpoint, módulo
+│   ├── outputs.tf            # bucket_name, kms_key_arn, vpc_endpoint_id...
 │   └── modules/
-│       ├── vpc/
-│       │   ├── main.tf
-│       │   ├── variables.tf
-│       │   └── outputs.tf
-│       ├── ec2-client/
-│       │   ├── main.tf
-│       │   ├── variables.tf
-│       │   └── outputs.tf
-│       └── efs-share/
-│           ├── main.tf
-│           ├── variables.tf
-│           └── outputs.tf
+│       └── secure-bucket/
+│           ├── variables.tf  # bucket_name, vpc_endpoint_id, transition/expiration_days
+│           ├── main.tf       # KMS, bucket, public access block, SSE, versioning,
+│           │                 # lifecycle, bucket policy
+│           └── outputs.tf    # bucket_id, bucket_arn, kms_key_arn, kms_alias
 └── localstack/
-    ├── README.md            # Limitaciones + comandos awslocal
-    ├── providers.tf         # Endpoints LocalStack (ec2, iam, sts)
-    ├── variables.tf
-    ├── main.tf              # vpc + ec2-client (efs-share omitido en Community)
+    ├── providers.tf          # Endpoints LocalStack (s3, kms, ec2, iam, sts)
+    ├── variables.tf          # project = "lab34-local"
+    ├── main.tf               # VPC, VPC endpoint, módulo
     ├── outputs.tf
+    ├── README.md             # Limitaciones + comandos awslocal
     └── modules/
-        ├── vpc/
-        ├── ec2-client/
-        └── efs-share/       # Presente para paridad estructural; sin recursos EFS reales
+        └── secure-bucket/    # Misma interfaz; anotaciones de limitaciones LocalStack
 ```
 
 ---
 
 ## Despliegue en AWS
 
-```bash
-# Obtén el ID de cuenta para el nombre del bucket de estado
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+### Módulo secure-bucket
 
-# Desde labs/lab-34/aws/
+El módulo recibe el ID del endpoint como variable y lo inyecta en la bucket policy:
+
+```hcl
+# modules/secure-bucket/main.tf (fragmento)
+resource "aws_s3_bucket_policy" "main" {
+  bucket     = aws_s3_bucket.main.id
+  depends_on = [aws_s3_bucket_public_access_block.main]
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyExternalNonVPCEndpoint"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource  = [aws_s3_bucket.main.arn, "${aws_s3_bucket.main.arn}/*"]
+      Condition = {
+        StringNotEquals = {
+          "aws:sourceVpce"       = var.vpc_endpoint_id
+          "aws:PrincipalAccount" = local.account_id
+        }
+      }
+    }]
+  })
+}
+```
+
+El módulo raíz crea el endpoint y se lo pasa al módulo:
+
+```hcl
+# main.tf
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+}
+
+module "datalake" {
+  source          = "./modules/secure-bucket"
+  vpc_endpoint_id = aws_vpc_endpoint.s3.id
+  # ...
+}
+```
+
+### Inicialización y despliegue
+
+```bash
+export BUCKET="terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
+
+# Desde lab34/aws/
 terraform fmt
 terraform init \
   -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=terraform-state-labs-$ACCOUNT_ID"
+  -backend-config="bucket=$BUCKET"
+
 terraform plan
 terraform apply
 ```
 
+Al finalizar, los outputs mostrarán:
+
+```
+bucket_arn           = "arn:aws:s3:::lab34-datalake-123456789012"
+bucket_name          = "lab34-datalake-123456789012"
+kms_alias            = "alias/lab34-datalake"
+kms_key_arn          = "arn:aws:kms:us-east-1:123456789012:key/..."
+vpc_endpoint_id      = "vpce-0abc123..."
+vpc_id               = "vpc-0abc123..."
+```
+
+### Verificar el sistema
+
+**Paso 1** — Verifica los cuatro controles de acceso público:
+
+```bash
+BUCKET=$(terraform output -raw bucket_name)
+
+aws s3api get-public-access-block --bucket "$BUCKET" \
+  --query 'PublicAccessBlockConfiguration'
+```
+
+Los cuatro valores deben ser `true`.
+
+**Paso 2** — Verifica el cifrado SSE-KMS y Bucket Key:
+
+```bash
+aws s3api get-bucket-encryption --bucket "$BUCKET" \
+  --query 'ServerSideEncryptionConfiguration.Rules[0]'
+```
+
+Busca `"SSEAlgorithm": "aws:kms"` y `"BucketKeyEnabled": true`.
+
+**Paso 3** — Verifica el versionado:
+
+```bash
+aws s3api get-bucket-versioning --bucket "$BUCKET"
+```
+
+Debe mostrar `"Status": "Enabled"`.
+
+**Paso 4** — Verifica la lifecycle configuration:
+
+```bash
+aws s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" \
+  --query 'Rules[0].{ID:ID,Estado:Status,Transicion:Transitions[0],Expiracion:Expiration}'
+```
+
+**Paso 5** — Verifica la CMK y su rotación:
+
+```bash
+KMS_ARN=$(terraform output -raw kms_key_arn)
+
+aws kms describe-key --key-id "$KMS_ARN" \
+  --query 'KeyMetadata.{KeyId:KeyId,Estado:KeyState,Rotacion:KeyRotationStatus}'
+
+# La rotación debe estar habilitada
+aws kms get-key-rotation-status --key-id "$KMS_ARN"
+```
+
+**Paso 6** — Verifica el VPC Endpoint y su ruta inyectada:
+
+```bash
+aws ec2 describe-vpc-endpoints \
+  --vpc-endpoint-ids "$(terraform output -raw vpc_endpoint_id)" \
+  --query 'VpcEndpoints[0].{ID:VpcEndpointId,Estado:State,Tipo:VpcEndpointType,RouteTables:RouteTableIds}'
+```
+
+**Paso 7** — Sube un objeto y verifica el cifrado aplicado:
+
+```bash
+echo "datos de prueba" > /tmp/test.txt
+aws s3 cp /tmp/test.txt s3://"$BUCKET"/test.txt
+
+# Verifica que el objeto está cifrado con la CMK
+aws s3api head-object --bucket "$BUCKET" --key test.txt \
+  --query '{ServerSideEncryption:ServerSideEncryption,KMSKeyId:SSEKMSKeyId}'
+```
+
+**Paso 8** — Verifica el versionado subiendo el mismo objeto dos veces:
+
+```bash
+echo "version 2" > /tmp/test.txt
+aws s3 cp /tmp/test.txt s3://"$BUCKET"/test.txt
+
+# Lista las versiones — deben aparecer 2 versiones de test.txt
+aws s3api list-object-versions --bucket "$BUCKET" \
+  --query 'Versions[*].{Key:Key,VersionId:VersionId,Latest:IsLatest}' --output table
+```
+
+**Paso 9** — Verifica la bucket policy:
+
+```bash
+aws s3api get-bucket-policy --bucket "$BUCKET" \
+  --query Policy --output text | python3 -m json.tool
+```
+
+Confirma que el `Statement` tiene `Effect: Deny` con un único bloque `StringNotEquals` que incluye `aws:sourceVpce` (ID del endpoint) y `aws:PrincipalAccount` (ID de la cuenta). Ambos como AND lógico — el Deny sólo dispara cuando el origen NO es el endpoint Y el principal NO pertenece a la cuenta.
+
 ---
+
+> **Antes de comenzar los retos**, verifica que `get-bucket-encryption` muestra `BucketKeyEnabled: true` y que `list-object-versions` devuelve dos versiones de `test.txt`.
 
 ## Verificación final
 
-### Volumen EBS gp3
-
 ```bash
-EBS_ID=$(terraform output -raw ebs_volume_id)
+# Confirmar que el acceso publico esta bloqueado
+aws s3api get-public-access-block \
+  --bucket $(terraform output -raw bucket_name) \
+  --query 'PublicAccessBlockConfiguration'
 
-# Verifica tipo, IOPS y throughput
-aws ec2 describe-volumes \
-  --volume-ids "$EBS_ID" \
-  --query 'Volumes[0].{Tipo:VolumeType,GB:Size,IOPS:Iops,ThroughputMBs:Throughput,Cifrado:Encrypted}'
-# Debe mostrar: gp3, 100, 6000, 400, true
+# Verificar cifrado con CMK y Bucket Key
+aws s3api get-bucket-encryption \
+  --bucket $(terraform output -raw bucket_name) \
+  --query 'ServerSideEncryptionConfiguration.Rules[0]'
 
-# Verifica que está adjunto a la instancia
-aws ec2 describe-volumes \
-  --volume-ids "$EBS_ID" \
-  --query 'Volumes[0].Attachments[0].{Instancia:InstanceId,Dispositivo:Device,Estado:State}'
-```
+# Comprobar que el versionado esta habilitado
+aws s3api get-bucket-versioning \
+  --bucket $(terraform output -raw bucket_name) \
+  --query 'Status'
+# Esperado: "Enabled"
 
-### Política DLM
-
-```bash
-DLM_ID=$(terraform output -raw dlm_policy_id)
-EBS_ID=$(terraform output -raw ebs_volume_id)
-
-# Verifica que la política está habilitada y el rol asignado
-aws dlm get-lifecycle-policy \
-  --policy-id "$DLM_ID" \
-  --query 'Policy.{Estado:State,Descripcion:Description,Rol:ExecutionRoleArn}'
-# Debe mostrar: State=ENABLED
-
-# Verifica las reglas: recursos objetivo, etiqueta selectora, horario y retención
-aws dlm get-lifecycle-policy \
-  --policy-id "$DLM_ID" \
-  --query 'Policy.PolicyDetails.Schedules[0].{Horario:CreateRule.Times,Intervalo:CreateRule.Interval,Retencion:RetainRule.Count}'
-# Debe mostrar: Times=["03:00"], Interval=24, Count=14
-
-# Verifica que el volumen EBS tiene la etiqueta Backup=true que activa la política
-aws ec2 describe-volumes \
-  --volume-ids "$EBS_ID" \
-  --query 'Volumes[0].Tags'
-
-# Consulta snapshots creados por esta política (disponibles tras la primera ejecución a las 03:00 UTC)
-aws ec2 describe-snapshots \
-  --owner-ids self \
-  --filters \
-    "Name=volume-id,Values=$EBS_ID" \
-    "Name=tag:SnapshotCreator,Values=DLM" \
-  --query 'Snapshots[*].{ID:SnapshotId,Estado:State,Iniciado:StartTime,Tamanyo:VolumeSize}' \
+# Verificar el VPC Gateway Endpoint creado
+aws ec2 describe-vpc-endpoints \
+  --filters "Name=service-name,Values=com.amazonaws.us-east-1.s3" \
+  --query 'VpcEndpoints[*].{ID:VpcEndpointId,State:State}' \
   --output table
-
-# DLM no tiene un comando "ejecutar ahora" en la CLI. Para verificar sin esperar
-# a las 03:00 UTC, crea un snapshot manual del volumen y comprueba que el ciclo
-# de vida funciona cuando DLM ejecute su primera ventana.
-aws ec2 create-snapshot \
-  --volume-id "$EBS_ID" \
-  --description "Snapshot manual de prueba - lab34" \
-  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Project,Value=lab34},{Key=Origen,Value=manual}]" \
-  --query '{ID:SnapshotId,Estado:State}'
-
-# Lista todos los snapshots del volumen (manuales + los que cree DLM a las 03:00 UTC)
-aws ec2 describe-snapshots \
-  --owner-ids self \
-  --filters "Name=volume-id,Values=$EBS_ID" \
-  --query 'Snapshots[*].{ID:SnapshotId,Estado:State,Fecha:StartTime,Descripcion:Description}' \
-  --output table
-```
-
-### EFS File System
-
-```bash
-EFS_ID=$(terraform output -raw efs_file_system_id)
-
-# Estado general del file system
-aws efs describe-file-systems \
-  --file-system-id "$EFS_ID" \
-  --query 'FileSystems[0].{ID:FileSystemId,Estado:LifeCycleState,Cifrado:Encrypted,Throughput:ThroughputMode,Tamanyo:SizeInBytes.Value}'
-
-# Mount targets (debe haber uno por AZ)
-aws efs describe-mount-targets \
-  --file-system-id "$EFS_ID" \
-  --query 'MountTargets[*].{ID:MountTargetId,AZ:AvailabilityZoneName,Subnet:SubnetId,IP:IpAddress,Estado:LifeCycleState}'
-```
-
-### EFS Access Point
-
-```bash
-AP_ID=$(terraform output -raw efs_access_point_id)
-
-aws efs describe-access-points \
-  --access-point-id "$AP_ID" \
-  --query 'AccessPoints[0].{ID:AccessPointId,Path:RootDirectory.Path,UID:PosixUser.Uid,GID:PosixUser.Gid,Estado:LifeCycleState}'
-# Debe mostrar path=/app/data, UID=1001, GID=1001
-```
-
-### Montaje del EFS desde la instancia (SSM)
-
-```bash
-# Los comandos terraform output se ejecutan en tu terminal local (donde corre
-# Terraform), no dentro de la instancia EC2. Obtén los valores antes de abrir
-# la sesión SSM y sustitúyelos manualmente en los comandos de la instancia.
-INSTANCE_ID=$(terraform output -raw instance_id)
-EFS_ID=$(terraform output -raw efs_file_system_id)
-AP_ID=$(terraform output -raw efs_access_point_id)
-
-echo "EFS_ID: $EFS_ID"
-echo "AP_ID:  $AP_ID"
-
-# Abre una sesión SSM (los valores de EFS_ID y AP_ID no existen en la instancia)
-aws ssm start-session --target "$INSTANCE_ID"
-
-# ── Dentro de la instancia (sustituye <EFS_ID> y <AP_ID> por los valores obtenidos arriba) ──
-
-sudo dnf install -y amazon-efs-utils
-sudo mkdir -p /mnt/efs
-
-# Monta via Access Point con TLS.
-# El mount helper de EFS acepta el ID en formato fsap-xxx, no el ARN.
-sudo mount -t efs -o tls,accesspoint=<AP_ID> <EFS_ID>:/ /mnt/efs
-
-# Verifica el montaje
-df -h /mnt/efs
-ls -la /mnt/efs   # muestra /app/data con UID/GID 1001
-
-# Escribe un fichero — verifica que el propietario es UID 1001
-echo "datos de la app" | sudo tee /mnt/efs/test.txt
-ls -la /mnt/efs/test.txt
-
-# ── Montaje permanente via /etc/fstab ─────────────────────────────────────────
-# La entrada en /etc/fstab hace que el EFS se monte automaticamente en cada
-# arranque. La opcion "_netdev" le indica al sistema que espere a que la red
-# este disponible antes de intentar el montaje — imprescindible para NFS.
-# "noresvport" mejora la disponibilidad reconectando desde un puerto no
-# reservado si se pierde la conexion con el mount target.
-# Sustituye <EFS_ID> y <AP_ID> por los valores obtenidos antes de la sesion SSM.
-
-echo "<EFS_ID>:/ /mnt/efs efs _netdev,tls,accesspoint=<AP_ID>,noresvport 0 0" \
-  | sudo tee -a /etc/fstab
-
-# Verifica que la entrada es correcta antes de reiniciar
-cat /etc/fstab
-
-# Prueba el fstab sin reiniciar (desmonta y vuelve a montar todo lo de fstab)
-sudo umount /mnt/efs
-sudo mount -a
-
-# Confirma que el EFS volvio a montarse
-df -h /mnt/efs
 ```
 
 ---
 
 ## Retos
 
-### Reto 1 — EFS File System Policy (cifrado en tránsito obligatorio)
+### Reto 1 — S3 Access Logging
 
-El EFS acepta conexiones NFS sin TLS por defecto. En entornos regulados es obligatorio cifrar los datos en tránsito. Una **File System Policy** (política de recursos del EFS) permite denegar todas las conexiones que no usen TLS, de forma similar a una bucket policy en S3.
+El bucket de datos no registra quién accede a sus objetos. Añadir **S3 Access Logging** crea un log por cada petición HTTP recibida — imprescindible en entornos regulados (PCI-DSS, HIPAA) para detectar accesos no autorizados.
 
 **Requisitos**
 
-1. Añade un `aws_efs_file_system_policy` que aplique al file system creado por el módulo.
-2. La política debe denegar cualquier acción EFS a cualquier principal si la conexión no usa TLS (`aws:SecureTransport = false`).
-3. Añade un output `efs_policy` que muestre el JSON de la política aplicada.
-
-> El recurso `aws_efs_file_system_policy` va en el **módulo raíz** (`aws/main.tf`) y referencia el file system mediante `module.efs_share.file_system_id`. No es necesario modificar el módulo `efs-share` para este reto.
+1. Crea un segundo bucket (`${var.project}-logs-<ACCOUNT_ID>`) para almacenar los logs. Este bucket debe tener:
+   - `aws_s3_bucket_public_access_block` con los cuatro controles activos.
+   - Cifrado SSE-S3 (`AES256`) — no es necesario KMS para el bucket de logs.
+2. Añade un `aws_s3_bucket_logging` al bucket principal que apunte al bucket de logs con `target_prefix = "access-logs/"`.
+3. Añade un output `log_bucket_name` con el nombre del bucket de logs.
 
 **Criterios de éxito**
 
-- `aws efs describe-file-system-policy --file-system-id "$EFS_ID"` muestra la política con `Effect: Deny` y condición `aws:SecureTransport`.
-- Un intento de montaje sin TLS (`-o notls`) desde la instancia falla con `access denied`.
+- `aws s3api get-bucket-logging --bucket "$BUCKET"` muestra el bucket de destino y el prefijo.
+- Tras subir un objeto al bucket principal, aparecen logs en `s3://LOGS_BUCKET/access-logs/` (puede tardar hasta 1 hora en AWS real).
+- Puedes explicar por qué el bucket de logs debe ser un bucket separado y no el mismo bucket principal.
 
-### Reto 2 — Segundo Access Point para un equipo diferente
+### Reto 2 — S3 Object Lock en modo GOVERNANCE
 
-El módulo `efs-share` gestiona el Access Point de la aplicación principal. Un segundo equipo necesita su propio espacio aislado en el mismo EFS con un UID/GID diferente y un directorio raíz propio.
+El versionado protege contra borrados accidentales, pero un administrador con permisos suficientes puede borrar versiones individuales. **Object Lock** añade protección WORM (Write Once Read Many): una vez bloqueado, ningún usuario — ni siquiera el root de la cuenta — puede borrar el objeto antes de que expire el periodo de retención.
 
 ### Requisitos
 
-1. Añade un segundo `aws_efs_access_point` directamente en el **módulo raíz** (`aws/main.tf`), sin modificar el módulo `efs-share`.
-2. Usa `posix_user.uid = 1002`, `posix_user.gid = 1002` y `root_directory.path = "/analytics/data"`.
-3. El directorio debe crearse con `owner_uid = 1002`, `owner_gid = 1002` y `permissions = "750"`.
-4. Añade un output `analytics_access_point_id` con el ID del nuevo Access Point.
-
-> El segundo Access Point referencia el file system del módulo mediante `module.efs_share.file_system_id`.
+1. Object Lock solo puede habilitarse al crear el bucket y no puede añadirse después. Por eso **no es posible reutilizar el bucket principal** creado por el módulo `secure-bucket` — debes crear un **nuevo bucket independiente** con `object_lock_enabled = true` en `aws_s3_bucket`.
+2. Configura `aws_s3_bucket_object_lock_configuration` con:
+   - `rule.default_retention.mode = "GOVERNANCE"` (permite que usuarios con permiso `s3:BypassGovernanceRetention` eliminen objetos bajo circunstancias especiales).
+   - `rule.default_retention.days = 7` (7 días de retención por defecto).
+3. Añade un output `object_lock_bucket_name` con el nombre del nuevo bucket.
 
 **Criterios de éxito**
 
-- `aws efs describe-access-points` muestra dos Access Points: uno con path `/app/data` (UID 1001) y otro con `/analytics/data` (UID 1002).
-- Puedes explicar por qué los dos Access Points garantizan que un proceso con UID 1001 no puede leer los ficheros creados por un proceso con UID 1002, aunque ambos usen el mismo EFS.
+- `aws s3api get-object-lock-configuration --bucket "$OBJECT_LOCK_BUCKET"` muestra `ObjectLockEnabled: Enabled` con `Mode: GOVERNANCE` y `Days: 7`.
+- Sube un objeto al bucket. Intenta borrarlo sin el permiso `BypassGovernanceRetention` — debe fallar con `AccessDenied`.
+- Puedes explicar la diferencia entre `GOVERNANCE` (bypasseable con permiso especial) y `COMPLIANCE` (nadie puede borrar, ni root).
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — EFS File System Policy</strong></summary>
+<summary><strong>Solución al Reto 1 — S3 Access Logging</strong></summary>
 
-### Solución al Reto 1 — EFS File System Policy
+### Solución al Reto 1 — S3 Access Logging
 
-El recurso `aws_efs_file_system_policy` va en el **módulo raíz** (`aws/main.tf`). No es necesario modificar el módulo `efs-share` porque el file system ID está disponible como output (`module.efs_share.file_system_id`).
+El bucket de logs y el recurso `aws_s3_bucket_logging` se añaden en el **módulo raíz** (`aws/main.tf`), no dentro de `modules/secure-bucket`. El módulo `secure-bucket` encapsula los controles de un único bucket; el bucket de logs es un recurso independiente que coexiste con él. La referencia al bucket principal se obtiene a través del output `module.datalake.bucket_id`.
 
 Añade en `aws/main.tf`:
 
 ```hcl
-resource "aws_efs_file_system_policy" "tls_only" {
-  file_system_id = module.efs_share.file_system_id
+locals {
+  log_bucket_name = "${var.project}-logs-${data.aws_caller_identity.current.account_id}"
+}
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "DenyNonTLS"
-        Effect    = "Deny"
-        Principal = { AWS = "*" }
-        Action    = "elasticfilesystem:*"
-        Resource  = module.efs_share.file_system_arn
-        Condition = {
-          Bool = {
-            "aws:SecureTransport" = "false"
-          }
-        }
-      }
-    ]
-  })
+resource "aws_s3_bucket" "logs" {
+  bucket = local.log_bucket_name
+  tags   = local.tags
+}
+
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket                  = aws_s3_bucket.logs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_logging" "main" {
+  bucket        = module.datalake.bucket_id
+  target_bucket = aws_s3_bucket.logs.id
+  target_prefix = "access-logs/"
 }
 ```
 
 Añade en `aws/outputs.tf`:
 
 ```hcl
-output "efs_policy" {
-  description = "Politica de recursos del EFS (requiere TLS)"
-  value       = aws_efs_file_system_policy.tls_only.policy
+output "log_bucket_name" {
+  description = "Nombre del bucket de logs de acceso S3"
+  value       = aws_s3_bucket.logs.id
 }
 ```
 
@@ -458,60 +471,100 @@ Verifica:
 ```bash
 terraform apply
 
-EFS_ID=$(terraform output -raw efs_file_system_id)
+# 1. Confirma que el logging está configurado en el bucket principal
+BUCKET=$(terraform output -raw bucket_name)
+LOGS=$(terraform output -raw log_bucket_name)
 
-# Verifica la política aplicada
-aws efs describe-file-system-policy \
-  --file-system-id "$EFS_ID" \
-  --query Policy --output text | python3 -m json.tool
+aws s3api get-bucket-logging \
+  --bucket "$BUCKET" \
+  --query 'LoggingEnabled'
+# Debe mostrar: {"TargetBucket": "...-logs-...", "TargetPrefix": "access-logs/"}
 
-# Intento de montaje sin TLS — debe fallar con access denied
-# (dentro de la instancia via SSM)
-sudo mkdir /mnt/efs-notls
-sudo mount -t nfs4 \
-  -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
-  "$EFS_ID".efs.us-east-1.amazonaws.com:/ /mnt/efs-notls
+# 2. Genera actividad en el bucket principal para producir logs
+aws s3 cp /etc/hostname s3://"$BUCKET"/test-logging.txt
+aws s3 ls s3://"$BUCKET"/
+aws s3api get-object --bucket "$BUCKET" --key test-logging.txt /tmp/downloaded.txt
+
+# 3. Espera unos minutos (S3 Access Logging puede tardar entre 1 y 60 minutos
+#    en entregar los primeros registros; no es en tiempo real).
+sleep 120
+
+# 4. Lista los logs entregados en el bucket de destino
+aws s3 ls s3://"$LOGS"/access-logs/ --recursive
+# Deben aparecer objetos con nombres del tipo:
+#   access-logs/2024-01-15-12-34-56-ABCDEF1234567890
+
+# 5. Descarga y examina un log
+LOG_KEY=$(aws s3 ls s3://"$LOGS"/access-logs/ --recursive \
+  | sort | tail -1 | awk '{print $4}')
+
+aws s3 cp s3://"$LOGS"/"$LOG_KEY" /tmp/access.log
+cat /tmp/access.log
+# Cada línea contiene: fecha, bucket, IP, solicitante, operación, clave, código HTTP, etc.
+# Ejemplo de línea:
+#   510547572113 lab34-datalake-... [15/Jan/2024:12:34:56 +0000] 1.2.3.4
+#   arn:aws:iam::...:user/joseemilio REST.PUT.OBJECT test-logging.txt
+#   "PUT /test-logging.txt HTTP/1.1" 200 - 8 8 12 11 ...
 ```
+
+> **Nota**: En AWS real los logs pueden tardar hasta una hora. Si tras 15 minutos no aparece nada, verifica que el bucket de logs existe y que `get-bucket-logging` muestra la configuración correcta.
+
+El bucket de logs debe ser **separado** del bucket principal porque si ambos fueran el mismo, cada log generaría a su vez un evento de escritura que generaría otro log — un bucle infinito que crearía millones de objetos y facturas elevadas.
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Segundo Access Point para un equipo diferente</strong></summary>
+<summary><strong>Solución al Reto 2 — S3 Object Lock en modo GOVERNANCE</strong></summary>
 
-### Solución al Reto 2 — Segundo Access Point para un equipo diferente
+### Solución al Reto 2 — S3 Object Lock en modo GOVERNANCE
 
-El segundo Access Point va en el **módulo raíz** (`aws/main.tf`) referenciando el file system del módulo. No se modifica `modules/efs-share` porque añadir un recurso allí afectaría a todos los usos futuros del módulo; un Access Point adicional es un requisito de este deployment concreto.
+El bucket WORM y sus recursos asociados van en el **módulo raíz** (`aws/main.tf`), no dentro de `modules/secure-bucket`. Hay dos razones:
+
+1. `object_lock_enabled = true` debe estar presente **en el momento de crear el bucket** — no es una configuración que se pueda añadir después. Añadirlo al módulo `secure-bucket` obligaría a recrear el bucket principal existente, destruyendo todos sus datos.
+2. El bucket WORM tiene un propósito distinto al data lake principal. Meterlo en el mismo módulo mezclaría responsabilidades y añadiría parámetros opcionales que complican la interfaz del módulo sin beneficio real.
 
 Añade en `aws/main.tf`:
 
 ```hcl
-resource "aws_efs_access_point" "analytics" {
-  file_system_id = module.efs_share.file_system_id
+resource "aws_s3_bucket" "worm" {
+  bucket              = "${var.project}-worm-${data.aws_caller_identity.current.account_id}"
+  object_lock_enabled = true
+  tags                = local.tags
+}
 
-  posix_user {
-    uid = 1002
-    gid = 1002
+resource "aws_s3_bucket_public_access_block" "worm" {
+  bucket                  = aws_s3_bucket.worm.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "worm" {
+  bucket = aws_s3_bucket.worm.id
+  versioning_configuration {
+    status = "Enabled"  # Object Lock requiere versionado
   }
+}
 
-  root_directory {
-    path = "/analytics/data"
-    creation_info {
-      owner_uid   = 1002
-      owner_gid   = 1002
-      permissions = "750"
+resource "aws_s3_bucket_object_lock_configuration" "worm" {
+  bucket = aws_s3_bucket.worm.id
+
+  rule {
+    default_retention {
+      mode = "GOVERNANCE"
+      days = 7
     }
   }
-
-  tags = merge(local.tags, { Name = "${var.project}-analytics-ap" })
 }
 ```
 
 Añade en `aws/outputs.tf`:
 
 ```hcl
-output "analytics_access_point_id" {
-  description = "ID del EFS Access Point del equipo de analytics"
-  value       = aws_efs_access_point.analytics.id
+output "object_lock_bucket_name" {
+  description = "Nombre del bucket con Object Lock en modo GOVERNANCE"
+  value       = aws_s3_bucket.worm.id
 }
 ```
 
@@ -520,14 +573,48 @@ Verifica:
 ```bash
 terraform apply
 
-# Lista todos los Access Points del EFS
-aws efs describe-access-points \
-  --file-system-id "$(terraform output -raw efs_file_system_id)" \
-  --query 'AccessPoints[*].{ID:AccessPointId,Path:RootDirectory.Path,UID:PosixUser.Uid,GID:PosixUser.Gid}'
-# Debe mostrar dos entradas: /app/data (1001) y /analytics/data (1002)
+WORM_BUCKET=$(terraform output -raw object_lock_bucket_name)
+
+aws s3api get-object-lock-configuration --bucket "$WORM_BUCKET"
+
+# Sube un objeto e intenta borrarlo inmediatamente
+echo "dato protegido" | aws s3 cp - s3://"$WORM_BUCKET"/locked.txt
+
+VERSION_ID=$(aws s3api list-object-versions \
+  --bucket "$WORM_BUCKET" --prefix locked.txt \
+  --query 'Versions[0].VersionId' --output text)
+
+# Intento de borrado — falla con AccessDenied en modo GOVERNANCE
+aws s3api delete-object \
+  --bucket "$WORM_BUCKET" \
+  --key locked.txt \
+  --version-id "$VERSION_ID"
+
+# Para borrar el objeto en modo GOVERNANCE es necesario:
+#   1. Tener el permiso s3:BypassGovernanceRetention en la política IAM del usuario.
+#   2. Enviar el header x-amz-bypass-governance-retention: true.
+# La AWS CLI lo hace con el flag --bypass-governance-retention.
+
+# Borrar la versión actual con bypass
+aws s3api delete-object \
+  --bucket "$WORM_BUCKET" \
+  --key locked.txt \
+  --version-id "$VERSION_ID" \
+  --bypass-governance-retention
+
+# Si hay delete markers u otras versiones, listarlas y borrarlas todas
+aws s3api list-object-versions \
+  --bucket "$WORM_BUCKET" \
+  --prefix locked.txt \
+  --query '{Versions: Versions[*].{Key:Key,VersionId:VersionId}, DeleteMarkers: DeleteMarkers[*].{Key:Key,VersionId:VersionId}}'
+
+# Para borrar todas las versiones y delete markers con bypass, itera
+# sobre cada VersionId con delete-object (singular) en lugar de usar
+# delete-objects (plural), que puede causar MalformedXML al convertir
+# el payload JSON a XML internamente.
 ```
 
-El aislamiento entre Access Points es real a nivel de sistema de archivos POSIX: los ficheros creados por UID 1001 tienen `owner=1001` en los metadatos del EFS. Un proceso con UID 1002 que acceda al directorio `/app/data` recibirá `EACCES` porque los permisos `750` solo conceden acceso al propietario y su grupo — el kernel del cliente NFS aplica las reglas POSIX estándar.
+**GOVERNANCE vs COMPLIANCE**: en modo `GOVERNANCE`, un usuario con el permiso `s3:BypassGovernanceRetention` puede borrar el objeto enviando el header `x-amz-bypass-governance-retention: true`. En modo `COMPLIANCE`, nadie puede borrar el objeto antes de que expire la retención — ni el root de la cuenta. Para datos con requisitos regulatorios estrictos (registros financieros, historiales médicos) se usa `COMPLIANCE`.
 
 </details>
 
@@ -536,27 +623,30 @@ El aislamiento entre Access Points es real a nivel de sistema de archivos POSIX:
 ## Limpieza
 
 ```bash
-# Desde labs/lab-34/aws/
+# Vaciar el bucket antes de destruir (requiere borrar las versiones)
+BUCKET=$(terraform output -raw bucket_name)
+
+aws s3api delete-objects \
+  --bucket "$BUCKET" \
+  --delete "$(aws s3api list-object-versions \
+    --bucket "$BUCKET" \
+    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+    --output json)"
+
+# Destruir la infraestructura
+# Desde lab34/aws/
 terraform destroy
 ```
 
-> Si has montado el EFS en la instancia, desmóntalo antes de destruir:
-> `sudo umount /mnt/efs`
+> **Importante**: la CMK tiene un `deletion_window_in_days = 7`. Tras el `terraform destroy`, la clave quedará en estado `PendingDeletion` durante 7 días antes de ser eliminada definitivamente. Durante ese periodo no se puede usar para cifrar ni descifrar.
 
 ---
 
 ## LocalStack
 
-```bash
-localstack start -d
+Los recursos S3 (bucket, public access block, versionado, lifecycle) y KMS se crean correctamente en LocalStack Community. La condición `aws:sourceVpce` de la bucket policy no se evalúa realmente — el bucket es accesible sin restricción de endpoint.
 
-# Desde labs/lab-34/localstack/
-terraform fmt
-terraform init
-terraform apply
-```
-
-Consulta [localstack/README.md](localstack/README.md) para las instrucciones completas de verificación y la tabla de limitaciones.
+Consulta [localstack/README.md](localstack/README.md) para instrucciones detalladas y tabla de limitaciones.
 
 ---
 
@@ -564,32 +654,37 @@ Consulta [localstack/README.md](localstack/README.md) para las instrucciones com
 
 | Aspecto | AWS Real | LocalStack |
 |---|---|---|
-| EBS gp3 iops/throughput | Rendimiento real desacoplado del tamaño | Parámetros aceptados; sin efecto real |
-| DLM snapshots automáticos | Snapshots reales creados y rotados diariamente | No disponible en Community |
-| EFS cifrado en reposo | Cifrado real con clave KMS gestionada | Configuración aceptada; sin cifrado real |
-| EFS Elastic Throughput | Throughput escala hasta 3 GB/s lectura | Configuración aceptada; sin efecto real |
-| EFS mount targets | Puntos NFS reales accesibles desde EC2 | Recurso creado; sin NFS real |
-| EFS Access Point (POSIX) | Enforcement real en el kernel del cliente NFS | Configuración verificable; sin enforcement real |
+| `aws_s3_bucket_public_access_block` | Bloqueo real de ACLs y políticas públicas | Configuración aceptada y verificable |
+| SSE-KMS + Bucket Key | Cifrado real; Bucket Key reduce llamadas KMS ~99% | Configuración aceptada; sin cifrado real |
+| Versionado | Versiones inmutables preservadas en S3 | Versiones creadas correctamente |
+| Lifecycle (→Glacier, →Delete) | AWS mueve automáticamente las clases de almacenamiento | Reglas aceptadas; sin transición real |
+| VPC Gateway Endpoint | Ruta inyectada en route table; tráfico S3 nunca sale a internet | Recurso creado; sin enrutamiento real |
+| Bucket policy (`aws:sourceVpce`) | Deniega efectivamente el acceso fuera del endpoint | Política aceptada; condición no evaluada |
+| CMK + rotación anual | Rotación real del material criptográfico | Clave creada; sin rotación real |
+| Módulo `secure-bucket` | Todos los recursos funcionan | Todos los recursos se crean sin error |
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- Etiqueta los volúmenes EBS con `Backup = "true"` desde el primer despliegue para que la política DLM los capture desde el inicio.
-- Despliega siempre un mount target por AZ. Si la AZ de un mount target falla, las instancias en otras AZs siguen accediendo al EFS sin interrupción.
-- Usa `encrypted = true` en EFS aunque los datos no sean sensibles — el coste es cero y simplifica los requisitos de auditoría.
-- Prefiere Access Points sobre montajes directos del root del EFS. El aislamiento POSIX previene errores de configuración que exponen datos entre aplicaciones.
-- Para cargas de trabajo que requieren baja latencia (bases de datos, logs de alta frecuencia), usa EBS. EFS añade latencia de red NFS — es adecuado para ficheros de configuración, assets compartidos y datos de acceso concurrente.
+- **Un módulo por conjunto de controles de seguridad**: encapsular todos los recursos de seguridad del bucket en un módulo evita olvidar aplicar alguno (por ejemplo, el `public_access_block`) al crear un nuevo bucket. El módulo actúa como lista de comprobación en código.
+- **`enable_key_rotation = true` siempre en CMKs**: la rotación automática anual del material criptográfico es gratuita, no cambia el ARN de la clave y es una buena práctica de seguridad requerida por la mayoría de frameworks de cumplimiento.
+- **`depends_on` en el lifecycle hacia el versionado**: S3 puede devolver un error si la lifecycle rule se aplica antes de que el versionado esté activo. El `depends_on` garantiza el orden correcto.
+- **`depends_on` en la bucket policy hacia el public access block**: `block_public_policy = true` rechaza políticas que concedan acceso público; si la policy se aplica antes del block, puede fallar con un error inesperado.
+- **Bucket de logs separado**: el bucket de destino de S3 Access Logging nunca debe ser el mismo que el bucket origen — generaría un bucle infinito de logs.
+- **Gateway Endpoint es gratuito**: a diferencia del Interface Endpoint (que cobra por hora de ENI y por GB procesado), el Gateway Endpoint de S3 y DynamoDB no tiene coste. Úsalo siempre que haya tráfico S3 desde una VPC.
+- **Excepción de la bucket policy en producción**: la excepción para la cuenta raíz que incluye este laboratorio es solo para facilitar la gestión desde Terraform. En producción, reemplázala por el ARN específico del rol de despliegue de CI/CD y ejecuta Terraform desde un runner dentro de la VPC o con acceso vía VPC endpoint.
 
 ---
 
 ## Recursos
 
-- [EBS Volume Types — AWS](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volume-types.html)
-- [AWS DLM — Automate EBS Snapshots](https://docs.aws.amazon.com/ebs/latest/userguide/snapshot-lifecycle.html)
-- [EFS Performance — Throughput Modes](https://docs.aws.amazon.com/efs/latest/ug/performance.html)
-- [EFS Access Points](https://docs.aws.amazon.com/efs/latest/ug/efs-access-points.html)
-- [Terraform: aws_ebs_volume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ebs_volume)
-- [Terraform: aws_dlm_lifecycle_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dlm_lifecycle_policy)
-- [Terraform: aws_efs_file_system](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/efs_file_system)
-- [Terraform: aws_efs_access_point](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/efs_access_point)
+- [AWS — S3 Block Public Access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
+- [AWS — SSE-KMS y Bucket Key](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html)
+- [AWS — S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
+- [AWS — S3 Lifecycle Configuration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html)
+- [AWS — VPC Gateway Endpoint para S3](https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints-s3.html)
+- [AWS — S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)
+- [Terraform — aws_s3_bucket_public_access_block](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_public_access_block)
+- [Terraform — aws_s3_bucket_lifecycle_configuration](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_lifecycle_configuration)
+- [Terraform — aws_vpc_endpoint](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint)

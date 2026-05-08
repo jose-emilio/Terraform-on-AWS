@@ -1,6 +1,6 @@
-# Backend config para Lab18 en AWS real.
+# Backend config para Lab17 en AWS real.
 # Usa el bucket creado en el Lab02 (terraform-state-labs-<ACCOUNT_ID>).
-# Usalo asi:
+# Úsalo así:
 #   terraform init -backend-config=aws.s3.tfbackend -backend-config="bucket=terraform-state-labs-<ACCOUNT_ID>"
 key            = "lab18/terraform.tfstate"
 region         = "us-east-1"

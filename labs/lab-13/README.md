@@ -1,4 +1,4 @@
-# Laboratorio 13 — Cifrado Transversal con KMS y Jerarquía de Llaves
+# Laboratorio 13 — Gestión de Identidades y Acceso Seguro para EC2
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,80 +8,89 @@
 
 ## Visión general
 
-Las llaves de cifrado son la raíz de confianza de cualquier arquitectura segura.
-Este laboratorio implementa una **Customer Managed Key (CMK)** en AWS KMS y la
-utiliza como llave maestra compartida para cifrar datos en reposo en dos servicios:
-un volumen EBS y un bucket S3. La Key Policy separa explícitamente a los
-administradores de la llave (que gestionan su ciclo de vida) de las aplicaciones
-(que solo pueden cifrar y descifrar datos).
+Las credenciales estáticas (Access Key ID + Secret Access Key) son el vector de compromiso más frecuente en AWS. Este laboratorio elimina ese riesgo implementando el ciclo completo de identidad temporal para instancias EC2:
 
-## Objetivos
+1. Un **grupo IAM** y un **usuario** modelan los accesos del equipo de desarrollo.
+2. Un **rol IAM** con una **Trust Policy** delega la identidad exclusivamente al servicio EC2.
+3. Un **Instance Profile** actúa como contenedor que une el rol con la instancia.
+4. La instancia obtiene **credenciales temporales automáticas** sin intervención humana.
 
-- Crear una CMK con rotación automática anual.
-- Asignar un alias como capa de indirección para facilitar la sustitución de la llave.
-- Diseñar una Key Policy con tres roles segregados: root, administradores y usuarios.
-- Forzar el cifrado SSE-KMS en un bucket S3 mediante política de bucket.
-- Cifrar un volumen EBS con la CMK personalizada en lugar de la llave gestionada por el servicio.
+## Objetivos de aprendizaje
+
+- Comprender la diferencia entre usuarios, grupos y roles en IAM.
+- Entender por qué la Trust Policy controla QUIÉN puede asumir un rol.
+- Implementar `aws_iam_instance_profile` como puente entre un rol IAM y EC2.
+- Verificar que las credenciales temporales se inyectan vía IMDSv2.
+- Practicar el acceso sin SSH usando SSM Session Manager.
 
 ## Requisitos previos
 
 - **Terraform >= 1.10** instalado.
 - AWS CLI configurado con perfil `default`.
-- Permisos IAM sobre KMS, S3 y EC2 (EBS).
+- Plugin SSM para la AWS CLI: `aws ssm start-session` disponible.
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 
 ## Arquitectura
 
-![KMS CMK con Key Policy segregada (root/admin/user) + alias + cifrado de EBS y S3 + bucket policy con deny explícitos](arch/diagrama.svg)
+![IAM users + grupo + role con Trust Policy → Instance Profile → EC2 con IMDSv2 obligatorio + STS](arch/diagrama.svg)
 
-Una Customer Managed Key (CMK) con `enable_key_rotation = true` y un alias `alias/lab13-main` (capa de indirección que permite rotar la CMK sin tocar a los consumidores). La Key Policy segrega tres roles: **root** (recuperación de emergencia), **administradores** (gestión del ciclo de vida sin Encrypt/Decrypt) y **usuarios finales** (Encrypt/Decrypt sin gestión). La CMK cifra dos servicios: un volumen EBS gp3 (envelope encryption con data keys por bloque) y un bucket S3 con SSE-KMS, `bucket_key_enabled = true` (-99% coste KMS) y bucket policy con dos `Deny` explícitos (`DenyNonKMSUploads` + `DenyWrongKMSKey`).
+El usuario `dev-01` representa a una persona (credenciales estáticas) miembro del grupo `developers`. El `ec2-role` tiene Trust Policy con principal `ec2.amazonaws.com` (solo el servicio EC2 puede asumirlo). El `instance_profile` es el conector EC2 ↔ Role (EC2 no usa roles directamente). La instancia obtiene credenciales temporales firmadas por STS a través de IMDSv2 (con `http_tokens = required` para mitigar SSRF) — sin par de claves SSH, acceso exclusivo por SSM Session Manager.
 
 ## Conceptos clave
 
-### Customer Managed Key vs llave gestionada por servicio
+### Usuarios, Grupos y Roles — ¿cuándo usar cada uno?
 
-| Característica | CMK | aws/ebs, aws/s3 |
-|----------------|-----|-----------------|
-| Control de Key Policy | Total | Ninguno |
-| Rotación configurable | Sí (`enable_key_rotation`) | AWS gestiona |
-| Auditoría en CloudTrail | Cada uso registrado | Limitada |
-| Compartir entre servicios | Sí | No (una por servicio) |
-| Coste | ~1 $/mes + uso | Sin cargo extra |
+| Entidad | Representa | Credenciales | Caso de uso |
+|---------|------------|--------------|-------------|
+| `aws_iam_user` | Persona o sistema externo | Estáticas (Access Keys) | CI/CD externos a AWS, personas |
+| `aws_iam_group` | Colección de usuarios | — | Gestión centralizada de permisos |
+| `aws_iam_role` | Identidad asumible temporalmente | Temporales (STS) | Servicios AWS, cuentas cruzadas |
 
-### Key Policy — tres roles segregados
+### Trust Policy — ¿quién puede asumir el rol?
 
-La segregación es el principio central de este laboratorio. Evita que un administrador de infraestructura pueda leer datos cifrados de producción:
+La Trust Policy es la parte más importante de un rol. Responde a: **"¿Quién tiene permiso para solicitar credenciales temporales para este rol?"**
 
-```
-Root account   → kms:* (recuperación de emergencia)
-Administradores → gestión del ciclo de vida (sin Encrypt/Decrypt)
-Usuarios finales → Encrypt, Decrypt, GenerateDataKey (sin gestión)
-```
-
-Sin el statement de root, si se elimina accidentalmente al último administrador la llave queda **irrecuperable** — AWS no puede restaurar el acceso.
-
-### Alias — capa de indirección
-
-```
-Código/Configuración
-       │
-       ▼
-alias/lab13-main  ──apunta──►  Key ID: abc123...
-                               (puede cambiar sin tocar el código)
+```json
+{
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ec2.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
 ```
 
-Al rotar o sustituir la CMK, basta con actualizar el target del alias. Todo lo que referencie `alias/lab13-main` seguirá funcionando.
+Con `Principal = "ec2.amazonaws.com"` solo el servicio EC2 puede asumir el rol. Ni un usuario humano ni otro servicio de AWS puede hacerlo sin modificar esta política.
 
-### Bucket Key — reducción de coste KMS
+### Instance Profile — el "conector" EC2 ↔ Rol
 
-Con `bucket_key_enabled = true`, S3 genera una llave de datos temporal a nivel de bucket. Solo se llama a KMS una vez por llave de bucket (no por objeto), reduciendo el coste de KMS hasta un **99%** en buckets con muchos objetos.
+EC2 no puede usar un rol IAM directamente. Necesita un `aws_iam_instance_profile` como intermediario:
 
-### Cifrado forzoso en S3 — Bucket Policy
+```
+EC2 instance  →  Instance Profile  →  IAM Role  →  Permisos
+```
 
-La configuración SSE por defecto no impide subir objetos sin cifrado si el cliente lo omite explícitamente. La Bucket Policy añade dos `Deny` explícitos:
+Una instancia solo puede tener **un** Instance Profile (y el profile puede contener **un** rol).
 
-1. `DenyNonKMSUploads`: bloquea objetos subidos sin `x-amz-server-side-encryption: aws:kms`.
-2. `DenyWrongKMSKey`: bloquea objetos cifrados con una CMK diferente a la del laboratorio.
+### IMDSv2 y credenciales temporales
+
+Con `http_tokens = "required"`, la instancia exige un token de sesión antes de devolver metadatos:
+
+```bash
+# 1. Obtener token (válido 6 horas)
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+# 2. Leer nombre del rol
+ROLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/)
+
+# 3. Leer credenciales temporales del rol
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE
+```
+
+El resultado incluye `AccessKeyId`, `SecretAccessKey`, `Token` y `Expiration`. EC2 las renueva automáticamente antes de la expiración.
 
 ## Estructura del proyecto
 
@@ -90,21 +99,22 @@ lab-13/
 ├── README.md
 ├── arch/
 │   └── diagrama.svg       # Diagrama de arquitectura (referenciado en este README)
+├── user_data.sh           # Script de verificación (ejecutado al arrancar EC2)
 ├── aws/
-│   ├── providers.tf       # Provider AWS ~> 6.0 + backend S3
-│   ├── variables.tf       # region, project, admin_principal_arns, app_principal_arns, ebs_volume_size_gb
-│   ├── main.tf            # CMK, alias, Key Policy, EBS, S3
-│   ├── outputs.tf         # ARNs, IDs y comandos de verificación
-│   └── aws.s3.tfbackend   # key = "lab13/terraform.tfstate"
+│   ├── providers.tf       # Provider AWS + backend S3
+│   ├── variables.tf       # Variables: project, region, instance_type
+│   ├── main.tf            # Todos los recursos IAM y EC2
+│   ├── outputs.tf         # Outputs: ARNs, IDs, comandos de verificación
+│   └── aws.s3.tfbackend   # Configuración del backend remoto
 └── localstack/
     ├── README.md          # Guía de despliegue en LocalStack
-    ├── providers.tf
+    ├── providers.tf       # Provider con endpoints LocalStack
     ├── variables.tf
-    ├── main.tf            # CMK, alias, S3 (sin EBS ni bucket policy)
+    ├── main.tf
     └── outputs.tf
 ```
 
-## Despliegue en AWS real
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-13/aws
@@ -117,15 +127,6 @@ terraform plan
 terraform apply
 ```
 
-> Por defecto, `admin_principal_arns` está vacío y Terraform asigna el caller
-> actual como administrador. Para añadir más administradores o usuarios finales:
->
-> ```bash
-> terraform apply \
->   -var='admin_principal_arns=["arn:aws:iam::123456789012:user/alice"]' \
->   -var='app_principal_arns=["arn:aws:iam::123456789012:role/my-app"]'
-> ```
-
 ## Despliegue en LocalStack
 
 Consulta [localstack/README.md](localstack/README.md) para instrucciones de
@@ -133,243 +134,211 @@ despliegue local con LocalStack y sus limitaciones respecto a AWS real.
 
 ## Verificación final
 
-### 1. Confirmar la CMK y su rotación
+### 1. Confirmar recursos IAM creados
 
 ```bash
-KEY_ID=$(terraform output -raw cmk_key_id)
-
-# Metadatos de la llave
-aws kms describe-key --key-id $KEY_ID \
-  --query 'KeyMetadata.{KeyId:KeyId,Enabled:Enabled,KeyState:KeyState,Description:Description}'
-
-# Rotación automática habilitada
-aws kms get-key-rotation-status --key-id $KEY_ID
-# Esperado: { "KeyRotationEnabled": true }
+# Listar los recursos del laboratorio
+aws iam get-group --group-name lab13-developers
+aws iam get-user --user-name lab13-dev-01
+aws iam get-role --role-name lab13-ec2-role
+aws iam get-instance-profile --instance-profile-name lab13-ec2-profile
 ```
 
-### 2. Confirmar el alias
+### 2. Confirmar que dev-01 pertenece al grupo
 
 ```bash
-aws kms list-aliases --key-id $KEY_ID \
-  --query 'Aliases[].AliasName'
-# Esperado: ["alias/lab13-main"]
+aws iam list-groups-for-user --user-name lab13-dev-01
 ```
 
-### 3. Verificar la Key Policy y la segregación
+Resultado esperado: `lab13-developers` aparece en la lista.
+
+### 3. Conectarse a la instancia via SSM
 
 ```bash
-aws kms get-key-policy --key-id $KEY_ID --policy-name default \
-  --query Policy --output text | python3 -m json.tool
+# Obtener el Instance ID del output de Terraform
+INSTANCE_ID=$(terraform output -raw instance_id)
+
+# Abrir sesión interactiva sin SSH
+aws ssm start-session --target $INSTANCE_ID
 ```
 
-Confirmar que aparecen los tres Sid: `EnableRootAccess`, `AllowKeyAdministration`, `AllowAWSServicesViaGrants`.
+> La instancia puede tardar 1-2 minutos en estar disponible para SSM
+> tras el arranque.
 
-### 4. Comprobar el cifrado del volumen EBS
+### 4. Leer el log de verificación (dentro de la sesión SSM)
 
 ```bash
-aws ec2 describe-volumes \
-  --volume-ids $(terraform output -raw ebs_volume_id) \
-  --query 'Volumes[0].{Encrypted:Encrypted,KmsKeyId:KmsKeyId,VolumeType:VolumeType}'
-# Esperado: Encrypted = true, KmsKeyId contiene el ARN de la CMK
+cat /var/log/lab13-verify.log
 ```
 
-### 5. Comprobar el cifrado del bucket S3
+Resultado esperado:
 
-```bash
-aws s3api get-bucket-encryption --bucket $(terraform output -raw s3_bucket_name)
-# Esperado: SSEAlgorithm = "aws:kms", KMSMasterKeyID = ARN de la CMK
+```
+=== Lab 13 — Verificación de Identidad IAM ===
+Timestamp: 2025-XX-XXTXX:XX:XXZ
+
+--- [1] Obteniendo token IMDSv2 ---
+Token IMDSv2 obtenido correctamente.
+
+--- [2] Nombre del rol IAM en el Instance Profile ---
+Rol activo: lab13-ec2-role
+
+--- [3] Credenciales temporales (STS) ---
+{
+  "Code": "Success",
+  "Type": "AWS-HMAC",
+  "AccessKeyId": "ASIA...",
+  "SecretAccessKey": "...",
+  "Token": "...",
+  "Expiration": "2025-XX-XXTXX:XX:XXZ",
+  "LastUpdated": "..."
+}
+
+--- [4] aws sts get-caller-identity ---
+{
+  "UserId": "AROA...:i-0abc...",
+  "Account": "123456789012",
+  "Arn": "arn:aws:sts::123456789012:assumed-role/lab13-ec2-role/i-0abc..."
+}
+
+--- [5] aws ec2 describe-instances (lectura) ---
+Número de reservaciones visibles: 1
 ```
 
-### 6. Prueba de cifrado y descifrado con la CMK
+Observaciones clave:
+- El `Arn` confirma que la instancia opera con el rol `lab13-ec2-role`.
+- El `UserId` tiene formato `AROA...:i-0...` (rol asumido + ID de sesión).
+- Las credenciales incluyen un `Token` de sesión — son temporales.
+
+### 5. Verificar la Trust Policy del rol
 
 ```bash
-ALIAS="alias/lab13-main"
-
-# Cifrar texto plano
-# --cli-binary-format raw-in-base64-out: la CLI v2 acepta texto plano directamente
-CIPHER=$(aws kms encrypt \
-  --key-id $ALIAS \
-  --plaintext "hola-lab13" \
-  --cli-binary-format raw-in-base64-out \
-  --query CiphertextBlob --output text)
-
-echo "CiphertextBlob: $CIPHER"
-
-# Descifrar (round-trip)
-# $CIPHER ya es base64 — decrypt no necesita --cli-binary-format
-# La salida Plaintext también llega en base64, de ahí el | base64 -d
-aws kms decrypt \
-  --ciphertext-blob "$CIPHER" \
-  --query Plaintext --output text | base64 -d
-# Esperado: hola-lab13
+aws iam get-role --role-name lab13-ec2-role \
+  --query 'Role.AssumeRolePolicyDocument' --output json
 ```
 
-### 7. Prueba de cifrado forzoso en S3
+Confirma que `Principal.Service = "ec2.amazonaws.com"`.
+
+### 6. Verificar membresía del grupo desde tu terminal local
 
 ```bash
-BUCKET=$(terraform output -raw s3_bucket_name)
-
-# Subida correcta: con SSE-KMS y la CMK del lab
-echo "dato-secreto" | aws s3 cp - s3://$BUCKET/correcto.txt \
-  --sse aws:kms --sse-kms-key-id alias/lab13-main
-# Esperado: upload OK
-
-# Subida bloqueada: sin cifrado
-echo "dato-en-claro" | aws s3 cp - s3://$BUCKET/bloqueado.txt
-# Esperado: upload failed ... An error occurred (AccessDenied) ... with an explicit deny in a resource-based policy
-```
-
-### 8. Verificar el cabecera de cifrado en el objeto subido
-
-```bash
-aws s3api head-object --bucket $BUCKET --key correcto.txt \
-  --query '{SSEAlgorithm:ServerSideEncryption,KMSKeyId:SSEKMSKeyId}'
-# Esperado: SSEAlgorithm = "aws:kms", KMSKeyId = ARN de la CMK
+aws iam list-groups-for-user --user-name lab13-dev-01 \
+  --query 'Groups[].GroupName'
 ```
 
 ## Retos
 
-### Reto 1 — Segunda CMK para un entorno separado
+### Reto 1 — Política inline en el rol EC2
 
-Crea una segunda CMK (`aws_kms_key.secondary`) y su alias (`alias/lab13-staging`)
-para representar el entorno de staging. La política de bucket debe actualizarse
-para permitir objetos cifrados con **cualquiera de las dos CMKs**.
+Añade al rol EC2 una **política inline** (`aws_iam_role_policy`) que permita
+únicamente `s3:ListAllMyBuckets` con `Resource = "*"`. Las políticas inline son
+específicas del rol y no pueden compartirse con otros roles.
 
-**Pistas:**
-- Necesitarás una segunda `aws_kms_key` y `aws_kms_alias`.
-- La condición `DenyWrongKMSKey` en la Bucket Policy deberá usar `ForAllValues:StringNotEquals` con una lista de ARNs permitidos.
-
-#### Prueba
-
-```bash
-# La segunda CMK debe existir con alias propio
-aws kms list-aliases | grep lab13
-
-# Subir con la segunda CMK debe ser permitido
-echo "dato-staging" | aws s3 cp - s3://$(terraform output -raw s3_bucket_name)/staging.txt \
-  --sse aws:kms --sse-kms-key-id alias/lab13-staging
-# Esperado: upload OK
-
-# Subir sin cifrado sigue bloqueado
-echo "dato" | aws s3 cp - s3://$(terraform output -raw s3_bucket_name)/sin-cifrar.txt
-# Esperado: AccessDenied
-```
-
-### Reto 2 — Snapshot de EBS cifrado con la misma CMK
-
-Crea un `aws_ebs_snapshot` del volumen EBS del laboratorio. El snapshot debe
-heredar el cifrado de la CMK del laboratorio (no la llave por defecto).
+**Recurso a añadir en `main.tf`:**
 
 ```hcl
-resource "aws_ebs_snapshot" "main" {
+resource "aws_iam_role_policy" "ec2_s3_list" {
   # completar...
 }
 ```
 
 #### Prueba
 
-```bash
-SNAPSHOT_ID=$(terraform output -raw ebs_snapshot_id)
+Tras ejecutar `terraform apply`, abre una sesión SSM en la instancia y verifica:
 
-# El snapshot debe estar cifrado con la CMK del lab
-aws ec2 describe-snapshots --snapshot-ids $SNAPSHOT_ID \
-  --query 'Snapshots[0].{Encrypted:Encrypted,KmsKeyId:KmsKeyId,State:State}'
-# Esperado: Encrypted = true, KmsKeyId = ARN de la CMK, State = "completed"
+```bash
+# 1. Confirmar que la política inline existe en el rol
+aws iam list-role-policies --role-name lab13-ec2-role \
+  --query 'PolicyNames'
+# Esperado: ["lab13-ec2-s3-list"]
+
+# 2. Listar buckets S3 desde la instancia (usa las credenciales temporales del rol)
+aws s3 ls
+# Esperado: listado de buckets sin error de autorización
+
+# 3. Confirmar que la acción está explícitamente permitida
+aws iam simulate-principal-policy \
+  --policy-source-arn $(aws iam get-role --role-name lab13-ec2-role --query 'Role.Arn' --output text) \
+  --action-names s3:ListAllMyBuckets \
+  --query 'EvaluationResults[].EvalDecision'
+# Esperado: ["allowed"]
+```
+
+### Reto 2 — Permissions Boundary sobre el rol EC2
+
+Los **Permission Boundaries** limitan el máximo de permisos que un rol puede
+tener, independientemente de las políticas adjuntas. Son el mecanismo para
+evitar escalada de privilegios en entornos con múltiples equipos.
+
+Crea una política gestionada que permita únicamente `s3:*`, `ec2:Describe*` y
+las acciones necesarias para SSM, y asígnala como `permissions_boundary` del
+rol EC2.
+
+```hcl
+resource "aws_iam_policy" "boundary" {
+  name = "${var.project}-ec2-boundary"
+  # ...
+}
+
+resource "aws_iam_role" "ec2" {
+  # ... (añadir)
+  permissions_boundary = aws_iam_policy.boundary.arn
+}
+```
+
+> El Permissions Boundary no concede permisos: solo establece el techo.
+> El permiso efectivo es la intersección entre las políticas adjuntas y el boundary.
+
+#### Prueba
+
+Tras ejecutar `terraform apply`, verifica desde tu terminal local y desde la instancia:
+
+```bash
+# 1. Confirmar que el boundary está asignado al rol
+aws iam get-role --role-name lab13-ec2-role \
+  --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' --output text
+# Esperado: arn:aws:iam::<ACCOUNT_ID>:policy/lab13-ec2-boundary
+
+# 2. Comprobar que sts:GetCallerIdentity sigue funcionando (dentro del boundary)
+# Ejecutar desde la sesión SSM en la instancia:
+aws sts get-caller-identity
+# Esperado: JSON con UserId, Account y Arn del rol asumido
+
+# 3. Simular el efecto del boundary sobre una acción permitida
+aws iam simulate-principal-policy \
+  --policy-source-arn $(aws iam get-role --role-name lab13-ec2-role --query 'Role.Arn' --output text) \
+  --action-names ec2:DescribeInstances \
+  --query 'EvaluationResults[].EvalDecision'
+# Esperado: ["allowed"]  (acción dentro del boundary Y de las políticas adjuntas)
+
+# 4. Simular el efecto del boundary sobre una acción fuera de él
+aws iam simulate-principal-policy \
+  --policy-source-arn $(aws iam get-role --role-name lab13-ec2-role --query 'Role.Arn' --output text) \
+  --action-names iam:CreateUser \
+  --query 'EvaluationResults[].EvalDecision'
+# Esperado: ["implicitDeny"]  (bloqueada por el boundary aunque hubiera política que la concediera)
 ```
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Segunda CMK y Bucket Policy actualizada</strong></summary>
+<summary><strong>Solución al Reto 1 — Política inline S3 ListAllMyBuckets</strong></summary>
 
-### Solución al Reto 1 — Segunda CMK y Bucket Policy actualizada
-
-**Por qué se necesita una segunda CMK y no solo un segundo alias**
-
-Un alias es simplemente un puntero a una CMK. Si apuntáramos dos alias a la
-misma CMK, revocar el acceso a staging requeriría revocar también el acceso a
-producción. Con dos CMKs independientes se puede deshabilitar, rotar o borrar
-una sin afectar a la otra.
-
-**Por qué cambia la condición de la Bucket Policy**
-
-La política original usa `StringNotEqualsIfExists` con un único ARN:
-si la llave del objeto no coincide con ese ARN, se deniega. Con dos CMKs
-válidas no basta con ese operador — necesitamos `ForAllValues:StringNotEquals`
-para evaluar que el ARN proporcionado **no está en ninguna de las posiciones**
-de la lista permitida. Si el ARN coincide con cualquiera de los dos, la condición
-no se cumple y el `Deny` no se aplica.
-
-```
-ForAllValues:StringNotEquals  →  niega si el valor NO está en la lista
-                               →  permite si el valor SÍ está en la lista
-```
-
-**Código a añadir en `main.tf`:**
+### Solución al Reto 1 — Política inline S3 ListAllMyBuckets
 
 ```hcl
-# Segunda CMK para el entorno de staging.
-# Reutiliza el mismo data source de Key Policy (data.aws_iam_policy_document.cmk_policy)
-# porque los administradores y el acceso root son los mismos en ambos entornos.
-resource "aws_kms_key" "secondary" {
-  description             = "CMK de staging del lab13"
-  enable_key_rotation     = true
-  deletion_window_in_days = 7
-  policy                  = data.aws_iam_policy_document.cmk_policy.json
-
-  tags = merge(local.tags, { Name = "${var.project}-cmk-staging" })
-}
-
-# Alias independiente: alias/lab13-staging apunta a la CMK de staging.
-# Si en el futuro se sustituye la CMK de staging, basta con actualizar
-# target_key_id aquí sin tocar ninguna otra referencia.
-resource "aws_kms_alias" "secondary" {
-  name          = "alias/${var.project}-staging"
-  target_key_id = aws_kms_key.secondary.key_id
-}
-
-# Bucket Policy actualizada: permite objetos cifrados con cualquiera de las dos CMKs.
-# Se reemplaza el recurso aws_s3_bucket_policy existente (mismo nombre de recurso).
-resource "aws_s3_bucket_policy" "enforce_kms" {
-  bucket = aws_s3_bucket.main.id
+resource "aws_iam_role_policy" "ec2_s3_list" {
+  name = "${var.project}-ec2-s3-list"
+  role = aws_iam_role.ec2.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        # Primer guard: el objeto debe venir con cabecera SSE-KMS.
-        # StringNotEqualsIfExists ignora la condición si la cabecera no existe,
-        # pero el segundo guard atrapa ese caso al verificar el Key ID.
-        Sid       = "DenyNonKMSUploads"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "s3:PutObject"
-        Resource  = "${aws_s3_bucket.main.arn}/*"
-        Condition = {
-          StringNotEqualsIfExists = {
-            "s3:x-amz-server-side-encryption" = "aws:kms"
-          }
-        }
-      },
-      {
-        # Segundo guard: el Key ID debe ser uno de los dos ARNs permitidos.
-        # ForAllValues:StringNotEquals evalúa cada valor de la clave de condición
-        # contra la lista; si ninguno coincide, el Deny se activa.
-        Sid       = "DenyWrongKMSKey"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "s3:PutObject"
-        Resource  = "${aws_s3_bucket.main.arn}/*"
-        Condition = {
-          "ForAllValues:StringNotEqualsIfExists" = {
-            "s3:x-amz-server-side-encryption-aws-kms-key-id" = [
-              aws_kms_key.main.arn,
-              aws_kms_key.secondary.arn,
-            ]
-          }
-        }
-      }
-    ]
+    Statement = [{
+      Sid      = "S3ListBuckets"
+      Effect   = "Allow"
+      Action   = "s3:ListAllMyBuckets"
+      Resource = "*"
+    }]
   })
 }
 ```
@@ -377,60 +346,59 @@ resource "aws_s3_bucket_policy" "enforce_kms" {
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Snapshot de EBS cifrado</strong></summary>
+<summary><strong>Solución al Reto 2 — Permissions Boundary</strong></summary>
 
-### Solución al Reto 2 — Snapshot de EBS cifrado
-
-**Qué hace un snapshot de EBS cifrado**
-
-Un snapshot es una copia puntual del contenido del volumen almacenada en S3
-(gestionado internamente por AWS, no en tu bucket). Si el volumen origen está
-cifrado, AWS copia también los metadatos de cifrado: el snapshot hereda la misma
-CMK automáticamente. No es necesario especificar `kms_key_id` en el snapshot
-porque AWS lo infiere del volumen.
-
-El snapshot puede usarse para:
-- Restaurar el volumen en caso de pérdida de datos.
-- Crear volúmenes en otras zonas de disponibilidad (siempre cifrados con la misma CMK).
-- Compartir datos cifrados con otra cuenta de AWS (requiriendo que la cuenta
-  destino tenga permisos sobre la CMK mediante una grant).
-
-**Implicación de coste**: los snapshots se facturan por GiB-mes del espacio
-diferencial utilizado. Un snapshot de un volumen de 10 GiB vacío ocupa muy poco,
-pero conviene destruirlos al terminar el laboratorio.
-
-**Código a añadir en `main.tf`:**
+### Solución al Reto 2 — Permissions Boundary
 
 ```hcl
-# El snapshot hereda encrypted = true y kms_key_id del volumen origen.
-# AWS no permite crear un snapshot no cifrado de un volumen cifrado.
-resource "aws_ebs_snapshot" "main" {
-  volume_id   = aws_ebs_volume.main.id
-  description = "Snapshot del volumen EBS del lab13 - cifrado con CMK"
+resource "aws_iam_policy" "boundary" {
+  name        = "${var.project}-ec2-boundary"
+  description = "Techo de permisos para el rol EC2 del lab13"
 
-  tags = merge(local.tags, { Name = "${var.project}-snapshot" })
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowS3"
+        Effect   = "Allow"
+        Action   = "s3:*"
+        Resource = "*"
+      },
+      {
+        Sid      = "AllowEC2Describe"
+        Effect   = "Allow"
+        Action   = ["ec2:Describe*", "ec2:Get*"]
+        Resource = "*"
+      },
+      {
+        Sid      = "AllowSTS"
+        Effect   = "Allow"
+        Action   = "sts:GetCallerIdentity"
+        Resource = "*"
+      },
+      {
+        Sid    = "AllowSSM"
+        Effect = "Allow"
+        Action = [
+          "ssm:UpdateInstanceInformation",
+          "ssmmessages:*",
+          "ec2messages:*"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
-```
 
-**Output a añadir en `outputs.tf`:**
+resource "aws_iam_role" "ec2" {
+  name               = "${var.project}-ec2-role"
+  path               = "/"
+  assume_role_policy = data.aws_iam_policy_document.ec2_trust.json
+  description        = "Rol para instancias EC2 del Lab12"
+  permissions_boundary = aws_iam_policy.boundary.arn   # <-- añadido
 
-```hcl
-output "ebs_snapshot_id" {
-  description = "ID del snapshot del volumen EBS"
-  value       = aws_ebs_snapshot.main.id
+  tags = merge(local.tags, { Name = "${var.project}-ec2-role" })
 }
-```
-
-**Por qué `terraform apply` podría tardar varios minutos**
-
-Terraform llama a `ec2:CreateSnapshot` y luego espera a que el estado sea
-`completed` antes de continuar. En volúmenes pequeños y vacíos suele tardar
-entre 1 y 5 minutos. El progreso se puede monitorizar con:
-
-```bash
-aws ec2 describe-snapshots \
-  --snapshot-ids $(terraform output -raw ebs_snapshot_id) \
-  --query 'Snapshots[0].{State:State,Progress:Progress}'
 ```
 
 </details>
@@ -442,27 +410,26 @@ cd labs/lab-13/aws
 terraform destroy
 ```
 
-> Los volúmenes EBS se facturan por GiB-hora aunque estén sin adjuntar; los snapshots se facturan por GiB-mes.
-> Destruye los recursos al terminar el laboratorio.
+> Terraform eliminará primero las políticas y membresías antes de intentar
+> borrar el usuario (gracias a `force_destroy = true`).
 
 ## Buenas prácticas aplicadas
 
 | Práctica | Implementación |
 |----------|----------------|
-| Root account siempre en Key Policy | Statement `EnableRootAccess` — recuperación ante errores |
-| Segregación admin/usuario | Administradores no pueden cifrar/descifrar; usuarios no pueden gestionar la llave |
-| Alias como capa de indirección | La sustitución de CMK no requiere cambios en el código |
-| Rotación automática | `enable_key_rotation = true` — rotación anual sin interrupciones |
-| Bucket Key activado | Reduce coste de KMS hasta un 99% en buckets con alta densidad |
-| Cifrado forzoso en S3 | Bucket Policy con `Deny` explícito — ningún objeto puede subirse sin cifrar |
-| `deletion_window_in_days = 7` | Ventana mínima — permite cancelar borrados accidentales |
+| Sin credenciales estáticas | Rol IAM + Instance Profile en lugar de Access Keys |
+| Principio de mínimo privilegio | El grupo solo tiene lectura; el rol solo lo que necesita |
+| IMDSv2 obligatorio | `http_tokens = "required"` bloquea ataques SSRF |
+| Sin acceso SSH | SSM Session Manager — sin puertos abiertos ni claves |
+| No crear Access Keys en Terraform | El usuario se crea sin credenciales adjuntas |
+| Trust Policy explícita | `data "aws_iam_policy_document"` valida la sintaxis |
 
 ## Recursos
 
-- [AWS KMS — Customer Managed Keys](https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk)
-- [Key Policy — AWS Docs](https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html)
-- [S3 SSE-KMS — AWS Docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html)
-- [EBS Encryption — AWS Docs](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-encryption.html)
-- [S3 Bucket Key — AWS Docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html)
-- [aws_kms_key — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/kms_key)
-- [aws_kms_alias — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/kms_alias)
+- [IAM Roles — AWS Docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html)
+- [Instance Profiles — AWS Docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2_instance-profiles.html)
+- [IMDSv2 — AWS Docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
+- [SSM Session Manager — AWS Docs](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
+- [Permissions Boundaries — AWS Docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html)
+- [aws_iam_role — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role)
+- [aws_iam_instance_profile — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile)

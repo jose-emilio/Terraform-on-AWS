@@ -22,7 +22,7 @@ El pipeline también incluye una **Lambda inspectora** que analiza programática
 antes de llegar a la aprobación humana: cuenta recursos por tipo de acción y puede bloquear
 automáticamente el pipeline si el número de destrucciones supera un umbral configurable.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Construir un pipeline CodePipeline de cuatro etapas con artefactos cifrados con KMS
 - Configurar acciones paralelas en la etapa Build usando `run_order`
@@ -170,7 +170,7 @@ Cada servicio (CodePipeline, CodeBuild, Lambda) recibe `kms:Decrypt` en su polí
 para poder leer los artefactos. La política de la clave solo permite acceso a la cuenta raíz;
 la autorización granular se delega en IAM.
 
-## Estructura
+## Estructura del proyecto
 
 ```
 lab-45/
@@ -788,10 +788,10 @@ El `input_transformer` permite reescribir el payload del evento antes de enviarl
 topic SNS, extrayendo solo los campos relevantes y dando formato al mensaje que se
 recibirá por correo.
 
-Las piezas 1–4 van en un nuevo fichero [aws/eventbridge.tf](aws/eventbridge.tf) dentro de
+Las piezas 1–4 van en un nuevo fichero `aws/eventbridge.tf` dentro de
 la infraestructura del pipeline.
 
-**Pieza 1 — Topic SNS de alertas** → [aws/eventbridge.tf](aws/eventbridge.tf):
+**Pieza 1 — Topic SNS de alertas** → `aws/eventbridge.tf`:
 
 Crea un topic SNS independiente del topic de aprobaciones ya existente. Reutilizar el topic
 de aprobaciones mezclaría dos tipos de notificaciones con semánticas distintas: una requiere
@@ -811,7 +811,7 @@ resource "aws_sns_topic_subscription" "pipeline_alerts_email" {
 }
 ```
 
-**Pieza 2 — Regla EventBridge para inicio y finalización exitosa** → [aws/eventbridge.tf](aws/eventbridge.tf):
+**Pieza 2 — Regla EventBridge para inicio y finalización exitosa** → `aws/eventbridge.tf`:
 
 Esta regla opera a nivel de **ejecución completa del pipeline** (`Pipeline Execution State
 Change`), no a nivel de etapa. Filtra únicamente los estados `STARTED` y `SUCCEEDED` para
@@ -833,7 +833,7 @@ resource "aws_cloudwatch_event_rule" "pipeline_execution_notify" {
 }
 ```
 
-**Pieza 3 — Regla EventBridge para fallos de etapa** → [aws/eventbridge.tf](aws/eventbridge.tf):
+**Pieza 3 — Regla EventBridge para fallos de etapa** → `aws/eventbridge.tf`:
 
 Esta segunda regla opera a nivel de **etapa** (`Stage Execution State Change`). El filtro
 `resources = [arn]` limita la regla a este pipeline concreto, evitando falsos positivos si
@@ -855,7 +855,7 @@ resource "aws_cloudwatch_event_rule" "pipeline_stage_failed" {
 }
 ```
 
-**Pieza 4 — Targets EventBridge → SNS** → [aws/eventbridge.tf](aws/eventbridge.tf):
+**Pieza 4 — Targets EventBridge → SNS** → `aws/eventbridge.tf`:
 
 Cada regla necesita su propio target. El `input_transformer` extrae campos del evento con
 `input_paths` (sintaxis JMESPath) y los interpola en `input_template`. Sin él, el mensaje
@@ -894,7 +894,7 @@ resource "aws_cloudwatch_event_target" "pipeline_stage_failed_sns" {
 }
 ```
 
-**Pieza 5 — Política del topic SNS** → [aws/eventbridge.tf](aws/eventbridge.tf):
+**Pieza 5 — Política del topic SNS** → `aws/eventbridge.tf`:
 
 Por defecto, un topic SNS solo acepta publicaciones del propietario de la cuenta. EventBridge
 es un servicio AWS diferente y necesita permiso explícito para publicar en el topic. Sin esta
@@ -920,7 +920,7 @@ resource "aws_sns_topic_policy" "pipeline_alerts" {
 
 **Aplicar la infraestructura:**
 
-Una vez creadas las piezas 1–5 en [aws/eventbridge.tf](aws/eventbridge.tf), aplica los cambios:
+Una vez creadas las piezas 1–5 en `aws/eventbridge.tf`, aplica los cambios:
 
 ```bash
 cd labs/lab-45/aws

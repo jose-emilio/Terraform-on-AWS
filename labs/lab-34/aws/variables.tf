@@ -10,20 +10,14 @@ variable "project" {
   default     = "lab34"
 }
 
-variable "instance_type" {
-  type        = string
-  description = "Tipo de instancia EC2"
-  default     = "t3.micro"
+variable "transition_days" {
+  type        = number
+  description = "Dias hasta mover objetos a Glacier Flexible Retrieval"
+  default     = 90
 }
 
-variable "app_uid" {
+variable "expiration_days" {
   type        = number
-  description = "POSIX UID del usuario de la aplicacion en el EFS Access Point"
-  default     = 1001
-}
-
-variable "app_gid" {
-  type        = number
-  description = "POSIX GID del grupo de la aplicacion en el EFS Access Point"
-  default     = 1001
+  description = "Dias hasta eliminar objetos definitivamente"
+  default     = 365
 }

@@ -1,16 +1,11 @@
 variable "region" {
-  type    = string
-  default = "us-east-1"
+  type        = string
+  description = "Región de AWS donde se despliega la infraestructura"
+  default     = "us-east-1"
 }
 
-variable "project" {
+variable "vpc_cidr" {
   type        = string
-  description = "Prefijo que identifica todos los recursos del laboratorio"
-  default     = "lab12"
-}
-
-variable "instance_type" {
-  type        = string
-  description = "Tipo de instancia EC2. t4g usa arquitectura ARM64 (Graviton)"
-  default     = "t4g.micro"
+  description = "CIDR block de la VPC"
+  default     = "10.11.0.0/16"
 }

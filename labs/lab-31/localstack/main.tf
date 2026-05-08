@@ -1,13 +1,17 @@
-# Versión LocalStack de Lab31.
+# Versión LocalStack de Lab30.
 #
-# API Gateway v2 (aws_apigatewayv2_*) y aws_lambda_permission NO están incluidos
-# en LocalStack Community (requieren licencia Pro). Se han eliminado de este fichero.
-# En LocalStack solo se despliegan los recursos disponibles en Community:
-#   archive_file, Lambda Layer, Lambda Function, IAM y CloudWatch Logs.
+# Recursos disponibles en LocalStack Community:
+#   SQS (colas, redrive_policy, DLQ), Lambda, IAM, CloudWatch Logs,
+#   archive_file, aws_lambda_event_source_mapping, aws_iam_role_policy.
 #
-# Para probar el flujo completo HTTP API → Lambda usa aws/ con AWS real.
-# Para invocar la función localmente usa:
-#   awslocal lambda invoke --function-name <nombre> --payload '<evento>' /tmp/out.json
+# Limitaciones conocidas:
+#   filter_criteria  — soporte parcial; en Community los filtros pueden no
+#                      aplicarse y todos los mensajes activarían Lambda.
+#   Lambda Destinations (aws_lambda_function_event_invoke_config) — soporte
+#                      parcial; el recurso se crea sin errores pero LocalStack
+#                      Community puede no enrutar el resultado a las colas.
+#
+# Para verificar el flujo completo con filtros y destinos garantizados usa AWS real.
 
 # ── Locales ───────────────────────────────────────────────────────────────────
 
@@ -19,44 +23,52 @@ locals {
 }
 
 # ── Empaquetado del código fuente ─────────────────────────────────────────────
-#
-# LocalStack Community no monta Lambda Layers correctamente: aunque el recurso
-# aws_lambda_layer_version se crea sin errores, el módulo no queda accesible
-# en /opt/python y el handler falla con "No module named 'utils'".
-#
-# Solución: la Layer se sigue creando (para demostrar su creación en LocalStack)
-# pero utils.py se empaqueta también dentro del ZIP de la función usando bloques
-# source {}, de modo que "from utils import ..." resuelve desde el mismo directorio.
-# En AWS real (aws/main.tf) el ZIP de la función NO incluye utils.py — lo provee
-# la Layer correctamente montada en /opt/python.
-
-data "archive_file" "layer" {
-  type        = "zip"
-  source_dir  = "${path.module}/src/layer"
-  output_path = "${path.module}/layer.zip"
-}
 
 data "archive_file" "function" {
   type        = "zip"
+  source_dir  = "${path.module}/src/function"
   output_path = "${path.module}/function.zip"
+}
 
-  # handler.py — código principal de la función
-  source {
-    content  = file("${path.module}/src/function/handler.py")
-    filename = "handler.py"
-  }
+# ── SQS: Dead Letter Queue ────────────────────────────────────────────────────
 
-  # utils.py — incluido directamente porque LocalStack no monta la Layer
-  source {
-    content  = file("${path.module}/src/layer/python/utils.py")
-    filename = "utils.py"
-  }
+resource "aws_sqs_queue" "dlq" {
+  name                      = "${var.project}-dlq"
+  message_retention_seconds = 1209600 # 14 días
+  tags                      = merge(local.tags, { Name = "${var.project}-dlq" })
+}
+
+# ── SQS: Colas de destino para Lambda Destinations ───────────────────────────
+
+resource "aws_sqs_queue" "success" {
+  name = "${var.project}-success"
+  tags = merge(local.tags, { Name = "${var.project}-success" })
+}
+
+resource "aws_sqs_queue" "failure" {
+  name = "${var.project}-failure"
+  tags = merge(local.tags, { Name = "${var.project}-failure" })
+}
+
+# ── SQS: Cola principal de órdenes ───────────────────────────────────────────
+
+resource "aws_sqs_queue" "orders" {
+  name                       = "${var.project}-orders"
+  visibility_timeout_seconds = 30
+  message_retention_seconds  = 86400 # 1 día
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 3
+  })
+
+  tags = merge(local.tags, { Name = "${var.project}-orders" })
 }
 
 # ── CloudWatch Logs ────────────────────────────────────────────────────────────
 
 resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${var.project}-function"
+  name              = "/aws/lambda/${var.project}-processor"
   retention_in_days = 7
   tags              = local.tags
 }
@@ -83,28 +95,46 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# ── Lambda Layer ──────────────────────────────────────────────────────────────
+resource "aws_iam_role_policy" "sqs" {
+  name = "${var.project}-sqs-policy"
+  role = aws_iam_role.lambda.id
 
-resource "aws_lambda_layer_version" "utils" {
-  layer_name          = "${var.project}-utils"
-  filename            = data.archive_file.layer.output_path
-  source_code_hash    = data.archive_file.layer.output_base64sha256
-  compatible_runtimes = [var.runtime]
-  description         = "Utilidades compartidas: format_response y get_metadata"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadOrdersQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+        ]
+        Resource = aws_sqs_queue.orders.arn
+      },
+      {
+        Sid    = "WriteDestinationQueues"
+        Effect = "Allow"
+        Action = ["sqs:SendMessage"]
+        Resource = [
+          aws_sqs_queue.success.arn,
+          aws_sqs_queue.failure.arn,
+        ]
+      },
+    ]
+  })
 }
 
 # ── Lambda Function ───────────────────────────────────────────────────────────
 
-resource "aws_lambda_function" "api" {
-  function_name    = "${var.project}-function"
+resource "aws_lambda_function" "processor" {
+  function_name    = "${var.project}-processor"
   filename         = data.archive_file.function.output_path
   source_code_hash = data.archive_file.function.output_base64sha256
   runtime          = var.runtime
   handler          = "handler.lambda_handler"
-  role = aws_iam_role.lambda.arn
-
-  # layers no se usa en LocalStack: utils.py ya viene empaquetado en el ZIP
-  # de la función (ver data "archive_file" "function" arriba).
+  role             = aws_iam_role.lambda.arn
+  timeout          = 30
 
   environment {
     variables = {
@@ -115,11 +145,47 @@ resource "aws_lambda_function" "api" {
 
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic,
+    aws_iam_role_policy.sqs,
     aws_cloudwatch_log_group.lambda,
   ]
 
-  tags = merge(local.tags, { Name = "${var.project}-function" })
+  tags = merge(local.tags, { Name = "${var.project}-processor" })
 }
 
-# ── API Gateway v2 y Lambda Permission ────────────────────────────────────────
-# No disponibles en LocalStack Community. Ver comentario en la cabecera del fichero.
+# ── Lambda Destinations ───────────────────────────────────────────────────────
+# Soporte parcial en LocalStack Community. El recurso se crea correctamente
+# pero el enrutamiento hacia las colas puede no ejecutarse.
+
+resource "aws_lambda_function_event_invoke_config" "processor" {
+  function_name = aws_lambda_function.processor.function_name
+
+  destination_config {
+    on_success {
+      destination = aws_sqs_queue.success.arn
+    }
+    on_failure {
+      destination = aws_sqs_queue.failure.arn
+    }
+  }
+}
+
+# ── Event Source Mapping ──────────────────────────────────────────────────────
+# filter_criteria tiene soporte parcial en LocalStack Community.
+# Si los filtros no se aplican, mensajes de cualquier order_type activarán Lambda.
+
+resource "aws_lambda_event_source_mapping" "orders" {
+  event_source_arn = aws_sqs_queue.orders.arn
+  function_name    = aws_lambda_function.processor.arn
+  batch_size       = 10
+  enabled          = true
+
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        body = {
+          order_type = ["premium"]
+        }
+      })
+    }
+  }
+}

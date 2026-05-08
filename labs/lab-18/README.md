@@ -1,4 +1,4 @@
-# Laboratorio 18 — Seguridad y Control de Tráfico en VPC
+# Laboratorio 18 — Optimización de Salida a Internet y "NAT Tax"
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,34 +8,35 @@
 
 ## Visión general
 
-Implementar un modelo de **seguridad por capas** (Capa 7 y Capa 4) utilizando Security Groups y NACLs, aplicando el patrón de diseño ALB -> EC2 con referencia por Security Group, bloques dinámicos, NACLs defensivas y VPC Flow Logs para diagnóstico.
+Configurar la conectividad de salida a Internet priorizando la **alta disponibilidad** y la **eficiencia de costes** (FinOps), comparando el modelo NAT Gateway regional con una Instancia NAT EC2 para entornos de desarrollo.
 
 ## Arquitectura
 
-![Defensa en profundidad: NACL pública → SG ALB → NACL privada → SG EC2 + Flow Logs](arch/diagrama.svg)
+![Salida a Internet por AZ con NAT Gateway o NAT Instance + VPC Endpoint S3](arch/diagrama.svg)
 
-El tráfico atraviesa **cuatro capas independientes** antes de llegar a la aplicación:
-
-1. **NACL pública** (Capa 4 stateless) — bloquea IPs maliciosas en regla 50, permite HTTP/HTTPS y puertos efímeros en reglas 100/110/120.
-2. **SG del ALB** (Capa 4 stateful) — admite `tcp/80` y `tcp/443` desde Internet.
-3. **NACL privada** — segunda barrera defensiva en la subred del backend.
-4. **SG de las EC2** — clave del patrón: `referenced_security_group_id = SG_ALB` (no CIDR), de modo que solo instancias asociadas al SG del ALB pueden conectar al puerto 80, sin acoplarse a IPs.
-
-**VPC Flow Logs** en modo `REJECT` graba en CloudWatch todo el tráfico denegado, lo que permite diagnosticar bloqueos sin SSH a las instancias.
-
-> **Defensa en profundidad:** Las NACLs actúan como primera línea (bloqueo de IPs conocidas, rango de puertos). Los Security Groups actúan como segunda línea (referencia por identidad, no por IP). Ambas capas se complementan.
+Una VPC `10.13.0.0/16` con 3 AZs. Cada AZ tiene su propio NAT (Gateway en producción, Instance ARM `t4g.small` en desarrollo, controlado por `var.use_nat_instance`) y su propia tabla de rutas privada — así el tráfico de salida nunca cruza AZs. El **VPC Gateway Endpoint S3** se asocia a las cuatro tablas de rutas (1 pública + 3 privadas) y desvía el tráfico hacia S3 por la red interna de AWS, evitando el cargo de $0.045/GB del NAT ("NAT Tax"). Una instancia de test en `private-1` permite verificar la conectividad por SSM Session Manager.
 
 ## Conceptos clave
 
 | Concepto | Descripción |
 |---|---|
-| **Security Group (SG)** | Firewall stateful a nivel de instancia (Capa 4/7). Evalúa solo reglas de permitir; el tráfico de retorno se permite automáticamente. Se pueden encadenar referenciando el ID de otro SG como origen |
-| **`source_security_group_id`** | Permite que un SG acepte tráfico solo desde instancias asociadas a otro SG, sin acoplar CIDRs. Patrón clave para ALB -> EC2 |
-| **Bloque `dynamic`** | Meta-argumento de Terraform que genera múltiples bloques anidados (como `ingress`) a partir de una lista o mapa, eliminando repetición |
-| **Network ACL (NACL)** | Firewall stateless a nivel de subred (Capa 4). Evalúa reglas de permitir y denegar con prioridad numérica. Requiere reglas explícitas para tráfico de retorno (puertos efímeros) |
-| **Puertos efímeros** | Rango 1024-65535 usado por clientes para recibir respuestas. Las NACLs, al ser stateless, necesitan permitir estos puertos explícitamente para que el tráfico de retorno funcione |
-| **VPC Flow Logs** | Registro del tráfico IP que entra y sale de las interfaces de red de la VPC. Puede capturar todo, solo ACCEPT, o solo REJECT. Se almacena en CloudWatch Logs o S3 |
-| **ALB (Application Load Balancer)** | Balanceador de carga en Capa 7 (HTTP/HTTPS) que distribuye tráfico entre instancias en múltiples AZs |
+| **Internet Gateway (IGW)** | Componente de VPC que permite comunicación bidireccional entre subredes públicas e Internet; sin coste base, sin límite de ancho de banda |
+| **NAT Gateway** | Servicio gestionado que permite a las subredes privadas iniciar conexiones salientes a Internet sin exponerse; coste: ~$32/mes + $0.045/GB procesado |
+| **NAT Gateway × 3 AZs** | Buena práctica: 1 NAT Gateway por AZ elimina tráfico cross-AZ y mantiene la salida si cae una AZ |
+| **Instancia NAT** | EC2 ARM configurada como router NAT con iptables; coste: ~$12.26/mes (t4g.small), ahorro ~62% vs NAT Gateway, mejor relación precio/rendimiento en Graviton |
+| **`source_dest_check`** | Atributo de EC2 que por defecto descarta tráfico cuyo origen/destino no sea la propia instancia; **debe deshabilitarse** en instancias NAT |
+| **VPC Gateway Endpoint** | Ruta directa desde la VPC al servicio de AWS (S3, DynamoDB) por la red interna; **completamente gratuito**, evita el cargo por GB del NAT |
+| **"NAT Tax"** | Término coloquial para el coste acumulado de $0.045/GB que cobra el NAT Gateway por cada GB procesado; puede ser significativo en cargas con alto volumen de datos |
+
+## Comparativa de costes
+
+| Modelo | Coste base (mes) | Coste por GB | Alta disponibilidad | Mantenimiento |
+|---|---|---|---|---|
+| NAT Gateway × 3 AZs (este lab) | ~$96 | $0.045 | Sí (por AZ) | Ninguno |
+| Instancia NAT × 3 AZs (este lab) | ~$36.78 | Tráfico EC2 estándar | Sí (por AZ) | Parches, iptables, monitoreo |
+| VPC Endpoint S3 | $0 | $0 | Sí | Ninguno |
+
+> **Regla FinOps:** Usa NAT Gateway × 3 en producción (alta disponibilidad sin mantenimiento), Instancia NAT × 3 en dev/sandbox (ahorro ~62%), y **siempre** VPC Endpoints para servicios de AWS de alto volumen (S3, DynamoDB).
 
 ## Requisitos previos
 
@@ -53,193 +54,206 @@ echo "Bucket: $BUCKET"
 
 ```
 lab-18/
-├── README.md                    <- Esta guía
+├── README.md                    ← Esta guía
 ├── arch/
-│   └── diagrama.svg             <- Diagrama de arquitectura (referenciado en este README)
+│   └── diagrama.svg             ← Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf             <- Backend S3 parcial
-│   ├── variables.tf             <- Variables: región, CIDR, proyecto, puertos, IP bloqueada
-│   ├── main.tf                  <- VPC + ALB + EC2 + SGs + NACLs + Flow Logs
-│   ├── outputs.tf               <- IDs, DNS del ALB, SG IDs
-│   ├── aws.s3.tfbackend         <- Parámetros del backend (sin bucket)
+│   ├── providers.tf             ← Backend S3 parcial
+│   ├── variables.tf             ← Variables: región, CIDR, proyecto, use_nat_instance
+│   ├── main.tf                  ← VPC + subredes + IGW + NAT GW/Instance + VPC Endpoint S3
+│   ├── outputs.tf               ← IDs, IPs, modo NAT activo
+│   ├── aws.s3.tfbackend         ← Parámetros del backend (sin bucket)
 │   └── scripts/
-│       └── app_init.sh          <- user_data de las EC2 (httpd + SSM agent)
+│       ├── nat_init.sh          ← user_data de la NAT Instance (iptables + SSM)
+│       └── test_init.sh         ← user_data de la instancia de test (SSM)
 └── localstack/
-    ├── README.md                <- Guía específica para LocalStack
+    ├── README.md                ← Guía específica para LocalStack
     ├── providers.tf
     ├── variables.tf
-    ├── main.tf                  <- Estructura equivalente (sin tráfico real, sin ALB)
+    ├── main.tf                  ← Solo NAT Gateway (NAT Instance no disponible en LocalStack)
     ├── outputs.tf
-    └── localstack.s3.tfbackend  <- Backend completo para LocalStack
+    └── localstack.s3.tfbackend  ← Backend completo para LocalStack
 ```
 
 ## Análisis del código
 
-### Security Group del ALB — Puerta de entrada controlada
-
-El SG se declara "vacío" (sin reglas inline) y cada regla vive en su propio recurso `aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule` (recomendados por HashiCorp desde el provider AWS 5.x sobre el antiguo `aws_security_group_rule`, que sigue funcionando pero queda como modelo legado):
+### Internet Gateway — La puerta de entrada
 
 ```hcl
-resource "aws_security_group" "alb" {
-  name        = "alb-${var.project_name}"
-  description = "Trafico HTTP/HTTPS desde Internet"
-  vpc_id      = aws_vpc.main.id
-}
-
-# Una regla por cada puerto en var.alb_ingress_ports (80 y 443 por defecto).
-resource "aws_vpc_security_group_ingress_rule" "alb_ports" {
-  for_each = { for p in var.alb_ingress_ports : tostring(p) => p }
-
-  security_group_id = aws_security_group.alb.id
-  cidr_ipv4         = "0.0.0.0/0"
-  from_port         = each.value
-  to_port           = each.value
-  ip_protocol       = "tcp"
-  description       = "Puerto ${each.value} desde Internet"
-}
-
-resource "aws_vpc_security_group_egress_rule" "alb_all" {
-  security_group_id = aws_security_group.alb.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
 }
 ```
 
-El recurso `aws_vpc_security_group_ingress_rule` se crea con `for_each` sobre `var.alb_ingress_ports` (por defecto `[80, 443]`), generando una regla por puerto. Si en el futuro necesitas abrir el 8080, basta con añadir el valor a la lista — sin tocar nada más. Cada regla queda con su propio address en el state (`aws_vpc_security_group_ingress_rule.alb_ports["80"]`, `["443"]`), lo que permite gestionarlas con `lifecycle`, importarlas o destruirlas individualmente.
+El IGW es el componente más simple de la red: se adjunta a la VPC y permite que las subredes públicas (con una ruta `0.0.0.0/0 → igw`) se comuniquen bidireccionalmente con Internet. No tiene coste base ni límite de ancho de banda.
 
-> **Nota sobre el puerto 443:** el SG y la NACL abren tanto 80 como 443 para reflejar el patrón habitual en producción, pero **el ALB de este laboratorio solo expone un listener HTTP en el puerto 80** (no se configura listener HTTPS porque eso requiere un certificado ACM, fuera del alcance del lab). Una conexión a `https://<alb_dns>` será rechazada por el ALB aunque el tráfico atraviese el SG y la NACL: el handshake TLS falla porque no hay nadie escuchando en 443. Mantenemos la regla 443 abierta como ejemplo de configuración defensiva: cuando añadas el listener HTTPS y el certificado, no tendrás que tocar ni el SG ni la NACL.
-
-**¿Por qué `for_each` sobre la variable y no reglas fijas?**
-
-Con reglas fijas, cada nuevo puerto requiere copiar y pegar un recurso completo. Con `for_each` parametrizado, la lista de puertos es una variable que puede cambiar por entorno (dev podría abrir el 8080 para depuración; producción solo 80 y 443) sin duplicación de código.
-
-**¿Por qué reglas en recursos separados en vez de bloques `ingress`/`egress` inline?**
-
-Cuando las reglas son bloques inline dentro de `aws_security_group`, Terraform las gestiona como parte del propio SG. Eso provoca dos problemas frecuentes:
-1. **Drift al editar reglas a mano** (consola, CLI, otra herramienta): el siguiente `apply` revierte todo lo que no esté en el código.
-2. **Dependencias circulares** cuando dos SGs se referencian mutuamente — Terraform no puede crear el SG-A porque su regla apunta al SG-B y viceversa. Con reglas separadas, los SGs se crean primero (vacíos) y las reglas después, rompiendo el ciclo.
-
-### Security Group de las EC2 — Solo tráfico desde el ALB
+Las subredes públicas se asocian a una tabla de rutas con esta ruta:
 
 ```hcl
-resource "aws_security_group" "app" {
-  name        = "app-${var.project_name}"
-  description = "Trafico solo desde el ALB"
-  vpc_id      = aws_vpc.main.id
-}
-
-resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
-  security_group_id            = aws_security_group.app.id
-  referenced_security_group_id = aws_security_group.alb.id   # <-- identidad, no IP
-  from_port                    = 80
-  to_port                      = 80
-  ip_protocol                  = "tcp"
-  description                  = "HTTP desde el ALB"
-}
-
-resource "aws_vpc_security_group_egress_rule" "app_all" {
-  security_group_id = aws_security_group.app.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
+resource "aws_route" "public_internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.main.id
 }
 ```
 
-Punto clave: la regla de entrada usa `referenced_security_group_id` (identidad del SG del ALB) en lugar de `cidr_ipv4`. Esto significa que **solo las instancias asociadas al SG del ALB** pueden enviar tráfico a las EC2 en el puerto 80. Si alguien intenta acceder directamente a la IP de la EC2, el tráfico se descarta.
-
-**Ventaja sobre CIDR:** Si el ALB cambia de IP (por escalado, reemplazo, etc.), la regla sigue funcionando porque referencia la identidad del SG, no una IP fija.
-
-### Network ACL — Bloqueo explícito de IP maliciosa
+### NAT Gateway × 3 — Uno por AZ (buena práctica)
 
 ```hcl
-resource "aws_network_acl" "public" {
-  vpc_id     = aws_vpc.main.id
-  subnet_ids = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
-
-  # Regla 50: Bloquear IP maliciosa. Las NACLs evalúan reglas en orden numérico
-  # ascendente y aplican la primera que coincida (sea allow o deny), por eso
-  # esta regla tiene número 50: se evalúa antes que el allow del puerto 80 (100).
-  ingress {
-    rule_no    = 50
-    action     = "deny"
-    protocol   = "-1"
-    from_port  = 0
-    to_port    = 0
-    cidr_block = var.blocked_ip
+resource "aws_nat_gateway" "this" {
+  for_each = var.use_nat_instance ? {} : {
+    for idx, az in local.azs : az => "public-${idx + 1}"
   }
 
-  # Regla 100: Permitir HTTP
-  ingress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 80
-    to_port    = 80
-    cidr_block = "0.0.0.0/0"
-  }
+  allocation_id = aws_eip.nat[each.key].id
+  subnet_id     = aws_subnet.this[each.value].id
 
-  # Regla 110: Permitir HTTPS
-  ingress {
-    rule_no    = 110
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 443
-    to_port    = 443
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # Regla 120: Puertos efimeros (trafico de retorno)
-  ingress {
-    rule_no    = 120
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 1024
-    to_port    = 65535
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # Regla de salida: las NACLs son stateless, así que el tráfico saliente
-  # (incluida la respuesta a las conexiones entrantes permitidas arriba)
-  # también necesita una regla allow explícita.
-  egress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "-1"
-    from_port  = 0
-    to_port    = 0
-    cidr_block = "0.0.0.0/0"
-  }
+  depends_on = [aws_internet_gateway.main]
 }
 ```
 
-**¿Por qué la regla 50 antes que la 100?**
+Puntos clave:
+- Se despliega **un NAT Gateway por AZ**, cada uno en la subred pública correspondiente
+- `for_each` itera sobre las AZs: la clave es el nombre de la AZ, el valor es la subred pública
+- Cada NAT Gateway tiene su propia **Elastic IP** (3 EIPs en total)
+- `depends_on` asegura que el IGW exista antes de crear los NAT Gateways
 
-Las NACLs evalúan reglas en **orden numérico ascendente** y aplican la primera que coincida. La IP maliciosa (`var.blocked_ip`) se bloquea en la regla 50. Aunque la regla 100 permite HTTP desde `0.0.0.0/0`, la IP maliciosa nunca llega a evaluarse contra esa regla porque ya fue denegada.
+**¿Por qué 1 por AZ en vez de 1 compartido?**
 
-**¿Por qué puertos efímeros?**
+| Aspecto | 1 NAT GW compartido | 1 NAT GW por AZ (este lab) |
+|---|---|---|
+| Coste base | ~$32/mes | ~$96/mes |
+| Tráfico cross-AZ | Sí ($0.01/GB extra) | No |
+| Resiliencia | Si cae la AZ, **todas** las privadas pierden salida | Solo la AZ afectada pierde salida |
+| Buena práctica AWS | No | **Sí** |
 
-Los Security Groups son **stateful**: si permites tráfico de entrada, el de retorno se permite automáticamente. Las NACLs son **stateless**: cada dirección necesita su propia regla. Sin la regla de puertos efímeros (1024-65535), las respuestas HTTP de las instancias no podrían salir de la subred.
+A escala, el coste de tráfico cross-AZ puede superar la diferencia de $64/mes. La resiliencia adicional suele justificar el coste en producción.
 
-### VPC Flow Logs — Solo tráfico REJECT
+### Tablas de rutas privadas — Una por AZ
 
 ```hcl
-resource "aws_flow_log" "reject" {
-  vpc_id               = aws_vpc.main.id
-  traffic_type         = "REJECT"
-  log_destination_type = "cloud-watch-logs"
-  log_destination      = aws_cloudwatch_log_group.flow_logs.arn
-  iam_role_arn         = aws_iam_role.flow_logs.arn
+resource "aws_route_table" "private" {
+  for_each = toset(local.azs)
+  vpc_id   = aws_vpc.main.id
+}
+
+resource "aws_route_table_association" "private" {
+  for_each       = local.private_subnets
+  subnet_id      = aws_subnet.this[each.key].id
+  route_table_id = aws_route_table.private[local.azs[each.value.az_index]].id
 }
 ```
 
-Capturar solo `REJECT` tiene dos ventajas:
-1. **Volumen reducido:** En una VPC activa, el tráfico ACCEPT puede generar GB de logs. REJECT es mucho más reducido y contiene la información de seguridad más valiosa.
-2. **Diagnóstico de bloqueos:** Si un servicio no puede conectarse, los logs REJECT muestran exactamente qué regla (SG o NACL) está bloqueando el tráfico.
+Cada subred privada se asocia a la tabla de rutas de **su propia AZ**, que apunta al NAT local. Esto garantiza que el tráfico nunca cruza AZs para salir a Internet.
 
-Los logs se almacenan en un CloudWatch Log Group con retención configurable (por defecto 7 días para el lab).
+### Instancia NAT × 3 — La alternativa económica para desarrollo
+
+```hcl
+resource "aws_instance" "nat" {
+  for_each = var.use_nat_instance ? {
+    for idx, az in local.azs : az => "public-${idx + 1}"
+  } : {}
+
+  ami                    = data.aws_ami.nat.id   # AL2023 ARM minimal
+  instance_type          = "t4g.small"            # Graviton (ARM)
+  subnet_id              = aws_subnet.this[each.value].id
+  vpc_security_group_ids = [aws_security_group.nat[0].id]
+
+  source_dest_check = false  # ← CLAVE para NAT
+
+  user_data = templatefile("${path.module}/scripts/nat_init.sh", {
+    vpc_cidr = var.vpc_cidr
+  })
+}
+```
+
+> En el código real, el `user_data` se mantiene en
+> [`scripts/nat_init.sh`](aws/scripts/nat_init.sh) (cargado con
+> `templatefile()`). Lo importante son las tres operaciones que ese script
+> realiza al arrancar la instancia:
+>
+> ```bash
+> # 1. Habilitar IP forwarding
+> echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-nat.conf
+> sysctl -p /etc/sysctl.d/90-nat.conf
+>
+> # 2. Instalar iptables-nft (AL2023 minimal usa nftables como backend)
+> dnf install -y iptables-nft
+>
+> # 3. Reescribir IP origen de los paquetes reenviados (MASQUERADE)
+> iptables -t nat -A POSTROUTING -o ens5 -s ${var.vpc_cidr} -j MASQUERADE
+> iptables -A FORWARD -i ens5 -o ens5 -m state --state RELATED,ESTABLISHED -j ACCEPT
+> iptables -A FORWARD -i ens5 -o ens5 -j ACCEPT
+> ```
+
+Mismo patrón `for_each` que los NAT Gateways: una instancia por AZ en su subred pública correspondiente.
+
+**¿Por qué `t4g.small` ARM en vez de `t3.nano` x86?**
+
+Las instancias Graviton (t4g) ofrecen hasta un 20% mejor relación precio/rendimiento que las equivalentes x86. Para una instancia NAT, el cuello de botella es el ancho de banda de red, no la CPU, y `t4g.small` proporciona suficiente capacidad de red para un entorno de desarrollo.
+
+**¿Por qué `user_data` con iptables?**
+
+Las antiguas AMIs `amzn-ami-vpc-nat` venían preconfiguradas con NAT, pero están basadas en Amazon Linux 1 (EOL). Usamos Amazon Linux 2023 (ARM) y configuramos NAT manualmente:
+
+1. **`ip_forward = 1`**: Habilita el reenvío de paquetes en el kernel (por defecto Linux descarta paquetes que no son para él)
+2. **`iptables -t nat ... MASQUERADE`**: Reescribe la IP origen de los paquetes reenviados con la IP pública de la instancia, permitiendo que las respuestas vuelvan correctamente
+3. **`FORWARD ... RELATED,ESTABLISHED`**: Permite el tráfico de retorno de conexiones ya establecidas
+
+**¿Por qué `source_dest_check = false`?**
+
+Por defecto, EC2 descarta cualquier paquete de red cuyo origen o destino no sea la IP de la propia instancia. Esto es una protección contra suplantación de IP. Pero una instancia NAT **reenvía** tráfico de otros orígenes (las subredes privadas), por lo que esta verificación debe deshabilitarse.
+
+Sin `source_dest_check = false`, el tráfico de las subredes privadas llega a la instancia NAT pero es descartado silenciosamente — uno de los errores más difíciles de diagnosticar en redes AWS.
+
+### VPC Gateway Endpoint para S3 — Eliminar el "NAT Tax"
+
+```hcl
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+
+  route_table_ids = concat(
+    [aws_route_table.public.id],
+    [for rt in aws_route_table.private : rt.id],   # private es un mapa (for_each por AZ)
+  )
+}
+```
+
+El Gateway Endpoint añade automáticamente una ruta en las tablas especificadas con el **prefix list** de S3 (las IPs del servicio S3 en la región). El tráfico hacia S3 viaja por la red interna de AWS en lugar de salir por el NAT Gateway.
+
+**Impacto en costes:** Si una aplicación transfiere 100 GB/mes a S3:
+- Sin endpoint: 100 GB × $0.045 = **$4.50/mes** en cargos NAT
+- Con endpoint: **$0** — el tráfico no pasa por el NAT
+
+A escala (TB de datos, backups, logs), este ahorro puede ser de cientos de dólares mensuales.
+
+### Rutas privadas mutuamente excluyentes — Una por AZ
+
+```hcl
+resource "aws_route" "private_nat_gateway" {
+  for_each = var.use_nat_instance ? {} : toset(local.azs)
+
+  route_table_id         = aws_route_table.private[each.key].id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.this[each.key].id
+}
+
+resource "aws_route" "private_nat_instance" {
+  for_each = var.use_nat_instance ? toset(local.azs) : toset([])
+
+  route_table_id         = aws_route_table.private[each.key].id
+  destination_cidr_block = "0.0.0.0/0"
+  network_interface_id   = aws_instance.nat[each.key].primary_network_interface_id
+}
+```
+
+Solo uno de los dos conjuntos existe en cada despliegue. En ambos casos se crean 3 rutas `0.0.0.0/0` (una por tabla de rutas privada), cada una apuntando al NAT Gateway o la instancia NAT de **su misma AZ**.
 
 ---
 
-## Despliegue
+## Despliegue — Modo producción (NAT Gateway)
 
 ```bash
 cd labs/lab-18/aws
@@ -251,240 +265,189 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará ~39 recursos: VPC, 4 subredes (2 públicas + 2 privadas), IGW + tabla de rutas pública + asociaciones, EIP + NAT Gateway + tabla de rutas privada + asociaciones, 2 Security Groups (ALB y app) + 5 reglas separadas (2 ingress ALB + 1 egress ALB + 1 ingress app + 1 egress app), 2 NACLs (pública y privada), ALB + Target Group + listener HTTP + 2 attachments, IAM role + policy attachment + instance profile para SSM, 2 instancias EC2, CloudWatch Log Group + IAM role/policy + recurso `aws_flow_log`.
+Terraform creará ~35 recursos: VPC, 6 subredes, IGW, 3 EIPs, 3 NAT Gateways, 1 tabla de rutas pública + 3 privadas (una por AZ), rutas y asociaciones, VPC Endpoint S3, IAM role + policy attachments + instance profile (SSM), security group e instancia de test.
 
 ```bash
 terraform output
-# alb_dns_name     = "lab18-alb-xxxxxxxxx.us-east-1.elb.amazonaws.com"
-# alb_sg_id        = "sg-0abc..."
-# app_sg_id        = "sg-0def..."
-# flow_log_group   = "/vpc/lab18/flow-logs"
+# nat_mode       = "nat_gateway"
+# nat_public_ips = { "us-east-1a" = "3.xx.xx.xx", "us-east-1b" = "18.xx.xx.xx", "us-east-1c" = "54.xx.xx.xx" }
+# s3_endpoint_id = "vpce-0abc..."
 ```
 
 ---
 
 ## Verificación final
 
-### Verificar el patrón ALB -> EC2 (referencia por SG)
+### Tabla de rutas pública
 
 ```bash
-# Ver el SG de las instancias de aplicacion
-APP_SG=$(terraform output -raw app_sg_id)
+aws ec2 describe-route-tables \
+  --filters Name=tag:Name,Values=lab18-public-rt \
+  --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, GatewayId: GatewayId}' \
+  --output table
+```
 
-aws ec2 describe-security-groups \
-  --group-ids $APP_SG \
-  --query 'SecurityGroups[].IpPermissions[].{Port: FromPort, SourceSG: UserIdGroupPairs[].GroupId}' \
+Deberías ver tres rutas:
+- `10.13.0.0/16 → local` (ruta interna de la VPC, automática)
+- `0.0.0.0/0 → igw-xxx` (ruta al IGW)
+- `Dest=None, Prefix=pl-xxx → vpce-xxx` (ruta al VPC Endpoint S3 — usa `DestinationPrefixListId` en lugar de CIDR, por eso `Dest` aparece vacío)
+
+### Tablas de rutas privadas (una por AZ)
+
+```bash
+aws ec2 describe-route-tables \
+  --filters "Name=tag:Name,Values=lab18-private-rt-*" \
+  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, NatGW: NatGatewayId, GatewayId: GatewayId}}' \
+  --output table
+```
+
+Cada tabla debe tener:
+- `10.13.0.0/16 → local`
+- `0.0.0.0/0 → nat-xxx` (ruta al NAT Gateway **de su propia AZ**)
+- `pl-xxx → vpce-xxx` (prefix list de S3 → VPC Endpoint)
+
+Verifica que cada tabla privada apunta a un NAT Gateway **diferente** (uno por AZ).
+
+### VPC Endpoint
+
+```bash
+aws ec2 describe-vpc-endpoints \
+  --filters Name=tag:Project,Values=lab18 \
+  --query 'VpcEndpoints[].{ID: VpcEndpointId, Service: ServiceName, State: State}' \
+  --output table
+```
+
+### Verificar el prefix list de S3
+
+```bash
+REGION=$(aws configure get region || echo us-east-1)
+
+PLID=$(aws ec2 describe-prefix-lists \
+  --filters "Name=prefix-list-name,Values=com.amazonaws.${REGION}.s3" \
+  --query 'PrefixLists[0].PrefixListId' --output text)
+
+aws ec2 describe-prefix-lists \
+  --prefix-list-ids $PLID \
+  --query 'PrefixLists[].Cidrs[]' \
+  --output table
+```
+
+Estos son los rangos de IPs públicas de S3 que el Gateway Endpoint intercepta antes de que lleguen al NAT.
+
+---
+
+## Despliegue — Modo desarrollo (Instancia NAT)
+
+Modifica el despliegue anterior y vuelve a aplicar con la variable activada — Terraform destruirá los NAT Gateways y creará las instancias NAT en su lugar:
+
+```bash
+terraform apply -var="use_nat_instance=true"
+```
+
+Compara los outputs:
+
+```bash
+terraform output
+# nat_mode       = "nat_instance"
+# nat_public_ips = { "us-east-1a" = "54.xx.xx.xx", "us-east-1b" = "3.xx.xx.xx", "us-east-1c" = "18.xx.xx.xx" }
+```
+
+### Verificar source_dest_check en las 3 instancias
+
+```bash
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=nat-instance-lab18-*" Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].{ID: InstanceId, AZ: Placement.AvailabilityZone, SourceDestCheck: SourceDestCheck}' \
+  --output table
+```
+
+Las 3 instancias deben mostrar `SourceDestCheck = false`.
+
+### Verificar las tablas de rutas privadas
+
+```bash
+aws ec2 describe-route-tables \
+  --filters "Name=tag:Name,Values=lab18-private-rt-*" \
+  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, NetworkInterface: NetworkInterfaceId, GatewayId: GatewayId}}' \
   --output json
 ```
 
-Deberías ver que el único origen permitido es el SG del ALB (no un CIDR).
-
-### Probar el ALB
-
-```bash
-ALB_DNS=$(terraform output -raw alb_dns_name)
-
-# Esperar ~2 minutos a que el ALB este activo y los targets sanos
-curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS
-# 200
-```
-
-### Verificar la NACL
-
-```bash
-aws ec2 describe-network-acls \
-  --filters Name=tag:Project,Values=lab18 \
-  --query 'NetworkAcls[].Entries[?RuleAction==`deny`].{RuleNum: RuleNumber, CIDR: CidrBlock, Action: RuleAction}' \
-  --output table
-```
-
-Deberías ver la regla 50 con `deny` para la IP bloqueada.
-
-### Consultar VPC Flow Logs (tráfico REJECT)
-
-```bash
-LOG_GROUP=$(terraform output -raw flow_log_group)
-
-# Esperar 5-10 minutos para que los primeros logs aparezcan
-aws logs filter-log-events \
-  --log-group-name "$LOG_GROUP" \
-  --filter-pattern "REJECT" \
-  --max-items 10 \
-  --query 'events[].message' \
-  --output text
-```
-
-Cada línea muestra: interfaz, IP origen, IP destino, puerto origen, puerto destino, protocolo, paquetes, bytes, acción (REJECT).
+Ahora cada ruta `0.0.0.0/0` apunta a `eni-xxx` (la interfaz de red de la instancia NAT de esa AZ) en lugar de `nat-xxx`.
 
 ---
 
-## Retos
+## Verificación end-to-end con instancia de test
 
-### Reto 1 — WAF básico con NACL dinámica
-
-**Situación**: El equipo de seguridad te proporciona una lista de IPs maliciosas que cambia semanalmente. Necesitas una NACL que bloquee todas esas IPs de forma mantenible, sin copiar y pegar reglas.
-
-**Tu objetivo**:
-
-1. Cambiar la variable `blocked_ip` por una variable `blocked_ips` de tipo `list(string)` con al menos 3 IPs de ejemplo (usa rangos de documentación RFC 5737: `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`)
-2. Usar un bloque `dynamic "ingress"` en la NACL para generar una regla `deny` por cada IP de la lista, asignando números de regla consecutivos (50, 51, 52...)
-3. Las reglas de `allow` (HTTP, HTTPS, efímeros) deben mantener números de regla superiores (100+) para que los `deny` siempre tengan prioridad
-4. Verificar con `terraform plan` que se generan exactamente N reglas de deny (una por IP bloqueada)
-5. Añadir o quitar una IP de la lista y verificar que `terraform plan` solo muestra los cambios incrementales
-
-**Pistas**:
-- `dynamic "ingress"` puede iterar sobre una lista con índice: `for_each = var.blocked_ips`
-- Usa `50 + index(var.blocked_ips, ingress.value)` para generar números de regla consecutivos
-- La NACL completa se define en un solo recurso `aws_network_acl` con múltiples bloques `ingress`
-
----
-
-## Soluciones
-
-<details>
-<summary><strong>Solución al Reto 1 — WAF básico con NACL dinámica</strong></summary>
-
-### Solución al Reto 1 — WAF básico con NACL dinámica
-
-#### Paso 1: Cambiar la variable
-
-En `variables.tf`, reemplaza `blocked_ip` por `blocked_ips`:
-
-```hcl
-variable "blocked_ips" {
-  type        = list(string)
-  description = "Lista de CIDRs maliciosos a bloquear en la NACL"
-  default     = [
-    "192.0.2.0/24",     # RFC 5737 - TEST-NET-1
-    "198.51.100.0/24",  # RFC 5737 - TEST-NET-2
-    "203.0.113.0/24",   # RFC 5737 - TEST-NET-3
-  ]
-}
-```
-
-#### Paso 2: Usar `dynamic "ingress"` en la NACL pública
-
-Reemplaza la regla 50 estática por un bloque dinámico que genera una regla `deny` por cada IP de la lista:
-
-```hcl
-resource "aws_network_acl" "public" {
-  vpc_id     = aws_vpc.main.id
-  subnet_ids = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
-
-  # --- Reglas DENY dinamicas (una por IP bloqueada) ---
-  # Los numeros de regla empiezan en 50 y son consecutivos (50, 51, 52...)
-  # para que siempre tengan prioridad sobre las reglas ALLOW (100+).
-  dynamic "ingress" {
-    for_each = var.blocked_ips
-    content {
-      rule_no    = 50 + index(var.blocked_ips, ingress.value)
-      action     = "deny"
-      protocol   = "-1"
-      from_port  = 0
-      to_port    = 0
-      cidr_block = ingress.value
-    }
-  }
-
-  # Regla 100: Permitir HTTP
-  ingress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 80
-    to_port    = 80
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # Regla 110: Permitir HTTPS
-  ingress {
-    rule_no    = 110
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 443
-    to_port    = 443
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # Regla 120: Puertos efimeros
-  ingress {
-    rule_no    = 120
-    action     = "allow"
-    protocol   = "tcp"
-    from_port  = 1024
-    to_port    = 65535
-    cidr_block = "0.0.0.0/0"
-  }
-
-  # Salida: Permitir todo
-  egress {
-    rule_no    = 100
-    action     = "allow"
-    protocol   = "-1"
-    from_port  = 0
-    to_port    = 0
-    cidr_block = "0.0.0.0/0"
-  }
-
-  tags = merge(local.common_tags, {
-    Name = "nacl-public-${var.project_name}"
-  })
-}
-```
-
-#### Paso 3: Aplicar y verificar
+La instancia de test se despliega automáticamente en la subred `private-1` con cada `terraform apply`. Es una `t4g.micro` con SSM Agent, que permite verificar la conectividad NAT sin SSH.
 
 ```bash
-terraform plan
-# Resultado esperado: la NACL pública aparece como
-#   ~ update in-place
-# en aws_network_acl.public. La línea de resumen final será similar a
-#   Plan: 0 to add, 1 to change, 0 to destroy.
-# El "1 to change" puede variar (ver nota más abajo).
+terraform output test_instance_id
+# "i-0abc123..."
 ```
 
-> **Nota:** el `1 to change` es un valor *plausible* pero no garantizado. Antes había una sola regla `deny` (la 50) y ahora hay tres (50, 51, 52); Terraform lo modela como una mutación del recurso `aws_network_acl.public`, no como tres reglas independientes (los bloques `ingress` son inline en el recurso). Si la versión del provider o el orden de evaluación cambian la representación, podrías ver `Plan: 1 to add, 0 to change, 1 to destroy.` (recreación) en lugar de un update in-place. Lo importante es revisar el diff línea a línea: deben aparecer las 3 entradas `cidr_block = "192.0.2.0/24"`, `"198.51.100.0/24"` y `"203.0.113.0/24"` con `rule_no = 50, 51, 52` y `action = "deny"`.
+### Conectarse via SSM Session Manager
+
+> **Requisito:** Instalar el [plugin de Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) para la AWS CLI.
 
 ```bash
-terraform apply
+INSTANCE_ID=$(terraform output -raw test_instance_id)
+
+aws ssm start-session --target $INSTANCE_ID
 ```
 
-Verifica que se generaron exactamente 3 reglas `deny`:
+Una vez dentro de la sesión:
 
 ```bash
-aws ec2 describe-network-acls \
-  --filters Name=tag:Project,Values=lab18 \
-  --query 'NetworkAcls[].Entries[?RuleAction==`deny` && !Egress].{RuleNum: RuleNumber, CIDR: CidrBlock}' \
+# Test 1: Verificar salida a Internet (a través del NAT)
+curl -s --max-time 5 https://checkip.amazonaws.com
+# Debe mostrar la IP pública del NAT (EIP del NAT Gateway o IP pública de la instancia NAT)
+
+# Test 2: Verificar acceso a S3 (a través del VPC Endpoint, sin pasar por NAT)
+aws s3 ls --region us-east-1 2>&1 | head -5
+# Debe listar buckets (si el role tiene permisos) o dar error de permisos (NO timeout). Ojo, sólo mostrará los buckets de S3 de la región donde está desplegada la instancia de prueba
+
+# Test 3: Verificar que la IP de salida coincide con el NAT
+echo "IP de salida: $(curl -s https://checkip.amazonaws.com)"
+exit
+```
+
+La IP que devuelve `checkip.amazonaws.com` debe coincidir con una de las IPs del output `nat_public_ips` (la correspondiente a la AZ de `private-1`):
+
+```bash
+terraform output nat_public_ips
+# Debe coincidir con la IP del Test 1
+```
+
+### Si SSM no conecta
+
+Si `start-session` se queda colgado, verifica:
+
+1. **La instancia está running:** `aws ec2 describe-instance-status --instance-ids $INSTANCE_ID`
+2. **El NAT funciona:** SSM necesita salida a Internet para conectarse a los endpoints de Systems Manager. Si el NAT no funciona, SSM tampoco.
+3. **El SSM agent arrancó:** Espera 2-3 minutos tras el despliegue para que el agente se registre.
+
+```bash
+aws ssm describe-instance-information \
+  --filters Key=InstanceIds,Values=$INSTANCE_ID \
+  --query 'InstanceInformationList[].{ID: InstanceId, Ping: PingStatus}' \
   --output table
+# PingStatus debe ser "Online"
 ```
-
-#### Paso 4: Probar cambios incrementales
-
-Añade una IP a la lista y verifica que solo cambia lo necesario:
-
-```bash
-terraform plan -var='blocked_ips=["192.0.2.0/24","198.51.100.0/24","203.0.113.0/24","100.64.0.0/10"]'
-```
-
-Resultado esperado: el `plan` muestra `~ update in-place` sobre `aws_network_acl.public`, con un nuevo bloque `ingress` que añade la entrada `cidr_block = "100.64.0.0/10"` con `rule_no = 53` (= 50 + index 3 en la lista). Ninguna otra regla cambia. Tras `terraform apply`, confirma con `aws ec2 describe-network-acls` que ahora hay 4 entradas `deny` (50, 51, 52, 53):
-
-```bash
-aws ec2 describe-network-acls \
-  --filters Name=tag:Project,Values=lab18 \
-  --query 'NetworkAcls[].Entries[?RuleAction==`deny` && !Egress].{RuleNum: RuleNumber, CIDR: CidrBlock}' \
-  --output table
-```
-
-</details>
 
 ---
 
 ## Limpieza
 
-Cuando hayas terminado el laboratorio (incluido el Reto si lo has completado), destruye toda la infraestructura para evitar costes:
-
 ```bash
 terraform destroy
+```
+
+Si desplegaste con `-var="use_nat_instance=true"`, incluye la misma variable:
+
+```bash
+terraform destroy \
+  -var="region=us-east-1" \
+  -var="use_nat_instance=true"
 ```
 
 > **Nota:** El laboratorio no crea ningún bucket S3 propio. No destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
@@ -493,30 +456,29 @@ terraform destroy
 
 ## LocalStack
 
-Para ejecutar este laboratorio sin cuenta de AWS, consulta el directorio `localstack/`.
+Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-LocalStack emula Security Groups, NACLs y VPC Flow Logs a nivel de API, pero no ejecuta tráfico real. El objetivo es validar la estructura de Terraform y el plan de despliegue.
+La Instancia NAT no está disponible en LocalStack (requiere AMIs reales de EC2). Solo se despliega la variante con NAT Gateway.
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Referencia entre Security Groups en lugar de CIDR**: la regla `source_security_group_id` del SG de EC2 que solo permite tráfico del SG del ALB es más segura y mantenible que abrir un rango CIDR amplio, ya que escala automáticamente con las IPs del ALB.
-- **NACLs como defensa en profundidad**: los Security Groups son stateful (las respuestas se permiten automáticamente), las NACLs son stateless. Usar ambas capas proporciona una segunda línea de defensa ante configuraciones incorrectas de Security Groups.
-- **Bloques `dynamic` para reglas de NACL**: las NACLs requieren números de regla y muchas entradas repetitivas. El bloque `dynamic` genera las reglas desde una lista de objetos, reduciendo la duplicación y facilitando el mantenimiento.
-- **VPC Flow Logs para diagnóstico**: habilitar Flow Logs permite diagnosticar tráfico denegado sin necesitar acceso a las instancias. El patrón `REJECT` en los logs indica un bloqueo de SG o NACL.
-- **Rango de puertos efímeros en NACLs de salida**: las NACLs deben permitir el rango de puertos efímeros (1024-65535) en las reglas de salida de las subnets que reciben conexiones TCP entrantes, o el handshake de tres vías falla.
-- **Reglas de Security Group como recursos independientes (`aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule`)**: el lab declara los SGs vacíos y gestiona cada regla en su propio recurso, el patrón recomendado por HashiCorp desde el provider AWS 5.x sobre el antiguo `aws_security_group_rule` (que sigue funcionando, pero queda como modelo legado). Ventajas: (1) cada regla tiene su propio address en el state y se puede importar / destruir / aplicar `lifecycle` por separado; (2) evita el drift cuando alguien añade reglas fuera de Terraform, ya que el SG en sí no las controla; (3) rompe dependencias circulares cuando dos SGs se referencian entre sí — los SGs se crean primero (vacíos) y las reglas después.
+- **NAT Gateway por AZ en producción**: desplegar un NAT Gateway por AZ elimina la dependencia de una única zona para la conectividad de salida. Si una AZ cae, las instancias de las otras AZs mantienen salida a Internet.
+- **Instancia NAT solo en desarrollo**: la Instancia NAT es más barata que el NAT Gateway (~$12.26/mes en `t4g.small` vs ~$32/mes por NAT Gateway, ahorro ~62%) pero tiene menor throughput, sin alta disponibilidad gestionada y requiere mantenimiento del SO (parches, iptables, monitoreo). Usarla solo en entornos no críticos.
+- **VPC Gateway Endpoint para S3 y DynamoDB**: el Gateway Endpoint no tiene costo y evita que el tráfico hacia S3 o DynamoDB salga por el NAT Gateway (ahorrando costes de procesamiento). Siempre debe activarse en VPCs con subnets privadas.
+- **`for_each` mutuamente excluyente para despliegue condicional**: usar `for_each = var.use_nat_instance ? toset([]) : toset(local.azs)` (y la negación en el otro recurso) permite elegir entre NAT Gateway e Instancia NAT en tiempo de despliegue con una sola variable, sin duplicar código y manteniendo la granularidad por AZ.
+- **IP Elástica para el NAT Gateway**: la IP fija del NAT Gateway permite configurar reglas de firewall en los destinos que solo permiten IPs conocidas, sin depender de IPs efímeras.
+- **Disable source/dest check en la Instancia NAT**: las instancias EC2 normales descartan paquetes que no van dirigidos a su IP. La Instancia NAT necesita este check deshabilitado para poder reenviar paquetes de otras instancias.
+- **`ingress = []` explícito en Security Groups sin entrada**: aunque un SG sin reglas de ingreso ya bloquea por defecto todo el tráfico entrante, declarar `ingress = []` de forma explícita (como en `aws_security_group.test`) deja documentada la intención de "deny all inbound" y evita findings falsos de linters de seguridad (tfsec, Checkov, etc.) que marcan los SGs sin bloque `ingress` declarado. La administración de la instancia se realiza por SSM Session Manager, que sólo requiere tráfico saliente.
 
 ---
 
 ## Recursos
 
-- [AWS: Security Groups](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html)
-- [AWS: Network ACLs](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html)
-- [AWS: VPC Flow Logs](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html)
-- [AWS: Security Group Referencing](https://docs.aws.amazon.com/vpc/latest/userguide/security-group-rules.html)
-- [Terraform: `dynamic` blocks](https://developer.hashicorp.com/terraform/language/expressions/dynamic-blocks)
-- [Terraform: `aws_security_group`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group)
-- [Terraform: `aws_network_acl`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/network_acl)
-- [Terraform: `aws_flow_log`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/flow_log)
+- [AWS: NAT Gateway Pricing](https://aws.amazon.com/vpc/pricing/)
+- [AWS: VPC Gateway Endpoints](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html)
+- [AWS: NAT Instances (Legacy)](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_NAT_Instance.html)
+- [AWS: Comparison of NAT Gateway vs NAT Instance](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-comparison.html)
+- [Terraform: `aws_nat_gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/nat_gateway)
+- [Terraform: `aws_vpc_endpoint`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint)

@@ -1,4 +1,4 @@
-# Laboratorio 24 — Composición de Módulos Públicos con Estándares Corporativos
+# Laboratorio 24 — Diseño de Interfaz Robusta y "Fail-Safe"
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,65 +8,50 @@
 
 ## Visión general
 
-Crear un módulo "wrapper" que orqueste módulos públicos del Terraform Registry (VPC y RDS), inyectando estándares de seguridad obligatorios que los equipos de desarrollo **no pueden desactivar**. Encadenar los outputs del módulo de VPC como inputs del módulo de RDS. Usar bloques `moved {}` para renombrar recursos internos sin destruir infraestructura.
+Crear módulos que validen los datos antes de intentar crear infraestructura en AWS. Aplicar cuatro técnicas de diseño defensivo dentro de módulos reutilizables: validación con regex para nombres de bucket, tipos complejos (`object`) para configuración de base de datos, variables sensibles para contraseñas, y postcondiciones que verifican el estado real del recurso creado.
 
 ## Arquitectura
 
-![Wrapper corporate-rds que compone los módulos públicos VPC y RDS del Registry con compliance hardcoded](arch/diagrama.svg)
+![Root Module orquesta 3 módulos con tres técnicas distintas de validación: validation, object+sensitive, postcondition](arch/diagrama.svg)
 
-El wrapper contiene tres componentes:
-1. **Módulo público VPC**: crea la red completa (VPC, subredes, NAT Gateway, route tables)
-2. **Security group**: restringe el acceso a RDS solo desde las subredes privadas
-3. **Módulo público RDS**: crea la base de datos con parámetros de seguridad hardcoded
+Cada módulo encapsula una técnica de validación diferente. El Root Module los orquesta pasando variables y etiquetas comunes:
+
+- **`safe-network`** — `lifecycle.postcondition` con regex RFC 1918 sobre `self.cidr_block` (validación **después** del create, sobre el atributo real que devolvió AWS).
+- **`validated-bucket`** — `validation` en la variable `bucket_name` con `can(regex(...))` que exige el prefijo `empresa-` (validación **antes** del plan, sin tocar la API de AWS).
+- **`db-config`** — `variable "db_config"` de tipo `object({})` con `optional(...)` para campos con default + `db_password` marcada como `sensitive` (oculta en logs / plan / apply pero sí en state).
 
 ## Conceptos clave
 
 | Concepto | Descripción |
 |---|---|
-| **Módulo wrapper** | Módulo que encapsula otros módulos (públicos o privados) añadiendo políticas corporativas. El equipo de plataforma lo mantiene; los equipos de producto lo consumen |
-| **Terraform Registry** | Repositorio público de módulos reutilizables. Los módulos oficiales de AWS (`terraform-aws-modules/*`) son los más usados y están mantenidos por la comunidad |
-| **Composición de módulos** | Patrón de invocar múltiples módulos dentro de otro módulo, conectando sus outputs e inputs para crear una arquitectura completa |
-| **Encadenamiento de outputs** | Pasar la salida de un módulo como entrada de otro: `module.vpc.private_subnets` → `module.rds.subnet_ids` |
-| **Parámetros hardcoded** | Valores fijados dentro del wrapper que el usuario no puede sobreescribir. Garantizan cumplimiento de políticas sin depender de la disciplina del equipo |
-| **`moved {}`** | Bloque que indica a Terraform que un recurso fue renombrado, no eliminado. Evita destruir y recrear infraestructura al refactorizar código |
-| **`manage_master_user_password`** | Característica de RDS que genera y rota automáticamente la contraseña maestra en Secrets Manager, eliminando la necesidad de gestionarla manualmente |
+| **`validation`** | Bloque dentro de una variable que define reglas de validación. Si la condición es `false`, Terraform rechaza el valor **antes** de crear ningún recurso, ahorrando tiempo y evitando estados inconsistentes |
+| **`can()` + `regex()`** | `can()` envuelve una expresión que podría fallar y devuelve `true`/`false`. Combinada con `regex()`, permite validar patrones como prefijos, formatos de nombre, o estructuras de CIDR |
+| **`object({})`** | Tipo compuesto que define una estructura con campos tipados. Permite agrupar configuraciones relacionadas en una sola variable en vez de tener decenas de variables sueltas |
+| **`optional(type, default)`** | Marca un campo de un `object` como opcional con un valor por defecto. Disponible desde Terraform 1.3. Reduce la carga del usuario al invocar el módulo |
+| **`sensitive = true`** | Marca una variable para que su valor no aparezca en la salida de `terraform plan` ni `terraform apply`. El valor **sí** se almacena en el archivo de estado — por eso el estado debe estar cifrado |
+| **`postcondition`** | Bloque dentro de `lifecycle` que valida el estado **después** de crear o actualizar un recurso. Usa `self` para referenciar los atributos reales del recurso. Ideal para validaciones que dependen de datos calculados por AWS |
+| **`precondition`** | Similar a `postcondition`, pero se evalúa **antes** de crear el recurso. Útil para validar relaciones entre variables o datos externos |
 
-## Comparativa: Módulo directo vs. Wrapper corporativo
+## Comparativa: Donde validar
 
-| Aspecto | Módulo público directo | Wrapper corporativo |
-|---|---|---|
-| Cifrado | El equipo decide (puede olvidarlo) | `storage_encrypted = true` siempre |
-| Acceso público | El equipo decide | `publicly_accessible = false` siempre |
-| Protección borrado | El equipo decide | `deletion_protection = true` siempre |
-| Networking | El equipo configura VPC, subredes, SG | Todo incluido y conectado |
-| Complejidad para el usuario | Alta (muchos parámetros) | Baja (solo motor, clase, nombre) |
-| Flexibilidad | Total | Limitada por diseño |
-| Auditoría | Revisar cada equipo | Revisar un solo módulo |
+| Mecanismo | Cuándo se evalúa | Tiene acceso a | Caso de uso |
+|---|---|---|---|
+| `validation` en variable | Al asignar el valor | Solo la propia variable | Formato, rango, patrón de un solo campo |
+| `precondition` en recurso | Antes del plan/apply | Variables, data sources, otros recursos | Relaciones entre múltiples valores |
+| `postcondition` en recurso | Después del apply | `self` (atributos reales del recurso) | Verificar lo que AWS realmente asignó |
+| `check` block (Terraform 1.5+) | Después del apply | Todo | Validaciones no bloqueantes (warnings) |
 
 ## Requisitos previos
 
 - Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
 - AWS CLI configurado con credenciales válidas
-- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3; los bloques `moved {}` requieren ≥ 1.1, así que ya está cubierto)
+- Terraform >= 1.10 (necesario para `use_lockfile` en el backend S3)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
 echo "Bucket: $BUCKET"
 ```
-
-> **⚠️ Aviso de coste — desglose mensual aproximado en `us-east-1`:**
->
-> | Componente | Tarifa | Coste/mes |
-> |---|---|---:|
-> | RDS `db.t4g.micro` (Single-AZ) | ~$0,016/h × 720 h | ~$11,50 |
-> | RDS storage 20 GB gp3 | ~$0,115/GB-mes | ~$2,30 |
-> | RDS backups (retention 7d, ≤storage gratis) | $0 hasta 100% storage | ~$0 |
-> | NAT Gateway (single, no por AZ) | ~$0,045/h × 720 h | ~$32 |
-> | Elastic IP del NAT | ~$0,005/h × 720 h | ~$3,60 |
-> | Secrets Manager (gestionado por RDS) | ~$0,40/secreto-mes | ~$0,40 |
->
-> **Total base ≈ 50 USD/mes** sin contar tráfico procesado por NAT (~$0,045/GB) ni transferencia de datos. Si dejas el lab corriendo, la factura sube rápido. **Ejecuta `terraform destroy` (sección 8) en cuanto termines la práctica** — recuerda que primero hay que desactivar `deletion_protection`.
 
 ## Estructura del proyecto
 
@@ -78,165 +63,293 @@ lab-24/
 ├── aws/
 │   ├── providers.tf                         <- Backend S3 parcial
 │   ├── variables.tf                         <- Variables del Root Module
-│   ├── main.tf                              <- Invocación del wrapper
-│   ├── outputs.tf                           <- Outputs delegados al wrapper
-│   ├── aws.s3.tfbackend                     <- Parámetros del backend
+│   ├── main.tf                              <- Root Module: invoca 3 módulos
+│   ├── outputs.tf                           <- Outputs delegados a los módulos
+│   ├── aws.s3.tfbackend                     <- Parámetros del backend (sin bucket)
 │   └── modules/
-│       └── corporate-rds/                   <- El wrapper corporativo
-│           ├── main.tf                      <- VPC + SG + RDS (módulos públicos)
-│           ├── variables.tf                 <- Interfaz simplificada
-│           └── outputs.tf                   <- VPC, RDS, compliance
+│       ├── validated-bucket/                <- Módulo S3 con regex en el nombre
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       ├── db-config/                       <- Módulo DB con object, sensitive y SSM
+│       │   ├── main.tf
+│       │   ├── variables.tf
+│       │   └── outputs.tf
+│       └── safe-network/                    <- Módulo VPC con postcondition RFC 1918
+│           ├── main.tf
+│           ├── variables.tf
+│           └── outputs.tf
 └── localstack/
-    └── README.md                            <- Explicación (RDS no disponible)
+    ├── README.md                            <- Guía específica para LocalStack
+    ├── providers.tf
+    ├── variables.tf
+    ├── main.tf                              <- Root Module adaptado
+    ├── outputs.tf
+    ├── localstack.s3.tfbackend
+    └── modules/                             <- Mismos módulos adaptados
+        ├── validated-bucket/
+        ├── db-config/
+        └── safe-network/
 ```
 
 ## Análisis del código
 
-### Composición de módulos — VPC del Registry
+### Módulo `validated-bucket` — Regex en la interfaz del módulo
 
 ```hcl
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
+# modules/validated-bucket/variables.tf
 
-  name = "${var.project_name}-vpc"
-  cidr = var.vpc_cidr
+variable "bucket_name" {
+  type        = string
+  description = "Nombre del bucket S3. Debe comenzar con el prefijo corporativo 'empresa-'"
 
-  azs              = local.azs
-  private_subnets  = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, 10 + i)]
-  database_subnets = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, 20 + i)]
-  public_subnets   = [for i in range(length(local.azs)) : cidrsubnet(var.vpc_cidr, 8, i)]
-
-  enable_nat_gateway                 = true
-  single_nat_gateway                 = true
-  create_database_subnet_group       = true
-  create_database_subnet_route_table = true
-
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-
-  tags = local.effective_tags
+  validation {
+    condition     = can(regex("^empresa-[a-z0-9][a-z0-9.-]{1,53}[a-z0-9]$", var.bucket_name))
+    error_message = "El nombre del bucket debe comenzar con 'empresa-', contener solo minúsculas, números, puntos y guiones, y tener entre 11 y 63 caracteres en total."
+  }
 }
 ```
 
-Puntos clave:
-- `source = "terraform-aws-modules/vpc/aws"` descarga el módulo del Registry público
-- `version = "~> 5.0"` permite versiones 5.x pero no 6.0 (semver pessimistic constraint)
-- Tres tipos de subredes: **public** (con IGW), **private** (con NAT), **database** (sin salida a Internet)
-- `create_database_subnet_group = true` crea automáticamente el subnet group que RDS necesita
-- Los CIDRs se calculan con `cidrsubnet()`: públicas en `x.x.0.0/24`, `x.x.1.0/24`; privadas en `x.x.10.0/24`, `x.x.11.0/24`; database en `x.x.20.0/24`, `x.x.21.0/24`
+Desglose de la regex `^empresa-[a-z0-9][a-z0-9.-]{1,53}[a-z0-9]$`:
 
-### Encadenamiento de outputs — VPC → RDS
+| Parte | Caracteres | Significado |
+|---|---:|---|
+| `^empresa-` | 8 | Debe empezar con el prefijo corporativo `empresa-` |
+| `[a-z0-9]` | 1 | Primer carácter del sufijo: letra minúscula o número (no punto ni guión al inicio) |
+| `[a-z0-9.-]{1,53}` | 1–53 | Cuerpo: letras, números, puntos o guiones |
+| `[a-z0-9]$` | 1 | Último carácter: letra minúscula o número (no punto ni guión al final) |
+| **Total** | **11–63** | Ajustado al límite de naming de S3 (3–63 chars). |
+
+La función `can()` envuelve `regex()` para que devuelva `true`/`false` en vez de lanzar un error si la regex no coincide. Sin `can()`, una regex que no coincide haría fallar Terraform con un error críptico en lugar del `error_message` personalizado.
+
+**¿Qué pasa si el nombre es inválido?**
+
+```bash
+terraform apply -var='bucket_name=MiBucket' -var='db_password=MiPassword123Seguro'
+# Error: Invalid value for variable
+#   El nombre del bucket debe comenzar con 'empresa-', contener solo
+#   minúsculas, números, puntos y guiones, y tener entre 11 y 63 caracteres
+#   en total.
+```
+
+Terraform rechaza el valor **antes** de contactar con AWS. No se crea ningún recurso, no se gasta dinero, no hay estado inconsistente.
+
+La validación está **dentro del módulo**, no en el Root Module. Esto significa que cualquier equipo que reutilice `validated-bucket` obtendrá la validación gratis, sin necesidad de recordar añadirla.
+
+### Módulo `db-config` — Tipos complejos y secretos
+
+#### Variable `object` con campos opcionales
 
 ```hcl
-module "rds" {
-  source  = "terraform-aws-modules/rds/aws"
-  version = "~> 6.0"
+# modules/db-config/variables.tf
 
-  # ...
-
-  # ─── OUTPUTS ENCADENADOS DEL MÓDULO VPC ───
-  db_subnet_group_name   = module.vpc.database_subnet_group_name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  subnet_ids             = module.vpc.database_subnets
+variable "db_config" {
+  type = object({
+    engine            = string
+    engine_version    = string
+    instance_class    = string
+    allocated_storage = number
+    port              = optional(number, 3306)
+    multi_az          = optional(bool, false)
+    backup_retention_days = optional(number, 7)
+  })
+  ...
 }
 ```
 
-El flujo de datos:
+| Campo | Tipo | ¿Obligatorio? | Default |
+|---|---|---|---|
+| `engine` | `string` | Sí | — |
+| `engine_version` | `string` | Sí | — |
+| `instance_class` | `string` | Sí | — |
+| `allocated_storage` | `number` | Sí | — |
+| `port` | `number` | No | `3306` |
+| `multi_az` | `bool` | No | `false` |
+| `backup_retention_days` | `number` | No | `7` |
 
-```
-module.vpc.database_subnet_group_name ──► module.rds.db_subnet_group_name
-module.vpc.database_subnets           ──► module.rds.subnet_ids
-module.vpc.private_subnets_cidr_blocks ──► aws_security_group.rds.ingress.cidr_blocks
-                                           ──► module.rds.vpc_security_group_ids
-```
-
-Terraform resuelve estas dependencias automáticamente: primero crea la VPC, luego el security group, y finalmente la instancia RDS. No se necesita `depends_on` explícito porque las referencias implican el orden.
-
-### Estandarización — Parámetros hardcoded
+`optional(number, 3306)` significa: "si el usuario no proporciona este campo, usa `3306`". El Root Module solo necesita especificar lo esencial:
 
 ```hcl
-module "rds" {
-  # ...
-
-  # ─── PARÁMETROS HARDCODED DE CUMPLIMIENTO ───
-  storage_encrypted   = true  # Cifrado en reposo obligatorio
-  deletion_protection = true  # Protección contra borrado accidental
-  publicly_accessible = false # Sin acceso público NUNCA
-
-  # ─── OPERACIONALES, también hardcoded por política ───
-  backup_retention_period = 7    # Snapshots diarios automáticos durante 7 días
-  skip_final_snapshot     = true # ⚠ ver nota más abajo
+# Mínimo requerido (los opcionales usan sus defaults)
+db_config = {
+  engine            = "mysql"
+  engine_version    = "8.0"
+  instance_class    = "db.t4g.micro"
+  allocated_storage = 20
 }
 ```
 
-> **Sobre `skip_final_snapshot = true`:** este flag dice a RDS **no crear** un snapshot final cuando se destruye la BD. Es práctico para un laboratorio (la BD es desechable), pero **en producción debería ser `false`** o, mejor, exponerse como variable con default `false` — perder datos al destruir sin querer es irrecuperable. Lo dejamos en `true` aquí solo para que `terraform destroy` funcione sin el paso adicional de proporcionar `final_snapshot_identifier`.
-
-Estos parámetros están **dentro del wrapper**, no expuestos como variables. El equipo de producto que consume el módulo no puede hacer:
+**Validaciones múltiples en la misma variable:**
 
 ```hcl
-# ❌ IMPOSIBLE — no existe variable para sobreescribir
-module "corporate_rds" {
-  source            = "./modules/corporate-rds"
-  storage_encrypted = false   # No existe esta variable
+validation {
+  condition     = contains(["mysql", "postgres", "mariadb"], var.db_config.engine)
+  error_message = "El motor de base de datos debe ser uno de: mysql, postgres, mariadb."
+}
+
+validation {
+  condition     = var.db_config.allocated_storage >= 20 && var.db_config.allocated_storage <= 1000
+  error_message = "El almacenamiento debe estar entre 20 y 1000 GB."
 }
 ```
 
-Si alguien intenta pasar `storage_encrypted`, Terraform dará error:
+Terraform evalúa todos los bloques `validation` y reporta **todos** los errores a la vez, no solo el primero.
 
-```
-Error: Unsupported argument
-  An argument named "storage_encrypted" is not expected here.
-```
-
-Este es el poder del patrón wrapper: **cumplimiento por diseño**, no por convención.
-
-### Contraseña gestionada por RDS
+#### Variable sensible — `db_password`
 
 ```hcl
-manage_master_user_password = true
-```
+variable "db_password" {
+  type        = string
+  sensitive   = true
 
-En vez de pasar una contraseña como variable (que acabaría en el estado en texto plano), RDS genera y rota automáticamente la contraseña en Secrets Manager. El ARN del secreto se expone como output:
+  validation {
+    condition     = length(var.db_password) >= 12
+    error_message = "La contraseña debe tener al menos 12 caracteres."
+  }
 
-```hcl
-output "db_master_user_secret_arn" {
-  value = module.rds.db_instance_master_user_secret_arn
+  validation {
+    condition     = can(regex("[A-Z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra mayúscula (A-Z)."
+  }
+
+  validation {
+    condition     = can(regex("[a-z]", var.db_password))
+    error_message = "La contraseña debe contener al menos una letra minúscula (a-z)."
+  }
+
+  validation {
+    condition     = can(regex("[0-9]", var.db_password))
+    error_message = "La contraseña debe contener al menos un dígito (0-9)."
+  }
 }
 ```
 
-Las aplicaciones pueden recuperar la contraseña desde Secrets Manager usando el SDK de AWS, sin que ningún humano necesite conocerla.
+> **Por qué cuatro `validation` separadas y no una compuesta:** Terraform evalúa **todos** los bloques `validation` y reporta cada error que falla. Si fusionáramos las cuatro reglas en una sola condición (`length(...) >= 12 && can(regex(...))[A-Z] && ...`), un fallo solo daría un mensaje genérico ("la contraseña no cumple los requisitos") y el alumno tendría que adivinar **qué** falta. Con bloques separados, el output dice exactamente "falta una letra mayúscula" o "es demasiado corta" — y si fallan varias reglas a la vez, las muestra todas.
 
-### Root Module — Interfaz simplificada
+**¿Qué hace `sensitive = true`?**
+
+| Aspecto | Sin `sensitive` | Con `sensitive = true` |
+|---|---|---|
+| `terraform plan` | Muestra el valor en texto plano | Muestra `(sensitive value)` |
+| `terraform apply` | Muestra el valor en texto plano | Muestra `(sensitive value)` |
+| `terraform output` | Muestra el valor | Error: requiere `-json` o `-raw` |
+| Archivo de estado | Texto plano | **Texto plano (idéntico — `sensitive` NO cifra)** |
+| Logs de CI/CD | Visible | Oculto |
+
+> **Advertencia crítica:** `sensitive = true` oculta el valor de la **interfaz**, pero **no lo cifra** en el archivo de estado (`terraform.tfstate`). Por eso el backend S3 debe tener `encrypt = true` y el acceso al bucket debe estar restringido con IAM.
+
+El módulo almacena la contraseña en AWS Secrets Manager:
 
 ```hcl
-module "corporate_rds" {
-  source = "./modules/corporate-rds"
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = var.db_password
+}
+```
 
+Y la configuración se desestructura en SSM Parameter Store:
+
+```hcl
+resource "aws_ssm_parameter" "db_engine" {
+  name  = "/${var.project_name}/db/engine"
+  value = var.db_config.engine      # Accede al campo 'engine' del objeto
+}
+
+resource "aws_ssm_parameter" "db_config_json" {
+  name  = "/${var.project_name}/db/config"
+  value = jsonencode(var.db_config)  # Serializa el objeto completo a JSON
+}
+```
+
+### Módulo `safe-network` — Postcondición RFC 1918
+
+```hcl
+# modules/safe-network/main.tf
+
+resource "aws_vpc" "this" {
+  cidr_block = var.vpc_cidr
+  ...
+
+  lifecycle {
+    postcondition {
+      condition = anytrue([
+        can(regex("^10\\.", self.cidr_block)),
+        can(regex("^172\\.(1[6-9]|2[0-9]|3[01])\\.", self.cidr_block)),
+        can(regex("^192\\.168\\.", self.cidr_block)),
+      ])
+      error_message = "El CIDR ${self.cidr_block} no es un rango privado RFC 1918."
+    }
+  }
+}
+```
+
+**¿Por qué postcondition y no validation?**
+
+- `validation` solo accede a la propia variable → podría validar `var.vpc_cidr`
+- `postcondition` accede a `self` → valida el CIDR **real** que AWS asignó al recurso
+
+En este caso, el CIDR proviene directamente de la variable, pero en escenarios reales AWS podría modificar o normalizar valores. La postcondición garantiza que el **resultado real** cumple los requisitos, no solo la intención.
+
+**Rangos RFC 1918 (IPs privadas):**
+
+| Rango | CIDR | Regex |
+|---|---|---|
+| Clase A | `10.0.0.0/8` | `^10\\.` |
+| Clase B | `172.16.0.0/12` | `^172\.(1[6-9]\|2[0-9]\|3[01])\.` |
+| Clase C | `192.168.0.0/16` | `^192\.168\.` |
+
+`anytrue()` devuelve `true` si **cualquiera** de las regex coincide. Si el CIDR es `52.0.0.0/16` (IP pública), ninguna regex coincide y la postcondición falla:
+
+```
+Error: Resource postcondition failed
+  on modules/safe-network/main.tf line XX:
+  El CIDR 52.0.0.0/16 no es un rango privado RFC 1918.
+```
+
+### Root Module — Orquestación de módulos
+
+```hcl
+# main.tf (Root Module)
+
+locals {
+  common_tags = {
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Project     = var.project_name
+  }
+}
+
+module "network" {
+  source       = "./modules/safe-network"
+  vpc_cidr     = var.vpc_cidr
   project_name = var.project_name
   environment  = var.environment
+  tags         = local.common_tags
+}
 
-  vpc_cidr          = "10.20.0.0/16"
-  db_engine         = "mysql"
-  db_engine_version = "8.0"
-  db_instance_class = "db.t4g.micro"
-  db_name           = "appdb"
-  db_username       = "admin"
+module "corporate_bucket" {
+  source        = "./modules/validated-bucket"
+  bucket_name   = var.bucket_name
+  force_destroy = true
+  tags = merge(local.common_tags, {
+    Purpose = "corporate-data"
+  })
+}
 
-  tags = local.common_tags
+module "database" {
+  source       = "./modules/db-config"
+  project_name = var.project_name
+  db_config    = var.db_config
+  db_password  = var.db_password
+  tags         = local.common_tags
 }
 ```
 
-El equipo de producto solo necesita decidir:
-- ¿Qué motor? (`mysql`, `postgres`, `mariadb`)
-- ¿Qué tamaño? (`db.t4g.micro`, `db.r6g.large`, etc.)
-- ¿Cómo se llama la BD?
-
-Todo lo demás (VPC, subredes, security groups, cifrado, protección, subnet groups) está resuelto por el wrapper. Compare esto con usar los módulos públicos directamente, que requieren decenas de parámetros.
+El Root Module es limpio y declarativo: define **qué** quiere (una red segura, un bucket validado, una configuración de DB) y delega el **cómo** a cada módulo. Las validaciones están encapsuladas — el Root Module no necesita saber los detalles de la regex o la postcondición.
 
 ---
 
-## Despliegue
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-24/aws
@@ -246,501 +359,365 @@ terraform init \
   -backend-config="bucket=$BUCKET"
 ```
 
-> **Nota:** `terraform init` descargará los módulos del Registry público (~30 segundos).
+El `apply` requiere dos valores sin default: `bucket_name` y `db_password`:
 
 ```bash
-terraform apply
+terraform apply \
+  -var="bucket_name=empresa-lab24-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro'
 ```
 
-Terraform creará ~30 recursos: VPC completa (subredes, route tables, NAT Gateway, IGW), security group, instancia RDS, parameter group, option group, y el secreto con la contraseña.
+> **Importante — el prefijo `empresa-`:** el módulo `validated-bucket` exige que el nombre empiece por `empresa-` (sección 1.2). Si lo pasas sin el prefijo (`lab24-data-${ACCOUNT_ID}`), Terraform aborta el `apply` antes de crear nada con `Error: Invalid value for variable`. Ese fallo es la prueba operativa de que la validación funciona — pero para el despliegue del lab base usa el nombre con prefijo como se muestra arriba.
 
-> **Tiempo estimado:** ~10-15 minutos (la instancia RDS tarda en aprovisionarse).
+Terraform creará **12 recursos** en la versión `aws/`: 1 VPC, 2 subredes privadas, 1 bucket S3 + 1 bloqueo público, 1 `aws_secretsmanager_secret` + 1 `aws_secretsmanager_secret_version`, y 5 `aws_ssm_parameter` (engine, engine-version, instance-class, port y un JSON con toda la config).
+
+> **Nota — versión LocalStack:** sustituye Secrets Manager por un `aws_ssm_parameter` SecureString adicional, así que crea **11 recursos** (1 SSM password + 5 SSM config = 6 SSM en total, más VPC, subnets, bucket y public_access_block).
 
 ```bash
 terraform output
-# vpc_id               = "vpc-0abc..."
-# vpc_cidr             = "10.20.0.0/16"
-# db_endpoint          = "lab24-db.xxxx.us-east-1.rds.amazonaws.com:3306"
-# db_port              = 3306
-# db_name              = "appdb"
-# db_secret_arn        = "arn:aws:secretsmanager:...:rds!db-..."
-# db_storage_encrypted = true
-# db_deletion_protection = true
+# vpc_id            = "vpc-0abc..."
+# vpc_cidr          = "10.19.0.0/16"
+# private_subnet_ids = ["subnet-...", "subnet-..."]
+# bucket_id         = "empresa-lab24-data-123456789012"
+# bucket_arn        = "arn:aws:s3:::empresa-lab24-data-123456789012"
+# db_config_summary = {
+#   engine         = "mysql"
+#   engine_version = "8.0"
+#   instance_class = "db.t4g.micro"
+#   port           = 3306
+#   multi_az       = false
+#   storage_gb     = 20
+#   backup_days    = 7
+# }
+# secret_arn        = "arn:aws:secretsmanager:us-east-1:...:secret:lab24/db-password-AbCdEf"
+# ssm_prefix        = "/lab24/db/"
 ```
+
+Nota que la contraseña **no aparece** en los outputs gracias a `sensitive = true`.
 
 ---
 
 ## Verificación final
 
-### Verificar la VPC y subredes
+### Probar que las validaciones rechazan valores inválidos
 
 ```bash
-VPC_ID=$(terraform output -raw vpc_id)
+# Bucket sin prefijo corporativo → debe fallar
+terraform plan -var="bucket_name=mi-bucket" -var='db_password=MiPassword123Seguro'
+# Error: Invalid value for variable
+#   El nombre del bucket debe comenzar con 'empresa-'...
 
-# Subredes por tipo
-aws ec2 describe-subnets \
-  --filters "Name=vpc-id,Values=$VPC_ID" \
-  --query 'Subnets[].{ID: SubnetId, CIDR: CidrBlock, AZ: AvailabilityZone, Name: Tags[?Key==`Name`].Value | [0]}' \
+# Motor de DB inválido → debe fallar
+terraform plan \
+  -var="bucket_name=empresa-test-bucket" \
+  -var='db_password=MiPassword123Seguro' \
+  -var='db_config={"engine":"oracle","engine_version":"19c","instance_class":"db.m5.large","allocated_storage":50}'
+# Error: Invalid value for variable
+#   El motor de base de datos debe ser uno de: mysql, postgres, mariadb.
+
+# Contraseña corta → falla la validación de longitud
+terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=corta'
+# Error: Invalid value for variable
+#   La contraseña debe tener al menos 12 caracteres.
+
+# Contraseña suficientemente larga y con dígito pero sin mayúsculas → falla
+# solo la regla de mayúscula:
+terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=todoenlowercase123'
+# Error: Invalid value for variable
+#   La contraseña debe contener al menos una letra mayúscula (A-Z).
+
+# Contraseña sin dígitos → falla solo la regla del dígito
+terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=PasswordSinNumeros'
+# Error: Invalid value for variable
+#   La contraseña debe contener al menos un dígito (0-9).
+```
+
+Las cuatro reglas (`length`, mayúscula, minúscula, dígito) están en `validation` blocks separados — Terraform reporta **cada** una que falle, así que el alumno ve exactamente qué corregir en lugar de un mensaje genérico.
+
+### Verificar el bucket S3
+
+```bash
+BUCKET_NAME=$(terraform output -raw bucket_id)
+
+aws s3api head-bucket --bucket $BUCKET_NAME
+# (sin error = el bucket existe)
+
+aws s3api get-bucket-tagging --bucket $BUCKET_NAME \
+  --query 'TagSet[].{Key: Key, Value: Value}' --output table
+```
+
+### Verificar la configuración en SSM
+
+```bash
+SSM_PREFIX=$(terraform output -raw ssm_prefix)
+
+aws ssm get-parameters-by-path \
+  --path "$SSM_PREFIX" \
+  --query 'Parameters[].{Name: Name, Value: Value}' \
   --output table
 ```
 
-Debe mostrar 6 subredes: 2 públicas, 2 privadas, 2 de base de datos.
+Debe mostrar los parámetros individuales: engine, engine-version, instance-class, port, y el JSON completo de config.
 
-### Verificar parámetros de seguridad de RDS
-
-```bash
-aws rds describe-db-instances \
-  --db-instance-identifier lab24-db \
-  --query 'DBInstances[0].{
-    Engine: Engine,
-    StorageEncrypted: StorageEncrypted,
-    DeletionProtection: DeletionProtection,
-    PubliclyAccessible: PubliclyAccessible,
-    MultiAZ: MultiAZ,
-    Endpoint: Endpoint.Address
-  }' \
-  --output json
-```
-
-Debe mostrar:
-- `StorageEncrypted: true` — hardcoded por el wrapper
-- `DeletionProtection: true` — hardcoded por el wrapper
-- `PubliclyAccessible: false` — hardcoded por el wrapper
-
-### Verificar security group
+### Verificar el secreto (sin exponer la contraseña)
 
 ```bash
-SG_ID=$(terraform output -raw security_group_id)
+SECRET_ARN=$(terraform output -raw secret_arn)
 
-aws ec2 describe-security-groups \
-  --group-ids $SG_ID \
-  --query 'SecurityGroups[0].IpPermissions[].{Port: FromPort, CIDR: IpRanges[].CidrIp}' \
-  --output json
-```
-
-Debe mostrar que el ingreso solo está permitido desde los CIDRs de las subredes privadas (`10.20.10.0/24`, `10.20.11.0/24`).
-
-### Verificar la contraseña en Secrets Manager
-
-```bash
-SECRET_ARN=$(terraform output -raw db_secret_arn)
-
-# Ver metadatos (sin el valor)
+# Ver metadatos del secreto (sin el valor)
 aws secretsmanager describe-secret \
   --secret-id $SECRET_ARN \
-  --query '{Name: Name, Description: Description, RotationEnabled: RotationEnabled}'
+  --query '{Name: Name, Description: Description}' \
+  --output json
 
-# Recuperar la contraseña (solo para verificación)
+# Recuperar el valor (solo si necesitas verificar)
 aws secretsmanager get-secret-value \
   --secret-id $SECRET_ARN \
-  --query 'SecretString' --output text | jq .
+  --query 'SecretString' \
+  --output text
 ```
 
-La contraseña fue generada automáticamente por RDS — ningún humano la eligió ni la vio durante el despliegue.
+### Probar la postcondición RFC 1918
+
+```bash
+# CIDR público → la postcondición debe fallar
+terraform plan \
+  -var="bucket_name=empresa-lab24-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro' \
+  -var="vpc_cidr=52.0.0.0/16"
+```
+
+> **Nota técnica — cuándo se evalúa una `postcondition`:** las postcondiciones se evalúan **después** de crear o actualizar el recurso (durante el apply). Sin embargo, desde Terraform 1.4+ el motor también las evalúa **al final del plan** cuando todos los valores referenciados (`self.*`) son ya conocidos en ese momento — es lo que ocurre aquí, porque `self.cidr_block` viene literalmente de la variable y no requiere creación previa para conocerse. Por eso este caso falla durante el `plan` y no llega al `apply`. En escenarios donde los atributos son **computados por AWS** (por ejemplo, `self.id` de un recurso recién creado), la postcondición solo puede evaluarse durante el `apply`, después de que AWS responda con el valor real.
 
 ---
 
 ## Retos
 
-### Reto 1 — Refactorización con `moved {}` — Renombrar sin destruir
+### Reto 1 — Precondición que valide el puerto según el motor
 
-**Situación**: El equipo de arquitectura ha decidido renombrar el módulo interno `module.vpc` a `module.network` dentro del wrapper para alinearse con la nomenclatura del resto de módulos corporativos. El cambio debe ser transparente: **la VPC existente no se destruye ni se recrea**.
-
-**Tu objetivo**:
-
-1. Dentro de `modules/corporate-rds/main.tf`, renombrar `module "vpc"` a `module "network"`
-2. Actualizar todas las referencias: `module.vpc.xxx` → `module.network.xxx`
-3. Añadir un bloque `moved {}` que indique a Terraform que el módulo fue renombrado
-4. Ejecutar `terraform plan` y verificar que muestra **0 cambios** (solo el moved)
-
-**Pistas**:
-- El bloque `moved {}` tiene `from` y `to` con las direcciones completas del recurso
-- Para un módulo: `from = module.vpc` y `to = module.network`
-- `terraform plan` debe mostrar algo como: `module.vpc has moved to module.network`
-- Si ves recursos marcados para destruir y recrear, algo está mal en las referencias
-
-### Reto 2 — Añadir parameter group con estándares de seguridad
-
-**Situación**: El equipo de seguridad requiere que todas las bases de datos MySQL tengan habilitado `require_secure_transport` (forzar conexiones SSL) y `log_bin_trust_function_creators` desactivado. Estos parámetros deben estar hardcoded en el wrapper, igual que el cifrado y la protección contra borrado.
+**Situación**: El equipo de DBA ha reportado errores de conexión porque los desarrolladores configuran motores de base de datos con puertos incorrectos (por ejemplo, MySQL en el puerto 5432 de PostgreSQL). Quieren que el módulo `db-config` rechace configuraciones donde el puerto no coincida con el motor.
 
 **Tu objetivo**:
 
-1. Crear un `aws_db_parameter_group` dentro del wrapper con los parámetros de seguridad
-2. Pasar el parameter group al módulo RDS usando `parameter_group_name`
-3. Desactivar la creación del parameter group interno del módulo RDS (`create_db_parameter_group = false`)
-4. Verificar con AWS CLI que los parámetros están aplicados
+1. Añadir una `precondition` en el recurso `aws_ssm_parameter.db_port` del módulo `db-config` que valide la coherencia entre `var.db_config.engine` y `var.db_config.port`
+2. Las reglas son:
+   - `mysql` o `mariadb` → puerto debe ser `3306`
+   - `postgres` → puerto debe ser `5432`
+3. Probar con una configuración incoherente (MySQL en puerto 5432) y verificar que Terraform la rechaza
+4. Probar con una configuración correcta (PostgreSQL en puerto 5432) y verificar que se acepta
 
 **Pistas**:
-- El `family` del parameter group para MySQL 8.0 es `"mysql8.0"`
-- `require_secure_transport = "1"` fuerza SSL
-- `log_bin_trust_function_creators = "0"` desactiva la creación de funciones inseguras
-- El módulo RDS acepta `parameter_group_name` como input y `create_db_parameter_group = false` para no crear uno interno
-- Después de aplicar, verifica con: `aws rds describe-db-parameters --db-parameter-group-name <name> --query 'Parameters[?ParameterName==\`require_secure_transport\`]'`
+- `precondition` va dentro del bloque `lifecycle {}` del recurso
+- Puedes usar una expresión condicional: `var.db_config.engine == "postgres" ? 5432 : 3306`
+- El `error_message` puede interpolar variables para ser más descriptivo
+- Recuerda que `precondition` se evalúa **antes** de crear/actualizar el recurso
+
+### Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados
+
+**Situación**: El equipo de plataforma quiere crear varios buckets corporativos de una sola vez usando el módulo `validated-bucket`, cada uno con su propia configuración. En lugar de duplicar bloques `module`, quieren definir todos los buckets en una sola variable de tipo `map(object)` y usar `for_each` sobre el módulo.
+
+**Tu objetivo**:
+
+1. Añadir una variable `extra_buckets` de tipo `map(object({...}))` en el Root Module con campos: `purpose` (string) y `force_destroy` (optional, bool, default true)
+2. Añadir una `validation` que verifique que **todas** las claves del mapa comienzan con el prefijo `empresa-` (ya que serán los nombres de los buckets)
+3. Invocar el módulo `validated-bucket` con `for_each` sobre la variable, pasando cada clave como `bucket_name`
+4. Probar con un mapa de 2 buckets: `empresa-logs-<ACCOUNT_ID>` y `empresa-backups-<ACCOUNT_ID>`
+
+**Pistas**:
+- `alltrue()` combinada con `[for k, v in var.extra_buckets : can(regex("^empresa-", k))]` valida todas las claves
+- `for_each = var.extra_buckets` en el bloque `module` itera sobre el mapa
+- `each.key` es el nombre del bucket, `each.value` es el objeto con la configuración
+- El módulo ya tiene su propia validación de regex, así que la del Root Module es una capa adicional
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Refactorización con `moved {}`</strong></summary>
+<summary><strong>Solución al Reto 1 — Precondición que valide el puerto según el motor</strong></summary>
 
-### Solución al Reto 1 — Refactorización con `moved {}`
+### Solución al Reto 1 — Precondición que valide el puerto según el motor
 
-#### Paso 1: Renombrar el módulo y añadir `moved {}`
+#### Paso 1: Precondición en el recurso del módulo
 
-En `modules/corporate-rds/main.tf`:
-
-```hcl
-# ─── Bloque moved: indica que module.vpc ahora se llama module.network ───
-moved {
-  from = module.vpc
-  to   = module.network
-}
-
-# ─── Módulo renombrado ───
-module "network" {                           # Antes: module "vpc"
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
-
-  name = "${var.project_name}-vpc"
-  cidr = var.vpc_cidr
-  # ... (mismo contenido)
-}
-```
-
-#### Paso 2: Actualizar todas las referencias en `main.tf`
-
-En `modules/corporate-rds/main.tf` hay **4 referencias** a `module.vpc.*` que hay que cambiar a `module.network.*`. Antes de empezar, lista las que tienes para no dejar ninguna olvidada:
-
-```bash
-grep -nE "module\.vpc\." modules/corporate-rds/main.tf
-# 90:  vpc_id      = module.vpc.vpc_id
-# 96:    cidr_blocks = module.vpc.private_subnets_cidr_blocks
-# 164:  db_subnet_group_name   = module.vpc.database_subnet_group_name
-# 166:  subnet_ids             = module.vpc.database_subnets
-```
-
-**Cambio 1 + 2** — bloque `resource "aws_security_group" "rds"`:
+En `modules/db-config/main.tf`:
 
 ```hcl
-resource "aws_security_group" "rds" {
-  name_prefix = "${var.project_name}-rds-"
-  description = "Acceso a RDS solo desde subredes privadas"
-  vpc_id      = module.network.vpc_id          # ← Cambio 1 (antes: module.vpc.vpc_id)
-
-  ingress {
-    from_port   = var.db_port
-    to_port     = var.db_port
-    protocol    = "tcp"
-    cidr_blocks = module.network.private_subnets_cidr_blocks  # ← Cambio 2
-    description = "Acceso desde subredes privadas"
+locals {
+  # Mapa engine → puerto estandar. Mas legible y escalable que un ternario
+  # encadenado: añadir "oracle" = 1521 es trivial.
+  default_db_ports = {
+    mysql    = 3306
+    mariadb  = 3306
+    postgres = 5432
   }
-
-  # egress, tags, lifecycle (sin cambios — no usan module.vpc.*)
-}
-```
-
-**Cambio 3 + 4** — bloque `module "rds"`:
-
-```hcl
-module "rds" {
-  source  = "terraform-aws-modules/rds/aws"
-  version = "~> 6.0"
-
-  # ... (parámetros del motor, hardcoded de cumplimiento, etc., sin cambios)
-
-  # ─── OUTPUTS ENCADENADOS DEL MÓDULO VPC ───
-  db_subnet_group_name   = module.network.database_subnet_group_name  # ← Cambio 3
-  vpc_security_group_ids = [aws_security_group.rds.id]                # (sin cambios — referencia local)
-  subnet_ids             = module.network.database_subnets            # ← Cambio 4
-
-  # ... (multi_az, skip_final_snapshot, family, etc., sin cambios)
-}
-```
-
-**Verificación**: tras los 4 cambios, no debería quedar ninguna referencia a `module.vpc.*` en `main.tf`:
-
-```bash
-grep -nE "module\.vpc\." modules/corporate-rds/main.tf
-# (sin salida = todas las referencias migradas)
-```
-
-> **Nota:** las referencias a `aws_security_group.rds.id`, `var.db_*`, `local.*` y `data.aws_availability_zones` **no cambian** — solo se renombra el módulo VPC, no los demás recursos.
-
-#### Paso 3: Actualizar los outputs en `outputs.tf`
-
-En `modules/corporate-rds/outputs.tf` hay **5 referencias** más a `module.vpc.*` que también hay que migrar (los outputs `db_*` apuntan a `module.rds`, no a la VPC, y NO se tocan):
-
-```bash
-grep -nE "module\.vpc\." modules/corporate-rds/outputs.tf
-# 5:  value       = module.vpc.vpc_id
-# 10: value       = module.vpc.vpc_cidr_block
-# 15: value       = module.vpc.private_subnets
-# 20: value       = module.vpc.database_subnets
-# 25: value       = module.vpc.database_subnet_group_name
-```
-
-Cambia cada una a `module.network.*`:
-
-```hcl
-output "vpc_id" {
-  value = module.network.vpc_id            # Antes: module.vpc.vpc_id
 }
 
-output "vpc_cidr" {
-  value = module.network.vpc_cidr_block    # Antes: module.vpc.vpc_cidr_block
-}
+resource "aws_ssm_parameter" "db_port" {
+  name  = "/${var.project_name}/db/port"
+  type  = "String"
+  value = tostring(var.db_config.port)
 
-output "private_subnet_ids" {
-  value = module.network.private_subnets   # Antes: module.vpc.private_subnets
-}
+  tags = var.tags
 
-output "database_subnet_ids" {
-  value = module.network.database_subnets  # Antes: module.vpc.database_subnets
-}
-
-output "database_subnet_group_name" {
-  value = module.network.database_subnet_group_name  # Antes: module.vpc...
-}
-```
-
-**Verificación final** — combinada para `main.tf` + `outputs.tf`:
-
-```bash
-grep -rnE "module\.vpc\." modules/corporate-rds/
-# (sin salida = las 9 referencias totales migradas: 4 en main.tf + 5 en outputs.tf)
-```
-
-#### Paso 4: Re-ejecutar `terraform init`
-
-Al renombrar un módulo que usa `source` del Registry, Terraform **necesita re-registrar el módulo con su nuevo nombre local**: el código fuente descargado del Registry se cachea en `.terraform/modules/<nombre-local>/`, así que el path cambia de `.terraform/modules/vpc/` a `.terraform/modules/network/`. Si saltas este paso, el siguiente `plan` falla inmediatamente con:
-
-```
-Error: Module not installed
-  on modules/corporate-rds/main.tf line N:
-   N: module "network" {
-This module is not yet installed. Run "terraform init" to install all
-modules required by this configuration.
-```
-
-Ejecuta:
-
-```bash
-terraform init \
-  -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=$BUCKET"
-```
-
-> **`init` es obligatorio aquí.** El cambio que hiciste en Paso 1 (renombrar `module "vpc"` → `module "network"`) toca la **interfaz de carga de módulos**, no solo el código. Sin `init` el plan ni siquiera arranca; con `init` Terraform descarga (o más bien, copia desde la caché) el módulo bajo el nuevo nombre y queda listo para evaluar el `moved {}`.
-
-#### Paso 5: Verificar el `moved {}` con `plan`
-
-Ahora sí, comprueba que el rename se traduce en un `moved` y no en una destrucción:
-
-```bash
-# Tip opcional: -refresh=false acelera el plan saltándose la consulta a
-# AWS para ver si la infraestructura ha cambiado fuera de Terraform.
-# Útil cuando solo quieres validar el rename, no diff con AWS.
-terraform plan -refresh=false
-```
-
-Debe mostrar algo como:
-
-```
-  # module.corporate_rds.module.vpc has moved to module.corporate_rds.module.network
-    resource "aws_vpc" "this" {
-        # (no changes)
+  lifecycle {
+    precondition {
+      condition     = var.db_config.port == local.default_db_ports[var.db_config.engine]
+      error_message = "El puerto ${var.db_config.port} no es el estándar para el motor '${var.db_config.engine}'. Esperado: ${local.default_db_ports[var.db_config.engine]} (3306 para mysql/mariadb, 5432 para postgres)."
     }
-
-  # module.corporate_rds.module.vpc.aws_subnet.private["..."] has moved to
-  # module.corporate_rds.module.network.aws_subnet.private["..."]
-    resource "aws_subnet" "private" {
-        # (no changes)
-    }
-
-  # ... (más moves sin cambios)
-
-Plan: 0 to add, 0 to change, 0 to destroy.
+  }
+}
 ```
 
-**Cero destrucciones.** Terraform entiende que los recursos son los mismos, solo con un nombre diferente en el código.
+> **Alternativa más concisa:** la versión con un mapa `local` es más mantenible que un `if/else` encadenado. Para añadir un nuevo motor (`oracle = 1521`, `mssql = 1433`), basta con extender el mapa — no hay que tocar la condición. La validación con `contains([...], engine)` ya cubrió en `variables.tf` que `engine` esté en la lista permitida, así que el lookup `local.default_db_ports[engine]` es seguro.
 
-> **⚠️ DETÉNTE antes del apply si ves esto:**
->
-> ```
-> # module.corporate_rds.module.vpc.aws_vpc.this will be destroyed
-> - resource "aws_vpc" "this" { ... }
->
-> # module.corporate_rds.module.network.aws_vpc.this will be created
-> + resource "aws_vpc" "this" { ... }
->
-> Plan: N to add, 0 to change, N to destroy.
-> ```
->
-> Eso significa que **Terraform no reconoció el rename como un `moved`** y va a destruir y recrear toda la infraestructura (VPC, subnets, NAT GW, RDS — todo). **NO ejecutes `apply`**. Cancela con `Ctrl+C` o responde `no`.
->
-> Causas posibles, en orden de probabilidad:
->
-> 1. **Falta el bloque `moved {}`** (Paso 1 incompleto). Verifica que existe en `modules/corporate-rds/main.tf`:
->
-> 2. **Direcciones del `moved` mal escritas**. Las direcciones son **relativas** al módulo donde está el bloque. Como el `moved {}` vive dentro de `corporate-rds`, debe decir `from = module.vpc` y `to = module.network` — **NO** `module.corporate_rds.module.vpc`. Terraform añade el prefijo `module.corporate_rds.` automáticamente al evaluar.
->
-> 3. **Falta `terraform init` tras el rename**. El módulo Registry se cachea bajo el nombre local; sin `init` el path nuevo no existe. Repite el `init` (ver inicio de este Paso 4).
->
-> 4. **Quedan referencias huérfanas a `module.vpc.*`**. Aunque Terraform debería avisar con `Reference to undeclared module`, conviene verificar:
->
-> Tras corregir lo que aplique, **vuelve a ejecutar `terraform plan`**. Solo cuando veas `has moved to` (no `destroyed`/`created`) está seguro continuar al apply.
-
-#### Paso 6: Aplicar y eliminar el bloque `moved {}` después
-
-Una vez que el `plan` muestra solo `has moved to` sin cambios reales, ejecuta el `apply` para que Terraform **persista las nuevas direcciones en el state**:
+#### Paso 2: Probar configuración incoherente
 
 ```bash
-terraform apply
-# Plan: 0 to add, 0 to change, 0 to destroy.
-# (los "moved" se aplican silenciosamente — solo reorganizan el state)
+terraform plan \
+  -var="bucket_name=empresa-lab24-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro' \
+  -var='db_config={"engine":"mysql","engine_version":"8.0","instance_class":"db.t4g.micro","allocated_storage":20,"port":5432}'
+# Error: Resource precondition failed
+#   El puerto 5432 no es el estándar para el motor 'mysql'.
+#   Usa 3306 para mysql/mariadb o 5432 para postgres.
 ```
 
-Tras este `apply`, el state ya tiene los recursos bajo `module.network.*` y **el bloque `moved {}` ha cumplido su función**. Lo correcto es **eliminarlo** del código:
-
-```hcl
-# ELIMINAR de modules/corporate-rds/main.tf:
-# moved {
-#   from = module.vpc
-#   to   = module.network
-# }
-```
-
-**¿Por qué eliminarlo?** Cuatro razones:
-
-1. **Ya es ruido**: el rename está consolidado en el state, así que el bloque ya no hace nada — Terraform lo evalúa pero no produce efecto.
-2. **Confunde al lector**: alguien que abra el código en seis meses verá un `moved {}` apuntando a un `module.vpc` que **no existe** y se preguntará si falta algo o si es código muerto.
-3. **Acumulación**: si dejas todos los `moved {}` históricos en el código, en pocos años tendrás decenas inútiles que ofuscan el `main.tf`.
-4. **Verificable**: tras eliminar el bloque, un `terraform plan` debe seguir mostrando `Plan: 0 to add, 0 to change, 0 to destroy.` — confirma que el `moved` ya cumplió su papel y se puede borrar sin riesgo.
+#### Paso 3: Probar configuración correcta
 
 ```bash
-# Tras eliminar el moved {} y guardar el archivo:
-terraform plan
-# Plan: 0 to add, 0 to change, 0 to destroy.   ← OK, el state ya estaba migrado
+terraform apply \
+  -var="bucket_name=empresa-lab24-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro' \
+  -var='db_config={"engine":"postgres","engine_version":"15.4","instance_class":"db.t4g.micro","allocated_storage":20,"port":5432}'
+# Apply complete! Resources: ... added
 ```
 
-> **Política de equipo recomendada:** mantener el `moved {}` durante **al menos un ciclo de despliegue completo** en todos los entornos (dev → staging → prod) para que cada uno aplique el rename. Una vez el último entorno haya hecho `apply`, abrir un PR de limpieza que elimine el bloque. Documenta la fecha del PR en el commit message para tener trazabilidad.
+#### Reflexión: ¿validation, precondition o postcondition?
 
-### Reflexión: ¿cuándo usar `moved {}`?
-
-| Escenario | ¿Usar `moved`? | Alternativa |
+| Escenario | Mecanismo | Razón |
 |---|---|---|
-| Renombrar un módulo | Sí | `terraform state mv` (manual, arriesgado) |
-| Renombrar un recurso | Sí | `terraform state mv` |
-| Mover recurso a un módulo hijo | Sí | `terraform state mv` |
-| Cambiar el `source` de un módulo | No (no aplica) | Recrear o importar |
-| Cambiar `for_each` key | Sí (1.7+) | `terraform state mv` por cada recurso |
+| Formato de un solo campo (regex, rango) | `validation` | Solo depende de la propia variable |
+| Coherencia entre campos de la misma variable | `validation` | Accede a `var.x.campo_a` y `var.x.campo_b` |
+| Coherencia entre diferentes variables | `precondition` | `validation` solo accede a su propia variable |
+| Verificar lo que AWS realmente creó | `postcondition` | Solo `self` tiene los valores reales post-apply |
+| Advertencia no bloqueante | `check` block | No detiene el apply, solo muestra un warning |
 
-`moved {}` es preferible a `terraform state mv` porque:
-1. Es **declarativo** — queda documentado en el código
-2. Es **revisable** — se ve en el PR
-3. Es **reproducible** — funciona en todos los entornos (dev, staging, prod)
-4. Es **seguro** — `terraform plan` muestra el resultado antes de aplicar
+---
 
 </details>
 
 <details>
-<summary><strong>Solución al Reto 2 — Añadir parameter group con estándares de seguridad</strong></summary>
+<summary><strong>Solución al Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados</strong></summary>
 
-### Solución al Reto 2 — Añadir parameter group con estándares de seguridad
+### Solución al Reto 2 — Variable de tipo `map(object)` para múltiples buckets validados
 
-#### Paso 1: Parameter group en el wrapper
-
-En `modules/corporate-rds/main.tf`, añadir antes del módulo RDS:
+#### Paso 1: Variable con validación en el Root Module (`variables.tf`)
 
 ```hcl
-resource "aws_db_parameter_group" "corporate" {
-  name_prefix = "${var.project_name}-corporate-"
-  family      = "${var.db_engine}${var.db_engine_version}"
-  description = "Parámetros de seguridad corporativos para ${var.db_engine}"
+variable "extra_buckets" {
+  type = map(object({
+    purpose       = string
+    force_destroy = optional(bool, true)
+  }))
 
-  # ─── PARÁMETROS HARDCODED DE SEGURIDAD ───
-  # Cada parámetro de RDS se clasifica como "dinámico" o "estático" según
-  # si el motor puede aplicarlo en caliente o necesita reinicio:
-  #   - dinámico → apply_method = "immediate" (default), se aplica al instante
-  #   - estático → apply_method = "pending-reboot" obligatorio, se aplica
-  #                en el siguiente reinicio de la BD
-  parameter {
-    # Dinámico — se aplica de inmediato sin reinicio.
-    name  = "require_secure_transport"
-    value = "1"
+  description = "Mapa de buckets adicionales. La clave es el nombre (debe empezar con 'empresa-')."
+  default     = {}
+
+  validation {
+    condition     = alltrue([for k, _ in var.extra_buckets : can(regex("^empresa-", k))])
+    error_message = "Todos los nombres de bucket deben comenzar con el prefijo 'empresa-'."
   }
+}
+```
 
-  parameter {
-    # Estático — siempre requiere reboot. Si omites apply_method o pones
-    # "immediate", terraform apply falla con un error de RDS API.
-    name         = "log_bin_trust_function_creators"
-    value        = "0"
-    apply_method = "pending-reboot"
-  }
+`alltrue()` evalúa una lista de booleanos y devuelve `true` solo si **todos** son `true`. La comprensión `[for k, _ in var.extra_buckets : ...]` itera sobre las claves del mapa.
 
-  tags = merge(local.effective_tags, {
-    Name = "${var.project_name}-corporate-pg"
+#### Paso 2: Módulo con `for_each` en el Root Module (`main.tf`)
+
+```hcl
+module "extra_buckets" {
+  source   = "./modules/validated-bucket"
+  for_each = var.extra_buckets
+
+  bucket_name   = each.key
+  force_destroy = each.value.force_destroy
+
+  tags = merge(local.common_tags, {
+    Purpose = each.value.purpose
   })
-
-  lifecycle {
-    create_before_destroy = true
-  }
 }
 ```
 
-#### Paso 2: Pasar al módulo RDS
+#### Paso 3: Output en el Root Module (`outputs.tf`)
 
 ```hcl
-module "rds" {
-  # ...
-
-  # Parameter group corporativo (en lugar del generado por el módulo)
-  create_db_parameter_group = false
-  parameter_group_name      = aws_db_parameter_group.corporate.name
-
-  # ...
+output "extra_bucket_ids" {
+  description = "IDs de los buckets adicionales"
+  value       = { for k, m in module.extra_buckets : k => m.bucket_id }
 }
 ```
 
-#### Paso 3: Verificar
+#### Paso 4: Invocar con 2 buckets
+
+`-var` interpreta su valor como **HCL**, no como JSON. La sintaxis correcta para un `map(object)` con claves dinámicas (que contienen `${ACCOUNT_ID}`) es más legible si se pasa por archivo `.tfvars` o se construye con `printf`:
+
+**Opción A — con archivo `extra_buckets.auto.tfvars`** (recomendado):
+
+```hcl
+# extra_buckets.auto.tfvars
+extra_buckets = {
+  "empresa-logs-123456789012"    = { purpose = "logs" }
+  "empresa-backups-123456789012" = { purpose = "backups" }
+}
+```
 
 ```bash
-terraform apply
-
-# Listar parámetros del parameter group
-PG_NAME=$(aws rds describe-db-instances \
-  --db-instance-identifier lab24-db \
-  --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' \
-  --output text)
-
-aws rds describe-db-parameters \
-  --db-parameter-group-name $PG_NAME \
-  --query 'Parameters[?ParameterName==`require_secure_transport`].{Name: ParameterName, Value: ParameterValue}' \
-  --output table
-# require_secure_transport = 1
-
-aws rds describe-db-parameters \
-  --db-parameter-group-name $PG_NAME \
-  --query 'Parameters[?ParameterName==`log_bin_trust_function_creators`].{Name: ParameterName, Value: ParameterValue}' \
-  --output table
-# log_bin_trust_function_creators = 0
+terraform apply \
+  -var="bucket_name=empresa-lab24-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro'
+# (extra_buckets.auto.tfvars se carga automáticamente)
 ```
 
-#### Reflexión: capas de seguridad en el wrapper
+**Opción B — inline con `printf`** (útil para CI/CD donde no quieres archivos extra):
 
-Después de los dos retos, el wrapper corporativo impone 6 estándares de seguridad:
+```bash
+EXTRA_BUCKETS=$(printf '{"empresa-logs-%s"={purpose="logs"},"empresa-backups-%s"={purpose="backups"}}' \
+  "$ACCOUNT_ID" "$ACCOUNT_ID")
 
-| Capa | Estándar | Mecanismo |
-|---|---|---|
-| Red | Sin acceso público | `publicly_accessible = false` hardcoded |
-| Red | Acceso solo desde subredes privadas | Security group en el wrapper |
-| Almacenamiento | Cifrado en reposo | `storage_encrypted = true` hardcoded |
-| Disponibilidad | Protección contra borrado | `deletion_protection = true` hardcoded |
-| Conexión | SSL obligatorio | Parameter group: `require_secure_transport = 1` |
-| Credenciales | Contraseña auto-gestionada | `manage_master_user_password = true` |
+terraform apply \
+  -var="bucket_name=empresa-lab24-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro' \
+  -var="extra_buckets=$EXTRA_BUCKETS"
+```
 
-Ninguno de estos puede ser desactivado por los equipos de producto. Si necesitan una excepción, deben solicitarla al equipo de plataforma, que puede crear una variante del wrapper o añadir un flag controlado.
+> **Nota:** la sintaxis HCL para mapas usa `=` (no `:`), claves entre comillas dobles y valores object con `{ campo = "valor" }`. No mezclar con sintaxis JSON (`":"`) — Terraform rechazará el `-var` con un error de parseo.
+
+#### Paso 5: Verificar
+
+```bash
+# Listar todos los buckets empresa-
+aws s3 ls | grep empresa
+
+# Verificar tags de cada uno
+for BUCKET in $(aws s3 ls | grep empresa | awk '{print $3}'); do
+  echo "=== $BUCKET ==="
+  aws s3api get-bucket-tagging --bucket $BUCKET \
+    --query 'TagSet[?Key==`Purpose`].Value' --output text
+done
+```
+
+### Reflexión: doble capa de validación
+
+En esta solución, la validación ocurre en dos niveles:
+
+1. **Root Module** (`extra_buckets` validation): verifica que las claves empiecen con `empresa-` antes de invocar el módulo
+2. **Módulo** (`bucket_name` validation): verifica la regex completa del nombre del bucket
+
+¿Es redundante? No necesariamente:
+- La validación del Root Module detecta errores temprano y da un mensaje genérico del mapa
+- La validación del módulo es más estricta (regex completa) y protege contra invocaciones desde otros Root Modules
+- En producción, el módulo puede publicarse en un registry y ser usado por equipos que **no** tienen la validación del Root Module
 
 </details>
 
@@ -748,72 +725,44 @@ Ninguno de estos puede ser desactivado por los equipos de producto. Si necesitan
 
 ## Limpieza
 
-El wrapper tiene **`deletion_protection = true`** hardcoded ([`modules/corporate-rds/main.tf`](aws/modules/corporate-rds/main.tf), bloque `module "rds"`). Si intentas `terraform destroy` directamente, AWS rechaza la operación con `Cannot delete protected DB instance`. Es **intencional** — borrar una base de datos requiere un paso deliberado, no un `terraform destroy` accidental.
-
-### Paso 1: Desactivar protección temporalmente
-
-Edita `modules/corporate-rds/main.tf` y localiza el bloque `module "rds"`. Cambia la línea:
-
-```hcl
-  deletion_protection = true  # Protección contra borrado accidental
-```
-
-a:
-
-```hcl
-  deletion_protection = false # Temporal: SOLO durante el destroy del lab
-```
-
-Aplica el cambio para que AWS desactive la protección en la instancia RDS existente (este `apply` no destruye nada, solo modifica un atributo de la BD):
-
 ```bash
-terraform apply
-# Plan: 0 to add, 1 to change, 0 to destroy.
-#   ~ deletion_protection = true -> false
+terraform destroy \
+  -var="bucket_name=empresa-lab24-data-${ACCOUNT_ID}" \
+  -var='db_password=MiPassword123Seguro'
 ```
 
-### Paso 2: Destruir
-
-```bash
-terraform destroy
-```
-
-> **Nota:** la destrucción tarda ~5-10 minutos (RDS hace shutdown ordenado).
-
-### Paso 3: Restaurar la protección si vas a redesplegar
-
-Si después de destruir vas a volver a desplegar el lab (o reutilizar el wrapper en otro proyecto), **revierte el cambio** a `deletion_protection = true` en el código. Dejar el wrapper con `false` rompería su contrato corporativo.
-
-> **Nota:** En producción, este paso manual es **intencional** — destruir una base de datos requiere una acción deliberada, no un `terraform destroy` accidental. El laboratorio sí crea recursos propios (VPC, RDS, secret) que se destruyen aquí; no destruyas el bucket de tfstate del lab02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
+> **Nota:** Debes pasar las mismas variables obligatorias (`bucket_name` y `db_password`) en el `destroy` porque Terraform necesita evaluarlas para calcular el plan. El laboratorio sí crea un bucket S3 propio (`empresa-lab24-data-…`) que se destruirá; no destruyas el bucket de tfstate del lab-02 (`terraform-state-labs-<ACCOUNT_ID>`), ya que es un recurso compartido entre laboratorios.
 
 ---
 
 ## LocalStack
 
-RDS **no está disponible** en LocalStack Community Edition. Este laboratorio requiere una cuenta de AWS real.
+Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
 
-Consulta [localstack/README.md](localstack/README.md) para más detalles.
+LocalStack emula S3 y SSM Parameter Store en Community. Las validaciones, precondiciones y postcondiciones funcionan idénticamente porque son evaluadas por el motor de Terraform, no por el proveedor. La versión localstack usa SSM SecureString en lugar de Secrets Manager para la contraseña.
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **Módulos wrapper como capa de control corporativo**: el wrapper impone estándares de seguridad (cifrado, deletion protection, backup) que los equipos de desarrollo no pueden desactivar, garantizando cumplimiento sin fricción.
-- **Encadenamiento de outputs entre módulos**: pasar `module.vpc.vpc_id` y `module.vpc.private_subnets` como inputs del módulo RDS demuestra el patrón de composición modular, la base de la reutilización en Terraform.
-- **`moved {}` para refactorizar sin destruir**: los bloques `moved` permiten renombrar recursos o moverlos entre módulos manteniendo el estado intacto. Son preferibles a `terraform state mv` porque el cambio queda documentado en código.
-- **Defaults razonables en el wrapper, obligatorios solo lo crítico**: un wrapper corporativo sirve para **reducir fricción** al consumidor, así que la mayoría de variables (`db_engine`, `db_engine_version`, `db_instance_class`, etc.) tienen defaults sensatos (`mysql 8.0`, `db.t4g.micro`) — el equipo de producto solo decide lo que de verdad varía. Lo único realmente obligatorio (sin `default`) es `project_name`, porque sin nombre no hay aislamiento de recursos. Este patrón es opuesto al de un módulo low-level (donde cada variable suele ser obligatoria para forzar elección consciente): un wrapper opina por defecto y el consumidor solo sobreescribe lo que necesita.
-- **`manage_master_user_password = true`**: delegar la gestión de credenciales a Secrets Manager elimina la necesidad de pasar contraseñas como variables de Terraform, que pueden quedar en el estado en texto claro.
-- **Módulos del Registry versionados con `~>`**: fijar la versión mínima con el operador pessimistic constraint `~>` permite actualizaciones de patch automáticas pero evita cambios de minor o major inesperados.
+- **Validación early-fail**: detectar errores en `terraform plan` (antes de cualquier llamada a AWS) es preferible a descubrirlos en mitad de un `terraform apply`. Las validaciones de variables permiten dar mensajes de error claros al desarrollador.
+- **Variables sensibles para secretos**: marcar contraseñas como `sensitive = true` evita que aparezcan en el output de `plan`/`apply` y en los logs de CI/CD. **Importante:** `sensitive = true` **NO cifra** el valor en `terraform.tfstate` — el secreto se almacena ahí en texto plano. Por eso es **obligatorio** que el backend cifre el state (`encrypt = true` en S3, KMS para tfstate, o un backend con cifrado en reposo) y que el bucket / repositorio del state esté restringido por IAM. La directiva `sensitive` resuelve la fuga **por output**, no la fuga **por acceso al state**.
+- **Postcondiciones para invariantes de estado**: verificar el estado real del recurso después de su creación (por ejemplo, que el bucket tiene public access bloqueado) detecta inconsistencias entre la configuración Terraform y el estado real de AWS.
+- **Tipos complejos `object` para configuraciones relacionadas**: agrupar parámetros relacionados en un objeto en lugar de variables individuales previene configuraciones parcialmente incorrectas (por ejemplo, motor de BD y puerto inconsistentes).
+- **`can()` para detección de errores sin fallo**: usar `can(regex(..., var.name))` permite evaluar si una expresión produce error sin que el plan falle, útil para validaciones condicionales.
+- **`optional()` con defaults en tipos `object`**: proporcionar valores por defecto para atributos opcionales de un objeto hace que el módulo sea más ergonómico sin sacrificar seguridad.
 
 ---
 
 ## Recursos
 
-- [Terraform: Module Composition](https://developer.hashicorp.com/terraform/language/modules/develop/composition)
-- [Terraform: `moved` blocks](https://developer.hashicorp.com/terraform/language/modules/develop/refactoring)
-- [Terraform Registry: VPC Module](https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/latest)
-- [Terraform Registry: RDS Module](https://registry.terraform.io/modules/terraform-aws-modules/rds/aws/latest)
-- [AWS: RDS Encryption](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.Encryption.html)
-- [AWS: RDS Deletion Protection](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_DeleteInstance.html)
-- [AWS: Managing Master User Password with Secrets Manager](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-secrets-manager.html)
-- [AWS: RDS Parameter Groups](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithParamGroups.html)
+- [Terraform: Input Variable Validation](https://developer.hashicorp.com/terraform/language/values/variables#custom-validation-rules)
+- [Terraform: Preconditions and Postconditions](https://developer.hashicorp.com/terraform/language/validate)
+- [Terraform: Type Constraints — `object`](https://developer.hashicorp.com/terraform/language/expressions/type-constraints#object)
+- [Terraform: `optional()` modifier](https://developer.hashicorp.com/terraform/language/expressions/type-constraints#optional-object-type-attributes)
+- [Terraform: Sensitive Variables](https://developer.hashicorp.com/terraform/language/values/variables#suppressing-values-in-cli-output)
+- [Terraform: `can()` function](https://developer.hashicorp.com/terraform/language/functions/can)
+- [Terraform: `regex()` function](https://developer.hashicorp.com/terraform/language/functions/regex)
+- [AWS: S3 Bucket Naming Rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html)
+- [AWS: Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html)
+- [RFC 1918: Address Allocation for Private Internets](https://datatracker.ietf.org/doc/html/rfc1918)

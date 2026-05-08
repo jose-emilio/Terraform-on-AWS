@@ -1,4 +1,4 @@
-# Laboratorio 19 — Conectividad Punto a Punto con VPC Peering
+# Laboratorio 19 — Seguridad y Control de Tráfico en VPC
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
@@ -8,44 +8,34 @@
 
 ## Visión general
 
-Establecer un túnel privado entre dos VPCs independientes para permitir la comunicación bidireccional **sin que el tráfico salga nunca a Internet**. Verificar experimentalmente que el peering **no es transitivo** mediante una tercera VPC.
+Implementar un modelo de **seguridad por capas** (Capa 7 y Capa 4) utilizando Security Groups y NACLs, aplicando el patrón de diseño ALB -> EC2 con referencia por Security Group, bloques dinámicos, NACLs defensivas y VPC Flow Logs para diagnóstico.
 
 ## Arquitectura
 
-![3 VPCs con 2 VPC Peerings (app↔db, app↔c) demostrando la NO transitividad hacia c↔db](arch/diagrama.svg)
+![Defensa en profundidad: NACL pública → SG ALB → NACL privada → SG EC2 + Flow Logs](arch/diagrama.svg)
 
-Tres VPCs con dos peerings:
-- **app ↔ db**: comunicación directa (ej. aplicación accede a base de datos)
-- **app ↔ vpc-c**: comunicación directa
-- **vpc-c ↔ db**: **sin peering** — vpc-c no puede alcanzar db a través de app (no transitividad)
+El tráfico atraviesa **cuatro capas independientes** antes de llegar a la aplicación:
 
-Solo `vpc-app` tiene IGW + NAT Gateway. `vpc-db` y `vpc-c` acceden a SSM Session Manager mediante 3 VPC Interface Endpoints (`ssm`, `ssmmessages`, `ec2messages`) cada una, sin necesidad de salida a Internet.
+1. **NACL pública** (Capa 4 stateless) — bloquea IPs maliciosas en regla 50, permite HTTP/HTTPS y puertos efímeros en reglas 100/110/120.
+2. **SG del ALB** (Capa 4 stateful) — admite `tcp/80` y `tcp/443` desde Internet.
+3. **NACL privada** — segunda barrera defensiva en la subred del backend.
+4. **SG de las EC2** — clave del patrón: `referenced_security_group_id = SG_ALB` (no CIDR), de modo que solo instancias asociadas al SG del ALB pueden conectar al puerto 80, sin acoplarse a IPs.
+
+**VPC Flow Logs** en modo `REJECT` graba en CloudWatch todo el tráfico denegado, lo que permite diagnosticar bloqueos sin SSH a las instancias.
+
+> **Defensa en profundidad:** Las NACLs actúan como primera línea (bloqueo de IPs conocidas, rango de puertos). Los Security Groups actúan como segunda línea (referencia por identidad, no por IP). Ambas capas se complementan.
 
 ## Conceptos clave
 
 | Concepto | Descripción |
 |---|---|
-| **VPC Peering** | Conexión de red privada entre dos VPCs que permite enrutar tráfico entre ellas usando IPs privadas. El tráfico nunca sale a Internet ni pasa por gateways intermedios |
-| **Requester / Accepter** | Modelo de solicitud: una VPC solicita el peering (requester) y la otra lo acepta (accepter). Con `auto_accept = true` se acepta automáticamente si ambas VPCs están en la misma cuenta y región |
-| **No transitividad** | Propiedad fundamental del peering: si A↔B y B↔C, eso **no** implica A↔C. Cada par de VPCs necesita su propio peering. Esto limita la escalabilidad (N VPCs requieren N×(N-1)/2 peerings) |
-| **Rutas bidireccionales** | El peering crea el túnel, pero las VPCs necesitan **rutas explícitas** en sus tablas de rutas para saber que deben enviar el tráfico a través del peering. Sin rutas en ambas direcciones, el tráfico no fluye |
-| **CIDR no solapado** | Requisito obligatorio: los rangos CIDR de las VPCs no pueden solaparse. AWS rechaza el peering si detecta solapamiento |
-| **Referencia por CIDR en SG** | En peering (a diferencia de Transit Gateway), los Security Groups referencian el CIDR de la otra VPC, no su Security Group ID. La referencia cruzada de SGs solo funciona dentro de la misma VPC o con peerings en la misma región si se habilita explícitamente |
-
-## Cuándo usar Peering vs Transit Gateway
-
-| Aspecto | VPC Peering | Transit Gateway |
-|---|---|---|
-| Topología | Punto a punto | Hub-and-spoke |
-| Transitividad | No | Sí |
-| Conexiones para 3 VPCs | 3 peerings | 3 attachments |
-| Conexiones para 10 VPCs | 45 peerings | 10 attachments |
-| Coste base | $0 | ~$36/mes por attachment |
-| Coste por GB | $0.01 (cross-AZ/region) | $0.02 por GB procesado |
-| Complejidad de rutas | 2 rutas por peering | Propagación automática |
-| Inspección centralizada | No nativo | Sí |
-
-> **Regla práctica:** Usa VPC Peering para 2-3 VPCs con conectividad simple y directa. A partir de 4+ VPCs, o si necesitas transitividad, inspección centralizada o conectividad híbrida, usa Transit Gateway (lab20).
+| **Security Group (SG)** | Firewall stateful a nivel de instancia (Capa 4/7). Evalúa solo reglas de permitir; el tráfico de retorno se permite automáticamente. Se pueden encadenar referenciando el ID de otro SG como origen |
+| **`source_security_group_id`** | Permite que un SG acepte tráfico solo desde instancias asociadas a otro SG, sin acoplar CIDRs. Patrón clave para ALB -> EC2 |
+| **Bloque `dynamic`** | Meta-argumento de Terraform que genera múltiples bloques anidados (como `ingress`) a partir de una lista o mapa, eliminando repetición |
+| **Network ACL (NACL)** | Firewall stateless a nivel de subred (Capa 4). Evalúa reglas de permitir y denegar con prioridad numérica. Requiere reglas explícitas para tráfico de retorno (puertos efímeros) |
+| **Puertos efímeros** | Rango 1024-65535 usado por clientes para recibir respuestas. Las NACLs, al ser stateless, necesitan permitir estos puertos explícitamente para que el tráfico de retorno funcione |
+| **VPC Flow Logs** | Registro del tráfico IP que entra y sale de las interfaces de red de la VPC. Puede capturar todo, solo ACCEPT, o solo REJECT. Se almacena en CloudWatch Logs o S3 |
+| **ALB (Application Load Balancer)** | Balanceador de carga en Capa 7 (HTTP/HTTPS) que distribuye tráfico entre instancias en múltiples AZs |
 
 ## Requisitos previos
 
@@ -65,176 +55,191 @@ echo "Bucket: $BUCKET"
 lab-19/
 ├── README.md                    <- Esta guía
 ├── arch/
-│   └── diagrama.svg             <- Diagrama de la arquitectura del lab
+│   └── diagrama.svg             <- Diagrama de arquitectura (referenciado en este README)
 ├── aws/
 │   ├── providers.tf             <- Backend S3 parcial
-│   ├── variables.tf             <- Variables: region, CIDRs, proyecto
-│   ├── main.tf                  <- 3 VPCs + 2 peerings + rutas + instancias de test
-│   ├── outputs.tf               <- IDs de VPCs, peerings, IPs de test
-│   └── aws.s3.tfbackend         <- Parámetros del backend (sin bucket)
+│   ├── variables.tf             <- Variables: región, CIDR, proyecto, puertos, IP bloqueada
+│   ├── main.tf                  <- VPC + ALB + EC2 + SGs + NACLs + Flow Logs
+│   ├── outputs.tf               <- IDs, DNS del ALB, SG IDs
+│   ├── aws.s3.tfbackend         <- Parámetros del backend (sin bucket)
+│   └── scripts/
+│       └── app_init.sh          <- user_data de las EC2 (httpd + SSM agent)
 └── localstack/
     ├── README.md                <- Guía específica para LocalStack
     ├── providers.tf
     ├── variables.tf
-    ├── main.tf                  <- VPCs y peerings (sin tráfico real)
+    ├── main.tf                  <- Estructura equivalente (sin tráfico real, sin ALB)
     ├── outputs.tf
     └── localstack.s3.tfbackend  <- Backend completo para LocalStack
 ```
 
 ## Análisis del código
 
-### VPC Peering — Solicitud y aceptación
+### Security Group del ALB — Puerta de entrada controlada
+
+El SG se declara "vacío" (sin reglas inline) y cada regla vive en su propio recurso `aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule` (recomendados por HashiCorp desde el provider AWS 5.x sobre el antiguo `aws_security_group_rule`, que sigue funcionando pero queda como modelo legado):
 
 ```hcl
-resource "aws_vpc_peering_connection" "app_to_db" {
-  vpc_id      = aws_vpc.app.id     # Requester
-  peer_vpc_id = aws_vpc.db.id      # Accepter
-  auto_accept = true
+resource "aws_security_group" "alb" {
+  name        = "alb-${var.project_name}"
+  description = "Trafico HTTP/HTTPS desde Internet"
+  vpc_id      = aws_vpc.main.id
+}
 
-  # DNS resolution cross-peering: cada lado resuelve los nombres DNS
-  # privados de la VPC peer (ej. endpoints internos de RDS). Sin estos
-  # bloques solo funciona la conectividad por IP.
-  requester {
-    allow_remote_vpc_dns_resolution = true
-  }
-  accepter {
-    allow_remote_vpc_dns_resolution = true
-  }
+# Una regla por cada puerto en var.alb_ingress_ports (80 y 443 por defecto).
+resource "aws_vpc_security_group_ingress_rule" "alb_ports" {
+  for_each = { for p in var.alb_ingress_ports : tostring(p) => p }
 
-  tags = merge(local.common_tags, {
-    Name = "peering-app-db-${var.project_name}"
-  })
+  security_group_id = aws_security_group.alb.id
+  cidr_ipv4         = "0.0.0.0/0"
+  from_port         = each.value
+  to_port           = each.value
+  ip_protocol       = "tcp"
+  description       = "Puerto ${each.value} desde Internet"
+}
+
+resource "aws_vpc_security_group_egress_rule" "alb_all" {
+  security_group_id = aws_security_group.alb.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
 }
 ```
 
-`auto_accept = true` solo funciona si ambas VPCs están en la **misma cuenta y región**. En un escenario multi-cuenta o cross-region, la cuenta/región accepter debe aceptar la solicitud con `aws_vpc_peering_connection_accepter`.
+El recurso `aws_vpc_security_group_ingress_rule` se crea con `for_each` sobre `var.alb_ingress_ports` (por defecto `[80, 443]`), generando una regla por puerto. Si en el futuro necesitas abrir el 8080, basta con añadir el valor a la lista — sin tocar nada más. Cada regla queda con su propio address en el state (`aws_vpc_security_group_ingress_rule.alb_ports["80"]`, `["443"]`), lo que permite gestionarlas con `lifecycle`, importarlas o destruirlas individualmente.
 
-Los bloques `requester` y `accepter` con `allow_remote_vpc_dns_resolution = true` activan la resolución DNS cross-peering: una instancia en `vpc-app` puede hacer `dig <hostname-privado-en-vpc-db>` y obtener la IP privada (no la pública). Imprescindible si vas a apuntar a recursos por nombre — RDS, ALB internos, endpoints VPC, etc. Sin este flag, sólo la conectividad por IP funciona.
+> **Nota sobre el puerto 443:** el SG y la NACL abren tanto 80 como 443 para reflejar el patrón habitual en producción, pero **el ALB de este laboratorio solo expone un listener HTTP en el puerto 80** (no se configura listener HTTPS porque eso requiere un certificado ACM, fuera del alcance del lab). Una conexión a `https://<alb_dns>` será rechazada por el ALB aunque el tráfico atraviese el SG y la NACL: el handshake TLS falla porque no hay nadie escuchando en 443. Mantenemos la regla 443 abierta como ejemplo de configuración defensiva: cuando añadas el listener HTTPS y el certificado, no tendrás que tocar ni el SG ni la NACL.
 
-**¿Qué pasa si los CIDRs se solapan?**
+**¿Por qué `for_each` sobre la variable y no reglas fijas?**
 
-AWS rechaza la solicitud de peering con el error `InvalidParameterValue: CIDRs overlap`. Por eso es crítico planificar los rangos CIDR antes de crear las VPCs. En este lab usamos rangos claramente separados:
-- app: `10.15.0.0/16`
-- db: `10.16.0.0/16`
-- vpc-c: `10.17.0.0/16`
+Con reglas fijas, cada nuevo puerto requiere copiar y pegar un recurso completo. Con `for_each` parametrizado, la lista de puertos es una variable que puede cambiar por entorno (dev podría abrir el 8080 para depuración; producción solo 80 y 443) sin duplicación de código.
 
-### Enrutamiento — El paso crítico
+**¿Por qué reglas en recursos separados en vez de bloques `ingress`/`egress` inline?**
+
+Cuando las reglas son bloques inline dentro de `aws_security_group`, Terraform las gestiona como parte del propio SG. Eso provoca dos problemas frecuentes:
+1. **Drift al editar reglas a mano** (consola, CLI, otra herramienta): el siguiente `apply` revierte todo lo que no esté en el código.
+2. **Dependencias circulares** cuando dos SGs se referencian mutuamente — Terraform no puede crear el SG-A porque su regla apunta al SG-B y viceversa. Con reglas separadas, los SGs se crean primero (vacíos) y las reglas después, rompiendo el ciclo.
+
+### Security Group de las EC2 — Solo tráfico desde el ALB
 
 ```hcl
-# app → db: el tráfico hacia 10.16.0.0/16 va por el peering
-resource "aws_route" "app_to_db" {
-  route_table_id            = aws_route_table.app.id
-  destination_cidr_block    = var.db_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_db.id
+resource "aws_security_group" "app" {
+  name        = "app-${var.project_name}"
+  description = "Trafico solo desde el ALB"
+  vpc_id      = aws_vpc.main.id
 }
 
-# db → app: ruta de retorno (sin ella, las respuestas se pierden)
-resource "aws_route" "db_to_app" {
-  route_table_id            = aws_route_table.db.id
-  destination_cidr_block    = var.app_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.app_to_db.id
+resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
+  security_group_id            = aws_security_group.app.id
+  referenced_security_group_id = aws_security_group.alb.id   # <-- identidad, no IP
+  from_port                    = 80
+  to_port                      = 80
+  ip_protocol                  = "tcp"
+  description                  = "HTTP desde el ALB"
+}
+
+resource "aws_vpc_security_group_egress_rule" "app_all" {
+  security_group_id = aws_security_group.app.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
 }
 ```
 
-**Importante:** Las rutas deben apuntar al **CIDR específico** de la VPC peer, no a `0.0.0.0/0`. El peering solo permite tráfico cuyo destino sea el CIDR de la otra VPC — AWS descarta paquetes con destino fuera de ese rango (por ejemplo, tráfico a Internet).
+Punto clave: la regla de entrada usa `referenced_security_group_id` (identidad del SG del ALB) en lugar de `cidr_ipv4`. Esto significa que **solo las instancias asociadas al SG del ALB** pueden enviar tráfico a las EC2 en el puerto 80. Si alguien intenta acceder directamente a la IP de la EC2, el tráfico se descarta.
 
-**Error más común con peering:** Crear el peering y olvidar las rutas. El peering aparece como `Active` en la consola, pero el tráfico no fluye porque las VPCs no saben que deben enviar los paquetes por el peering. Cada VPC necesita una ruta explícita hacia el CIDR de la otra VPC usando el ID del peering como target.
+**Ventaja sobre CIDR:** Si el ALB cambia de IP (por escalado, reemplazo, etc.), la regla sigue funcionando porque referencia la identidad del SG, no una IP fija.
 
-**¿Por qué rutas bidireccionales?**
-
-TCP requiere comunicación en ambas direcciones (SYN → SYN-ACK → ACK). Si solo app tiene ruta hacia db, el paquete SYN llega a db, pero el SYN-ACK no puede volver porque db no tiene ruta hacia app. El resultado es un timeout de conexión.
-
-### Security Group — Acceso por CIDR
+### Network ACL — Bloqueo explícito de IP maliciosa
 
 ```hcl
-resource "aws_security_group" "db" {
-  name        = "db-${var.project_name}"
-  description = "Permite MySQL desde VPC app, ICMP desde app"
-  vpc_id      = aws_vpc.db.id
+resource "aws_network_acl" "public" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
 
+  # Regla 50: Bloquear IP maliciosa. Las NACLs evalúan reglas en orden numérico
+  # ascendente y aplican la primera que coincida (sea allow o deny), por eso
+  # esta regla tiene número 50: se evalúa antes que el allow del puerto 80 (100).
   ingress {
-    from_port   = 3306
-    to_port     = 3306
-    protocol    = "tcp"
-    cidr_blocks = [var.app_cidr]
-    description = "MySQL desde VPC app"
+    rule_no    = 50
+    action     = "deny"
+    protocol   = "-1"
+    from_port  = 0
+    to_port    = 0
+    cidr_block = var.blocked_ip
   }
 
-  # ICMP desde app: permite que las pruebas de `ping` de la sección 3.4
-  # funcionen. Sin esta regla, el peering y las rutas serían correctos
-  # pero el ping fallaría — un error fácil de diagnosticar mal.
+  # Regla 100: Permitir HTTP
   ingress {
-    from_port   = -1
-    to_port     = -1
-    protocol    = "icmp"
-    cidr_blocks = [var.app_cidr]
-    description = "ICMP desde VPC app"
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 80
+    to_port    = 80
+    cidr_block = "0.0.0.0/0"
   }
 
+  # Regla 110: Permitir HTTPS
+  ingress {
+    rule_no    = 110
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 443
+    to_port    = 443
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla 120: Puertos efimeros (trafico de retorno)
+  ingress {
+    rule_no    = 120
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 1024
+    to_port    = 65535
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla de salida: las NACLs son stateless, así que el tráfico saliente
+  # (incluida la respuesta a las conexiones entrantes permitidas arriba)
+  # también necesita una regla allow explícita.
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Todo el trafico saliente"
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "-1"
+    from_port  = 0
+    to_port    = 0
+    cidr_block = "0.0.0.0/0"
   }
 }
 ```
 
-A diferencia del patrón ALB → EC2 (lab18) donde se referencia el Security Group ID, en peering se usa el **CIDR de la otra VPC** como origen. Esto permite que solo las instancias de vpc-app puedan conectarse al puerto 3306 de las instancias en vpc-db.
+**¿Por qué la regla 50 antes que la 100?**
 
-### No transitividad — Por qué vpc-c no puede hablar con db
+Las NACLs evalúan reglas en **orden numérico ascendente** y aplican la primera que coincida. La IP maliciosa (`var.blocked_ip`) se bloquea en la regla 50. Aunque la regla 100 permite HTTP desde `0.0.0.0/0`, la IP maliciosa nunca llega a evaluarse contra esa regla porque ya fue denegada.
 
-```
-vpc-c (10.17.0.0/16)
-   │
-   │  peering con app ✓
-   │  ruta: 10.15.0.0/16 → peering-app-c
-   │
-   ▼
-vpc-app (10.15.0.0/16)
-   │
-   │  peering con db ✓
-   │  ruta: 10.16.0.0/16 → peering-app-db
-   │
-   ▼
-vpc-db (10.16.0.0/16)
-```
+**¿Por qué puertos efímeros?**
 
-Aunque vpc-c tiene peering con app, y app tiene peering con db, vpc-c **no puede** enviar tráfico a db a través de app. La razón está en cómo AWS valida las rutas asociadas a un peering:
+Los Security Groups son **stateful**: si permites tráfico de entrada, el de retorno se permite automáticamente. Las NACLs son **stateless**: cada dirección necesita su propia regla. Sin la regla de puertos efímeros (1024-65535), las respuestas HTTP de las instancias no podrían salir de la subred.
 
-1. vpc-c envía un paquete a `10.16.0.0/16` (db).
-2. La tabla de rutas de vpc-c **no tiene** ruta hacia `10.16.0.0/16` → el paquete se descarta en origen.
-3. Si intentáramos crear esa ruta apuntando al peering existente — `route 10.16.0.0/16 → peering-app-c` — **AWS rechaza la creación de la ruta** con un error como `RouteNotSupported: The route's CIDR block 10.16.0.0/16 is not equal to or part of the peer VPC's CIDR (10.15.0.0/16)`. La validación es estricta: el destino de una ruta peering debe estar contenido en el CIDR del peer (vpc-app, no vpc-db).
-4. Tampoco se puede crear una ruta `10.16.0.0/16 → peering-app-db` desde vpc-c, porque vpc-c **no es** parte de ese peering — AWS rechaza referenciar un peering al que la VPC no pertenece.
-
-En otras palabras, el bloqueo no ocurre "en tiempo de tráfico" (el paquete llega a app y se descarta), sino **en tiempo de configuración** (AWS no permite siquiera crear la ruta intermedia). Esa es la garantía de que el peering es **estrictamente punto a punto** y no transitivo. Para conectividad transitiva, se necesita Transit Gateway (lab-20).
-
-### Acceso SSM sin salida a Internet — AMI con SSM + VPC Endpoints
-
-vpc-db y vpc-c no tienen IGW ni NAT Gateway, y **el peering no permite reenviar tráfico a Internet** — solo permite tráfico cuyo destino sea el CIDR de la VPC peer. Para poder conectarse a las instancias via SSM Session Manager se combinan dos estrategias:
-
-1. **AMI con SSM Agent preinstalado:** Se usa Amazon Linux 2023 estándar (no `minimal`) que incluye el SSM Agent de fábrica. Así no se necesita descargar nada en el arranque.
-2. **VPC Interface Endpoints (PrivateLink):** El agente SSM necesita conectarse a los servicios `ssm`, `ssmmessages` y `ec2messages` de AWS para registrarse. Sin Internet, se crean 3 endpoints por VPC que resuelven estos servicios a IPs privadas dentro de la VPC.
+### VPC Flow Logs — Solo tráfico REJECT
 
 ```hcl
-resource "aws_vpc_endpoint" "db_ssm" {
-  for_each = toset(["ssm", "ssmmessages", "ec2messages"])
-
-  vpc_id              = aws_vpc.db.id
-  service_name        = "com.amazonaws.${var.region}.${each.key}"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = [for k, s in aws_subnet.db : s.id]
-  security_group_ids  = [aws_security_group.ssm_endpoints_db.id]
-  private_dns_enabled = true
+resource "aws_flow_log" "reject" {
+  vpc_id               = aws_vpc.main.id
+  traffic_type         = "REJECT"
+  log_destination_type = "cloud-watch-logs"
+  log_destination      = aws_cloudwatch_log_group.flow_logs.arn
+  iam_role_arn         = aws_iam_role.flow_logs.arn
 }
 ```
 
-> **Nota:** vpc-app tiene IGW + NAT Gateway, por lo que su SSM Agent sale directamente por Internet sin necesidad de endpoints.
+Capturar solo `REJECT` tiene dos ventajas:
+1. **Volumen reducido:** En una VPC activa, el tráfico ACCEPT puede generar GB de logs. REJECT es mucho más reducido y contiene la información de seguridad más valiosa.
+2. **Diagnóstico de bloqueos:** Si un servicio no puede conectarse, los logs REJECT muestran exactamente qué regla (SG o NACL) está bloqueando el tráfico.
+
+Los logs se almacenan en un CloudWatch Log Group con retención configurable (por defecto 7 días para el lab).
 
 ---
 
-## Despliegue
+## Despliegue en AWS
 
 ```bash
 cd labs/lab-19/aws
@@ -246,280 +251,229 @@ terraform init \
 terraform apply
 ```
 
-Terraform creará ~51 recursos: 3 VPCs, 8 subredes (4 en app, 2 en db, 2 en vpc-c), IGW + EIP + NAT Gateway en app, 4 tablas de rutas con sus asociaciones, 2 peerings + 4 rutas peering, **6 VPC Interface Endpoints** (3 servicios SSM × 2 VPCs sin Internet) + 2 SGs para los endpoints, 3 IAM (rol + attachment + instance profile) para SSM, 3 Security Groups (app/db/c) y 3 instancias EC2 de test.
-
-> **⚠️ Aviso de coste — VPC Interface Endpoints:** los 6 Interface Endpoints (PrivateLink) facturan **~0,01 USD/hora por endpoint y AZ**. Este lab los despliega en **2 AZs** (`slice(..., 0, 2)` en [aws/main.tf](aws/main.tf)): 6 endpoints × 2 AZs × 0,01 USD × 720 h ≈ **86,40 USD/mes** solo por los endpoints SSM, además del NAT Gateway (~32 USD/mes) y el resto de cargos. Si dejas el lab desplegado, el coste se acumula rápido — ejecuta `terraform destroy` en cuanto termines la práctica.
+Terraform creará ~39 recursos: VPC, 4 subredes (2 públicas + 2 privadas), IGW + tabla de rutas pública + asociaciones, EIP + NAT Gateway + tabla de rutas privada + asociaciones, 2 Security Groups (ALB y app) + 5 reglas separadas (2 ingress ALB + 1 egress ALB + 1 ingress app + 1 egress app), 2 NACLs (pública y privada), ALB + Target Group + listener HTTP + 2 attachments, IAM role + policy attachment + instance profile para SSM, 2 instancias EC2, CloudWatch Log Group + IAM role/policy + recurso `aws_flow_log`.
 
 ```bash
 terraform output
-# peering_app_db_id            = "pcx-0abc..."
-# peering_app_c_id             = "pcx-0def..."
-# app_vpc_id                   = "vpc-0aaa..."
-# db_vpc_id                    = "vpc-0bbb..."
-# c_vpc_id                     = "vpc-0ccc..."
-# test_instance_app_id         = "i-0aaa..."
-# test_instance_db_id          = "i-0bbb..."
-# test_instance_c_id           = "i-0ccc..."
-# test_instance_app_private_ip = "10.15.10.10"
-# test_instance_db_private_ip  = "10.16.10.10"
-# test_instance_c_private_ip   = "10.17.10.10"
+# alb_dns_name     = "lab19-alb-xxxxxxxxx.us-east-1.elb.amazonaws.com"
+# alb_sg_id        = "sg-0abc..."
+# app_sg_id        = "sg-0def..."
+# flow_log_group   = "/vpc/lab19/flow-logs"
 ```
 
 ---
 
 ## Verificación final
 
-### Estado de los peerings
-
-Verificar que ambos peerings están en estado `active`:
+### Verificar el patrón ALB -> EC2 (referencia por SG)
 
 ```bash
-aws ec2 describe-vpc-peering-connections \
-  --filters Name=tag:Project,Values=lab19 \
-  --query 'VpcPeeringConnections[].{Name: Tags[?Key==`Name`].Value|[0], ID: VpcPeeringConnectionId, Status: Status.Code}' \
-  --output table
-```
-
-Deberías ver 2 peerings en estado `active`.
-
-### Tablas de rutas
-
-Verificar que las rutas bidireccionales estan configuradas:
-
-```bash
-aws ec2 describe-route-tables \
-  --filters Name=tag:Project,Values=lab19 \
-  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], PeeringRoutes: Routes[?VpcPeeringConnectionId!=null].{Dest: DestinationCidrBlock, Peering: VpcPeeringConnectionId}}' \
-  --output json
-```
-
-Cada tabla de rutas debe tener rutas hacia los CIDRs de las VPCs con las que tiene peering.
-
-### Security Group de db
-
-Verificar que el SG de db permite MySQL (3306) desde el CIDR de app:
-
-```bash
-DB_SG=$(terraform output -raw db_sg_id)
+# Ver el SG de las instancias de aplicacion
+APP_SG=$(terraform output -raw app_sg_id)
 
 aws ec2 describe-security-groups \
-  --group-ids $DB_SG \
-  --query 'SecurityGroups[].IpPermissions[].{Port: FromPort, CIDR: IpRanges[].CidrIp}' \
+  --group-ids $APP_SG \
+  --query 'SecurityGroups[].IpPermissions[].{Port: FromPort, SourceSG: UserIdGroupPairs[].GroupId}' \
   --output json
 ```
 
-### Conectividad app ↔ db (debe funcionar)
+Deberías ver que el único origen permitido es el SG del ALB (no un CIDR).
+
+### Probar el ALB
 
 ```bash
-INSTANCE_APP=$(terraform output -raw test_instance_app_id)
+ALB_DNS=$(terraform output -raw alb_dns_name)
 
-aws ssm start-session --target $INSTANCE_APP
+# Esperar ~2 minutos a que el ALB este activo y los targets sanos
+curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS
+# 200
 ```
 
-Una vez dentro de la sesión:
+### Verificar la NACL
 
 ```bash
-# Ping a db (debe funcionar — hay peering + rutas + SG)
-ping -c 3 10.16.10.10
-
-# Verificar salida a Internet
-curl -s --max-time 5 https://checkip.amazonaws.com
-
-exit
-```
-
-### Conectividad vpc-c → db (debe fallar — no transitivo)
-
-Conectarse a la instancia en vpc-c via SSM (funciona gracias a los VPC Endpoints):
-
-```bash
-INSTANCE_C=$(terraform output -raw test_instance_c_id)
-
-aws ssm start-session --target $INSTANCE_C
-```
-
-Una vez dentro de la sesión:
-
-```bash
-# Ping a app (debe funcionar — hay peering directo)
-ping -c 3 10.15.10.10
-
-# Ping a db (debe FALLAR — no hay peering vpc-c ↔ db)
-ping -c 3 -W 2 10.16.10.10
-# 100% packet loss
-
-exit
-```
-
-Este es el momento clave del laboratorio: vpc-c puede hablar con app (peering directo), pero **no puede** hablar con db a través de app. El peering no es transitivo.
-
-También se puede verificar desde vpc-db:
-
-```bash
-INSTANCE_DB=$(terraform output -raw test_instance_db_id)
-
-aws ssm start-session --target $INSTANCE_DB
-```
-
-```bash
-# Ping a app (debe funcionar — hay peering directo)
-ping -c 3 10.15.10.10
-
-# Ping a vpc-c (debe FALLAR — no hay peering db ↔ vpc-c)
-ping -c 3 -W 2 10.17.10.10
-# 100% packet loss
-
-exit
-```
-
-### Si SSM no conecta
-
-Si `start-session` se queda colgado, esperar 2-3 minutos para que el SSM Agent se registre:
-
-```bash
-aws ssm describe-instance-information \
-  --filters Key=InstanceIds,Values=$(terraform output -raw test_instance_app_id) \
-  --query 'InstanceInformationList[].{ID: InstanceId, Ping: PingStatus}' \
+aws ec2 describe-network-acls \
+  --filters Name=tag:Project,Values=lab19 \
+  --query 'NetworkAcls[].Entries[?RuleAction==`deny`].{RuleNum: RuleNumber, CIDR: CidrBlock, Action: RuleAction}' \
   --output table
 ```
+
+Deberías ver la regla 50 con `deny` para la IP bloqueada.
+
+### Consultar VPC Flow Logs (tráfico REJECT)
+
+```bash
+LOG_GROUP=$(terraform output -raw flow_log_group)
+
+# Esperar 5-10 minutos para que los primeros logs aparezcan
+aws logs filter-log-events \
+  --log-group-name "$LOG_GROUP" \
+  --filter-pattern "REJECT" \
+  --max-items 10 \
+  --query 'events[].message' \
+  --output text
+```
+
+Cada línea muestra: interfaz, IP origen, IP destino, puerto origen, puerto destino, protocolo, paquetes, bytes, acción (REJECT).
 
 ---
 
 ## Retos
 
-### Reto 1 — Resolver la no transitividad con un peering directo
+### Reto 1 — WAF básico con NACL dinámica
 
-**Situación**: El equipo necesita que vpc-c acceda a la base de datos en vpc-db. Actualmente no puede porque el peering no es transitivo.
+**Situación**: El equipo de seguridad te proporciona una lista de IPs maliciosas que cambia semanalmente. Necesitas una NACL que bloquee todas esas IPs de forma mantenible, sin copiar y pegar reglas.
 
 **Tu objetivo**:
 
-1. Crear un tercer peering entre vpc-c y vpc-db (`aws_vpc_peering_connection`)
-2. Añadir las rutas bidireccionales en las tablas de rutas de vpc-c y vpc-db
-3. Actualizar el Security Group de db para permitir tráfico desde el CIDR de vpc-c en el puerto 3306
-4. Verificar que vpc-c puede hacer ping a db
-5. Reflexionar: ahora tienes 3 peerings para 3 VPCs. ¿Cuántos peerings necesitarías para 10 VPCs? (Respuesta: 45). ¿Y para 20? (190). Este es el problema que resuelve Transit Gateway.
+1. Cambiar la variable `blocked_ip` por una variable `blocked_ips` de tipo `list(string)` con al menos 3 IPs de ejemplo (usa rangos de documentación RFC 5737: `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`)
+2. Usar un bloque `dynamic "ingress"` en la NACL para generar una regla `deny` por cada IP de la lista, asignando números de regla consecutivos (50, 51, 52...)
+3. Las reglas de `allow` (HTTP, HTTPS, efímeros) deben mantener números de regla superiores (100+) para que los `deny` siempre tengan prioridad
+4. Verificar con `terraform plan` que se generan exactamente N reglas de deny (una por IP bloqueada)
+5. Añadir o quitar una IP de la lista y verificar que `terraform plan` solo muestra los cambios incrementales
 
 **Pistas**:
-- El tercer peering sigue el mismo patrón que los dos existentes (incluidos los bloques `requester` / `accepter` con `allow_remote_vpc_dns_resolution = true`).
-- Necesitas 2 rutas nuevas (vpc-c → db y db → vpc-c) y reglas en los SG de db **y** vpc-c (la verificación con `ping` requiere reglas en ambos sentidos; consulta el Paso 3).
-- **No tienes que tocar el SG de `app`**: ya admite ICMP desde `var.db_cidr` y `var.c_cidr` ([aws/main.tf:444](aws/main.tf#L444)), así que cualquier `ping` saliente desde db o vpc-c hacia app sigue funcionando sin cambios. Lo mismo para el SG de los endpoints SSM, que están limitados al CIDR de su propia VPC y no se ven afectados por este Reto.
-- La fórmula para peerings en una malla completa es N×(N-1)/2.
+- `dynamic "ingress"` puede iterar sobre una lista con índice: `for_each = var.blocked_ips`
+- Usa `50 + index(var.blocked_ips, ingress.value)` para generar números de regla consecutivos
+- La NACL completa se define en un solo recurso `aws_network_acl` con múltiples bloques `ingress`
 
 ---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Resolver la no transitividad con un peering directo</strong></summary>
+<summary><strong>Solución al Reto 1 — WAF básico con NACL dinámica</strong></summary>
 
-### Solución al Reto 1 — Resolver la no transitividad con un peering directo
+### Solución al Reto 1 — WAF básico con NACL dinámica
 
-#### Paso 1: Crear el tercer peering
+#### Paso 1: Cambiar la variable
 
-Mismo patrón que los dos existentes — incluidos los bloques `requester` / `accepter` para que la resolución DNS cross-peering también funcione entre vpc-c y vpc-db:
+En `variables.tf`, reemplaza `blocked_ip` por `blocked_ips`:
 
 ```hcl
-resource "aws_vpc_peering_connection" "c_to_db" {
-  vpc_id      = aws_vpc.c.id
-  peer_vpc_id = aws_vpc.db.id
-  auto_accept = true
+variable "blocked_ips" {
+  type        = list(string)
+  description = "Lista de CIDRs maliciosos a bloquear en la NACL"
+  default     = [
+    "192.0.2.0/24",     # RFC 5737 - TEST-NET-1
+    "198.51.100.0/24",  # RFC 5737 - TEST-NET-2
+    "203.0.113.0/24",   # RFC 5737 - TEST-NET-3
+  ]
+}
+```
 
-  requester {
-    allow_remote_vpc_dns_resolution = true
+#### Paso 2: Usar `dynamic "ingress"` en la NACL pública
+
+Reemplaza la regla 50 estática por un bloque dinámico que genera una regla `deny` por cada IP de la lista:
+
+```hcl
+resource "aws_network_acl" "public" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = [for k, s in aws_subnet.this : s.id if local.subnets[k].public]
+
+  # --- Reglas DENY dinamicas (una por IP bloqueada) ---
+  # Los numeros de regla empiezan en 50 y son consecutivos (50, 51, 52...)
+  # para que siempre tengan prioridad sobre las reglas ALLOW (100+).
+  dynamic "ingress" {
+    for_each = var.blocked_ips
+    content {
+      rule_no    = 50 + index(var.blocked_ips, ingress.value)
+      action     = "deny"
+      protocol   = "-1"
+      from_port  = 0
+      to_port    = 0
+      cidr_block = ingress.value
+    }
   }
-  accepter {
-    allow_remote_vpc_dns_resolution = true
+
+  # Regla 100: Permitir HTTP
+  ingress {
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 80
+    to_port    = 80
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla 110: Permitir HTTPS
+  ingress {
+    rule_no    = 110
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 443
+    to_port    = 443
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Regla 120: Puertos efimeros
+  ingress {
+    rule_no    = 120
+    action     = "allow"
+    protocol   = "tcp"
+    from_port  = 1024
+    to_port    = 65535
+    cidr_block = "0.0.0.0/0"
+  }
+
+  # Salida: Permitir todo
+  egress {
+    rule_no    = 100
+    action     = "allow"
+    protocol   = "-1"
+    from_port  = 0
+    to_port    = 0
+    cidr_block = "0.0.0.0/0"
   }
 
   tags = merge(local.common_tags, {
-    Name = "peering-c-db-${var.project_name}"
+    Name = "nacl-public-${var.project_name}"
   })
 }
 ```
 
-#### Paso 2: Rutas bidireccionales
+#### Paso 3: Aplicar y verificar
 
-```hcl
-resource "aws_route" "c_to_db" {
-  route_table_id            = aws_route_table.c.id
-  destination_cidr_block    = var.db_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.c_to_db.id
-}
-
-resource "aws_route" "db_to_c" {
-  route_table_id            = aws_route_table.db.id
-  destination_cidr_block    = var.c_cidr
-  vpc_peering_connection_id = aws_vpc_peering_connection.c_to_db.id
-}
+```bash
+terraform plan
+# Resultado esperado: la NACL pública aparece como
+#   ~ update in-place
+# en aws_network_acl.public. La línea de resumen final será similar a
+#   Plan: 0 to add, 1 to change, 0 to destroy.
+# El "1 to change" puede variar (ver nota más abajo).
 ```
 
-#### Paso 3: Actualizar el Security Group de db
-
-El peering y las rutas permiten que los paquetes lleguen a vpc-db, pero el Security Group es la última barrera. Actualmente, el SG de db solo permite ICMP y MySQL desde `var.app_cidr`. El tráfico desde vpc-c (`10.17.0.0/16`) será descartado por el SG aunque tenga peering y rutas.
-
-Hay que añadir reglas ingress para el CIDR de vpc-c. En el recurso `aws_security_group.db` de `main.tf`, añadir estos dos bloques `ingress` junto a los existentes:
-
-```hcl
-ingress {
-  from_port   = 3306
-  to_port     = 3306
-  protocol    = "tcp"
-  cidr_blocks = [var.c_cidr]
-  description = "MySQL desde VPC C"
-}
-
-ingress {
-  from_port   = -1
-  to_port     = -1
-  protocol    = "icmp"
-  cidr_blocks = [var.c_cidr]
-  description = "ICMP desde VPC C"
-}
-```
-
-Sin la regla ICMP, el ping de verificación fallaría aunque el peering y las rutas estén correctos — un error fácil de confundir con un problema de red cuando en realidad es el Security Group.
-
-También hay que actualizar el SG de vpc-c para permitir tráfico desde db. Actualmente solo acepta ICMP desde `var.app_cidr`. Si db necesita iniciar conexiones hacia vpc-c, el SG lo bloquearía. En el recurso `aws_security_group.c`, añadir:
-
-```hcl
-ingress {
-  from_port   = -1
-  to_port     = -1
-  protocol    = "icmp"
-  cidr_blocks = [var.db_cidr]
-  description = "ICMP desde VPC db"
-}
-```
-
-> **Recordatorio:** Los Security Groups son **stateful** — si vpc-c inicia un ping hacia db y el SG de db lo permite, la respuesta vuelve automáticamente sin necesidad de regla en el SG de vpc-c. Pero si db necesita **iniciar** tráfico hacia vpc-c, sí se necesita la regla explícita.
-
-#### Paso 4: Verificar
+> **Nota:** el `1 to change` es un valor *plausible* pero no garantizado. Antes había una sola regla `deny` (la 50) y ahora hay tres (50, 51, 52); Terraform lo modela como una mutación del recurso `aws_network_acl.public`, no como tres reglas independientes (los bloques `ingress` son inline en el recurso). Si la versión del provider o el orden de evaluación cambian la representación, podrías ver `Plan: 1 to add, 0 to change, 1 to destroy.` (recreación) en lugar de un update in-place. Lo importante es revisar el diff línea a línea: deben aparecer las 3 entradas `cidr_block = "192.0.2.0/24"`, `"198.51.100.0/24"` y `"203.0.113.0/24"` con `rule_no = 50, 51, 52` y `action = "deny"`.
 
 ```bash
 terraform apply
-
-INSTANCE_C=$(terraform output -raw test_instance_c_id)
-aws ssm start-session --target $INSTANCE_C
 ```
+
+Verifica que se generaron exactamente 3 reglas `deny`:
 
 ```bash
-# Ahora sí funciona — peering directo vpc-c ↔ db
-ping -c 3 10.16.10.10
-
-exit
+aws ec2 describe-network-acls \
+  --filters Name=tag:Project,Values=lab19 \
+  --query 'NetworkAcls[].Entries[?RuleAction==`deny` && !Egress].{RuleNum: RuleNumber, CIDR: CidrBlock}' \
+  --output table
 ```
 
-#### Reflexión: escalabilidad del peering
+#### Paso 4: Probar cambios incrementales
 
-| VPCs | Peerings necesarios para malla completa: n(n-1)/2 |
-|------|---------------------------------------------------|
-| 3 | 3 |
-| 5 | 10 |
-| 10 | 45 |
-| 20 | 190 |
-| 50 | 1.225 |
+Añade una IP a la lista y verifica que solo cambia lo necesario:
 
-Cada peering requiere 2 rutas + reglas de SG. Con 20 VPCs serían 190 peerings, 380 rutas y cientos de reglas de SG. Transit Gateway (lab20) resuelve esto con N attachments y propagación automática de rutas.
+```bash
+terraform plan -var='blocked_ips=["192.0.2.0/24","198.51.100.0/24","203.0.113.0/24","100.64.0.0/10"]'
+```
+
+Resultado esperado: el `plan` muestra `~ update in-place` sobre `aws_network_acl.public`, con un nuevo bloque `ingress` que añade la entrada `cidr_block = "100.64.0.0/10"` con `rule_no = 53` (= 50 + index 3 en la lista). Ninguna otra regla cambia. Tras `terraform apply`, confirma con `aws ec2 describe-network-acls` que ahora hay 4 entradas `deny` (50, 51, 52, 53):
+
+```bash
+aws ec2 describe-network-acls \
+  --filters Name=tag:Project,Values=lab19 \
+  --query 'NetworkAcls[].Entries[?RuleAction==`deny` && !Egress].{RuleNum: RuleNumber, CIDR: CidrBlock}' \
+  --output table
+```
 
 </details>
 
@@ -527,7 +481,7 @@ Cada peering requiere 2 rutas + reglas de SG. Con 20 VPCs serían 190 peerings, 
 
 ## Limpieza
 
-> **⚠️ Importante — coste acumulado:** este lab incluye **6 VPC Interface Endpoints** desplegados en 2 AZs (~0,01 USD/hora por endpoint y AZ → **~86,40 USD/mes**, sin contar el tráfico procesado), 1 NAT Gateway (~32 USD/mes) y 1 EIP. Si dejas el despliegue activo, la factura crece rápido. Ejecuta `terraform destroy` en cuanto termines la práctica (incluido el Reto, si lo has hecho).
+Cuando hayas terminado el laboratorio (incluido el Reto si lo has completado), destruye toda la infraestructura para evitar costes:
 
 ```bash
 terraform destroy
@@ -539,99 +493,30 @@ terraform destroy
 
 ## LocalStack
 
-Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
+Para ejecutar este laboratorio sin cuenta de AWS, consulta el directorio `localstack/`.
 
-LocalStack emula VPC Peering a nivel de API pero no ejecuta tráfico real. El objetivo es validar la estructura de Terraform.
-
----
-
-## Optimización opcional — Centralizar los endpoints SSM en vpc-app
-
-> **Nota:** esta optimización **no está integrada en el lab por razones
-> pedagógicas** (el foco es peering y la no transitividad; añadir Route 53
-> Private Hosted Zones diluiría el mensaje). Se documenta aquí como referencia
-> para entornos de producción.
-
-El lab despliega 6 VPC Interface Endpoints (3 servicios SSM × 2 VPCs sin
-Internet, en 2 AZs cada uno) con un coste de ~86,40 USD/mes. En producción es
-habitual **centralizar los endpoints en una única VPC "shared services"** y
-compartirlos vía peering, lo que reduce el coste a la mitad y simplifica la
-gestión.
-
-### Por qué no funciona "directo"
-
-Los Interface Endpoints tienen `private_dns_enabled = true`, que hace que
-*dentro de su VPC* el dominio `ssm.us-east-1.amazonaws.com` resuelva a la IP
-privada de la ENI. **Esa anulación de DNS es por VPC** y no se propaga por
-peering: si vpc-db hace `dig ssm.us-east-1.amazonaws.com`, recibe la IP
-*pública* del servicio AWS e intenta salir a Internet (que no tiene). El flag
-`allow_remote_vpc_dns_resolution = true` del peering tampoco lo arregla — solo
-afecta a DNS internos del par (hostnames de instancias, RDS, etc.), no al
-override del private DNS de los Interface Endpoints.
-
-### Patrón canónico (4 piezas)
-
-1. **3 Interface Endpoints solo en vpc-app**, con `private_dns_enabled = false`.
-2. **3 Route 53 Private Hosted Zones** (`ssm.us-east-1.amazonaws.com`,
-   `ssmmessages.us-east-1.amazonaws.com`, `ec2messages.us-east-1.amazonaws.com`),
-   cada una con un registro A *alias* hacia el DNS regional del endpoint
-   correspondiente.
-3. **Asociar las 3 PHZ a las 3 VPCs** (`aws_route53_zone_association` para
-   vpc-db y vpc-c; vpc-app entra por defecto al crearse la zona).
-4. **SG del endpoint** que permite HTTPS (443) desde los 3 CIDRs
-   (`var.app_cidr`, `var.db_cidr`, `var.c_cidr`).
-
-Flujo desde vpc-db:
-
-```
-dig ssm.us-east-1.amazonaws.com
-  → PHZ asociada a vpc-db → IP privada del endpoint en vpc-app (10.15.x.y)
-
-TCP 443 a 10.15.x.y
-  → ruta 10.15.0.0/16 → peering app-db → endpoint en vpc-app → AWS SSM
-```
-
-### Comparativa de coste
-
-| | Setup actual | Centralizado con PHZ |
-|---|---:|---:|
-| Endpoints (3 servicios × 2 AZs × 0.01 USD/h × 720 h) | 6 × 2 × 7,20 = **86,40 USD/mes** | 3 × 2 × 7,20 = **43,20 USD/mes** |
-| Route 53 PHZ ($0,50/zona-mes) | $0 | 3 × $0,50 = **1,50 USD/mes** |
-| **Total** | **86,40 USD/mes** | **44,70 USD/mes** |
-
-Ahorro: ~48 % (~42 USD/mes). A escala (más VPCs spoke), el ahorro se
-multiplica linealmente porque solo crece el número de asociaciones PHZ —
-no el número de endpoints.
-
-### Por qué se documenta pero no se aplica al lab
-
-- El lab tiene un objetivo pedagógico claro: **demostrar la no transitividad
-  del peering**. Centralizar endpoints añade Route 53 PHZ + asociaciones
-  + SG con múltiples CIDRs, conceptos que merecen un lab propio.
-- El patrón de endpoints duplicados también es válido en producción cuando
-  cada VPC pertenece a un dominio de seguridad distinto y no se quiere
-  exponer la VPC central al tráfico de los spokes.
-- Como ejercicio personal, el alumno motivado puede convertir esta nota en
-  un refactor — todo el código necesario está listado arriba.
+LocalStack emula Security Groups, NACLs y VPC Flow Logs a nivel de API, pero no ejecuta tráfico real. El objetivo es validar la estructura de Terraform y el plan de despliegue.
 
 ---
 
 ## Buenas prácticas aplicadas
 
-- **CIDR no solapantes entre VPCs**: el VPC Peering no funciona si los bloques CIDR de las VPCs se solapan. Planificar el espacio de direccionamiento desde el principio evita tener que redesplegar toda la infraestructura de red.
-- **Rutas explícitas en ambas tablas de rutas**: el peering es bidireccional pero las rutas no se crean automáticamente. Deben declararse en la tabla de rutas de cada VPC para que el tráfico pueda fluir en ambas direcciones.
-- **Aceptación automática con `auto_accept = true`**: solo funciona cuando ambas VPCs pertenecen a la misma cuenta. Para peerings cross-account, el proceso de aceptación debe ser manual o gestionado por un módulo dedicado.
-- **DNS resolution cross-peering (`allow_remote_vpc_dns_resolution = true`)**: el lab activa este flag en los bloques `requester` y `accepter` de cada `aws_vpc_peering_connection`. Permite que una instancia en una VPC resuelva los nombres DNS privados de la VPC peer (típico caso: una EC2 en `vpc-app` resolviendo el endpoint privado de un RDS en `vpc-db`). Sin estos bloques solo funciona la conectividad por IP, lo que impide usar nombres estables como `mydb.cluster-xxx.us-east-1.rds.amazonaws.com`.
-- **Seguridad por CIDR de la VPC peer en los Security Groups**: en VPC Peering, los Security Groups se referencian por **CIDR** de la VPC remota (`cidr_blocks = [var.app_cidr]`), no por ID de SG. Es lo que hace este lab. Existe la posibilidad de **referenciar un SG remoto** (`security_groups = [<sg-id-remoto>]`), pero solo funciona en peerings same-region y requiere que esté explícitamente habilitado en ambos lados; además, no escala bien a muchas VPCs. Como recomendación: usar CIDR es portable y suficientemente granular si los CIDRs están bien planificados; reservar la referencia por SG remoto para casos concretos en los que necesites filtrar por *qué workload* hace la conexión, no por *desde qué red* viene.
-- **Documentar la no transitividad**: en arquitecturas con tres o más VPCs, el equipo debe saber que VPC-A puede hablar con VPC-B y VPC-C pero que VPC-B no puede hablar con VPC-C a través de VPC-A. Para transitividad, usar Transit Gateway.
+- **Referencia entre Security Groups en lugar de CIDR**: la regla `source_security_group_id` del SG de EC2 que solo permite tráfico del SG del ALB es más segura y mantenible que abrir un rango CIDR amplio, ya que escala automáticamente con las IPs del ALB.
+- **NACLs como defensa en profundidad**: los Security Groups son stateful (las respuestas se permiten automáticamente), las NACLs son stateless. Usar ambas capas proporciona una segunda línea de defensa ante configuraciones incorrectas de Security Groups.
+- **Bloques `dynamic` para reglas de NACL**: las NACLs requieren números de regla y muchas entradas repetitivas. El bloque `dynamic` genera las reglas desde una lista de objetos, reduciendo la duplicación y facilitando el mantenimiento.
+- **VPC Flow Logs para diagnóstico**: habilitar Flow Logs permite diagnosticar tráfico denegado sin necesitar acceso a las instancias. El patrón `REJECT` en los logs indica un bloqueo de SG o NACL.
+- **Rango de puertos efímeros en NACLs de salida**: las NACLs deben permitir el rango de puertos efímeros (1024-65535) en las reglas de salida de las subnets que reciben conexiones TCP entrantes, o el handshake de tres vías falla.
+- **Reglas de Security Group como recursos independientes (`aws_vpc_security_group_ingress_rule` / `aws_vpc_security_group_egress_rule`)**: el lab declara los SGs vacíos y gestiona cada regla en su propio recurso, el patrón recomendado por HashiCorp desde el provider AWS 5.x sobre el antiguo `aws_security_group_rule` (que sigue funcionando, pero queda como modelo legado). Ventajas: (1) cada regla tiene su propio address en el state y se puede importar / destruir / aplicar `lifecycle` por separado; (2) evita el drift cuando alguien añade reglas fuera de Terraform, ya que el SG en sí no las controla; (3) rompe dependencias circulares cuando dos SGs se referencian entre sí — los SGs se crean primero (vacíos) y las reglas después.
 
 ---
 
 ## Recursos
 
-- [AWS: VPC Peering](https://docs.aws.amazon.com/vpc/latest/peering/what-is-vpc-peering.html)
-- [AWS: VPC Peering Limitations](https://docs.aws.amazon.com/vpc/latest/peering/vpc-peering-basics.html#vpc-peering-limitations)
-- [AWS: Invalid VPC Peering Configurations](https://docs.aws.amazon.com/vpc/latest/peering/vpc-peering-basics.html)
-- [AWS: Updating Route Tables for Peering](https://docs.aws.amazon.com/vpc/latest/peering/vpc-peering-routing.html)
-- [Terraform: `aws_vpc_peering_connection`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_peering_connection)
-- [Terraform: `aws_route`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route)
+- [AWS: Security Groups](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html)
+- [AWS: Network ACLs](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html)
+- [AWS: VPC Flow Logs](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html)
+- [AWS: Security Group Referencing](https://docs.aws.amazon.com/vpc/latest/userguide/security-group-rules.html)
+- [Terraform: `dynamic` blocks](https://developer.hashicorp.com/terraform/language/expressions/dynamic-blocks)
+- [Terraform: `aws_security_group`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group)
+- [Terraform: `aws_network_acl`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/network_acl)
+- [Terraform: `aws_flow_log`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/flow_log)

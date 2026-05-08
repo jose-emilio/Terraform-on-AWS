@@ -1,435 +1,484 @@
-# Laboratorio 12 — Gestión de Identidades y Acceso Seguro para EC2
+# Laboratorio 12 — Gestión de Drift y Disaster Recovery (3-2-1)
 
 ![Terraform on AWS](../../images/lab-banner.svg)
 
 
-[← Módulo 4 — Seguridad e IAM con Terraform](../../modulos/modulo-04/README.md)
+[← Módulo 3 — Gestión del Estado (State)](../../modulos/modulo-03/README.md)
 
 
 ## Visión general
 
-Las credenciales estáticas (Access Key ID + Secret Access Key) son el vector de compromiso más frecuente en AWS. Este laboratorio elimina ese riesgo implementando el ciclo completo de identidad temporal para instancias EC2:
-
-1. Un **grupo IAM** y un **usuario** modelan los accesos del equipo de desarrollo.
-2. Un **rol IAM** con una **Trust Policy** delega la identidad exclusivamente al servicio EC2.
-3. Un **Instance Profile** actúa como contenedor que une el rol con la instancia.
-4. La instancia obtiene **credenciales temporales automáticas** sin intervención humana.
-
-## Objetivos
-
-- Comprender la diferencia entre usuarios, grupos y roles en IAM.
-- Entender por qué la Trust Policy controla QUIÉN puede asumir un rol.
-- Implementar `aws_iam_instance_profile` como puente entre un rol IAM y EC2.
-- Verificar que las credenciales temporales se inyectan vía IMDSv2.
-- Practicar el acceso sin SSH usando SSM Session Manager.
-
-## Requisitos previos
-
-- **Terraform >= 1.10** instalado.
-- AWS CLI configurado con perfil `default`.
-- Plugin SSM para la AWS CLI: `aws ssm start-session` disponible.
-- Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
-
-## Arquitectura
-
-![IAM users + grupo + role con Trust Policy → Instance Profile → EC2 con IMDSv2 obligatorio + STS](arch/diagrama.svg)
-
-El usuario `dev-01` representa a una persona (credenciales estáticas) miembro del grupo `developers`. El `ec2-role` tiene Trust Policy con principal `ec2.amazonaws.com` (solo el servicio EC2 puede asumirlo). El `instance_profile` es el conector EC2 ↔ Role (EC2 no usa roles directamente). La instancia obtiene credenciales temporales firmadas por STS a través de IMDSv2 (con `http_tokens = required` para mitigar SSRF) — sin par de claves SSH, acceso exclusivo por SSM Session Manager.
+Aprender a detectar y gestionar el **drift de infraestructura** (divergencia entre el estado deseado y la realidad) y a aplicar una estrategia de **Disaster Recovery 3-2-1** para recuperar el estado de Terraform desde el versionado de S3.
 
 ## Conceptos clave
 
-### Usuarios, Grupos y Roles — ¿cuándo usar cada uno?
+| Concepto | Descripción |
+|---|---|
+| **Drift** | Divergencia entre el estado registrado en `terraform.tfstate` y la infraestructura real |
+| **`terraform plan`** | Detecta drift al comparar estado con la realidad (refresca antes de calcular el plan) |
+| **`terraform apply -refresh-only`** | Actualiza el estado para reflejar la realidad *sin* modificar infraestructura |
+| **Terraform gana** | Estrategia de reconciliación: aplicar para revertir los cambios manuales |
+| **La realidad gana** | Estrategia de reconciliación: actualizar el código para que refleje el cambio manual |
+| **Versioning S3** | Cada `terraform apply` genera una nueva versión del `.tfstate`; permite restaurar versiones anteriores |
+| **Disaster Recovery 3-2-1** | 3 copias, 2 medios distintos, 1 offsite — el S3 con versioning proporciona la copia offsite |
 
-| Entidad | Representa | Credenciales | Caso de uso |
-|---------|------------|--------------|-------------|
-| `aws_iam_user` | Persona o sistema externo | Estáticas (Access Keys) | CI/CD externos a AWS, personas |
-| `aws_iam_group` | Colección de usuarios | — | Gestión centralizada de permisos |
-| `aws_iam_role` | Identidad asumible temporalmente | Temporales (STS) | Servicios AWS, cuentas cruzadas |
+## Requisitos previos
 
-### Trust Policy — ¿quién puede asumir el rol?
-
-La Trust Policy es la parte más importante de un rol. Responde a: **"¿Quién tiene permiso para solicitar credenciales temporales para este rol?"**
-
-```json
-{
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Service": "ec2.amazonaws.com" },
-    "Action": "sts:AssumeRole"
-  }]
-}
-```
-
-Con `Principal = "ec2.amazonaws.com"` solo el servicio EC2 puede asumir el rol. Ni un usuario humano ni otro servicio de AWS puede hacerlo sin modificar esta política.
-
-### Instance Profile — el "conector" EC2 ↔ Rol
-
-EC2 no puede usar un rol IAM directamente. Necesita un `aws_iam_instance_profile` como intermediario:
-
-```
-EC2 instance  →  Instance Profile  →  IAM Role  →  Permisos
-```
-
-Una instancia solo puede tener **un** Instance Profile (y el profile puede contener **un** rol).
-
-### IMDSv2 y credenciales temporales
-
-Con `http_tokens = "required"`, la instancia exige un token de sesión antes de devolver metadatos:
+- Laboratorio 02 completado — el bucket `terraform-state-labs-<ACCOUNT_ID>` debe existir
+- AWS CLI configurado con credenciales válidas
+- **Terraform >= 1.10**
 
 ```bash
-# 1. Obtener token (válido 6 horas)
-TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token \
-  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-
-# 2. Leer nombre del rol
-ROLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-  http://169.254.169.254/latest/meta-data/iam/security-credentials/)
-
-# 3. Leer credenciales temporales del rol
-curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-  http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE
+# Exportar el Account ID y nombre del bucket para usar en los comandos
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export BUCKET="terraform-state-labs-${ACCOUNT_ID}"
+echo "Bucket: $BUCKET"
 ```
-
-El resultado incluye `AccessKeyId`, `SecretAccessKey`, `Token` y `Expiration`. EC2 las renueva automáticamente antes de la expiración.
 
 ## Estructura del proyecto
 
 ```
 lab-12/
-├── README.md
+├── README.md                    ← Esta guía
 ├── arch/
-│   └── diagrama.svg       # Diagrama de arquitectura (referenciado en este README)
-├── user_data.sh           # Script de verificación (ejecutado al arrancar EC2)
+│   └── diagrama.svg             ← Diagrama de arquitectura (referenciado en este README)
 ├── aws/
-│   ├── providers.tf       # Provider AWS + backend S3
-│   ├── variables.tf       # Variables: project, region, instance_type
-│   ├── main.tf            # Todos los recursos IAM y EC2
-│   ├── outputs.tf         # Outputs: ARNs, IDs, comandos de verificación
-│   └── aws.s3.tfbackend   # Configuración del backend remoto
+│   ├── providers.tf             ← Backend S3 parcial
+│   ├── variables.tf
+│   ├── main.tf                  ← VPC + Security Group con tags explícitos
+│   ├── outputs.tf
+│   └── aws.s3.tfbackend         ← Parámetros del backend (sin bucket)
 └── localstack/
-    ├── README.md          # Guía de despliegue en LocalStack
-    ├── providers.tf       # Provider con endpoints LocalStack
+    ├── README.md                ← Guía específica para LocalStack
+    ├── providers.tf
     ├── variables.tf
     ├── main.tf
-    └── outputs.tf
+    ├── outputs.tf
+    └── localstack.s3.tfbackend  ← Backend completo para LocalStack
 ```
 
-## Despliegue en AWS real
+## Arquitectura
+
+![Drift detection (refresh/plan) + DR 3-2-1: restaurar tfstate desde versionado S3](arch/diagrama.svg)
+
+Dos fases:
+
+- **Detección de drift:** `terraform plan` compara el state contra AWS real. Cuando difieren (alguien editó tags por consola), Terraform muestra el diff. Estrategia A "Terraform gana" — `apply` revierte el cambio. Estrategia B "la realidad gana" — `apply -refresh-only` o editar el código para reconciliar.
+- **DR 3-2-1 sobre el tfstate:** el versionado S3 del lab-02 mantiene la historia de cada cambio. Si el tfstate se corrompe, `aws s3api list-object-versions` localiza la última versión sana y `get-object --version-id` la restaura. Cross-Region Replication (opcional) cubre el "1 off-site".
+
+## Despliegue inicial
 
 ```bash
 cd labs/lab-12/aws
 
 terraform init \
   -backend-config=aws.s3.tfbackend \
-  -backend-config="bucket=terraform-state-labs-$(aws sts get-caller-identity --query Account --output text)"
+  -backend-config="bucket=$BUCKET"
 
-terraform plan
 terraform apply
 ```
 
-## Despliegue en LocalStack
-
-Consulta [localstack/README.md](localstack/README.md) para instrucciones de
-despliegue local con LocalStack y sus limitaciones respecto a AWS real.
-
-## Verificación final
-
-### 1. Confirmar recursos IAM creados
+Anota los outputs, los necesitarás en los pasos siguientes:
 
 ```bash
-# Listar los recursos del laboratorio
-aws iam get-group --group-name lab12-developers
-aws iam get-user --user-name lab12-dev-01
-aws iam get-role --role-name lab12-ec2-role
-aws iam get-instance-profile --instance-profile-name lab12-ec2-profile
+terraform output
+# vpc_id            = "vpc-0abc123..."
+# security_group_id = "sg-0def456..."
+# security_group_name = "app-lab12"
 ```
 
-### 2. Confirmar que dev-01 pertenece al grupo
+Verifica el estado almacenado en S3:
 
 ```bash
-aws iam list-groups-for-user --user-name lab12-dev-01
+aws s3 ls s3://$BUCKET/lab12/
+# 2024-01-15 10:00:00       1234 terraform.tfstate
 ```
 
-Resultado esperado: `lab12-developers` aparece en la lista.
+---
 
-### 3. Conectarse a la instancia via SSM
+## Fase 1 — Detección de Drift
+
+El drift ocurre cuando alguien modifica infraestructura fuera de Terraform (consola web, CLI, otro proceso). Terraform no lo sabe hasta que ejecuta un `plan` o `apply`.
+
+### Introducir drift manualmente
+
+Obtén el ID del security group desplegado:
 
 ```bash
-# Obtener el Instance ID del output de Terraform
-INSTANCE_ID=$(terraform output -raw instance_id)
-
-# Abrir sesión interactiva sin SSH
-aws ssm start-session --target $INSTANCE_ID
+SG_ID=$(terraform output -raw security_group_id)
+echo "Security Group: $SG_ID"
 ```
 
-> La instancia puede tardar 1-2 minutos en estar disponible para SSM
-> tras el arranque.
-
-### 4. Leer el log de verificación (dentro de la sesión SSM)
+**Cambio 1: Modificar un tag** (simula un cambio "legítimo" pero no registrado en el código):
 
 ```bash
-cat /var/log/lab12-verify.log
+aws ec2 create-tags \
+  --resources $SG_ID \
+  --tags Key=Environment,Value=production
 ```
 
-Resultado esperado:
+**Cambio 2: Abrir un puerto SSH** (simula un cambio accidental o de emergencia):
+
+```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id $SG_ID \
+  --protocol tcp \
+  --port 22 \
+  --cidr 0.0.0.0/0
+```
+
+### Detectar el drift con Terraform
+
+```bash
+terraform plan
+```
+
+Terraform actualizará automáticamente su vista de la realidad y mostrará las diferencias:
 
 ```
-=== Lab 12 — Verificación de Identidad IAM ===
-Timestamp: 2025-XX-XXTXX:XX:XXZ
+  # aws_security_group.app will be updated in-place
+  ~ resource "aws_security_group" "app" {
+        id                     = "sg-xxxxxxxxxxx"
+        name                   = "app-lab12"
+      ~ tags                   = {
+          ~ "Environment" = "production" -> "lab"
+            "ManagedBy"   = "terraform"
+            "Name"        = "app-lab12"
+        }
+      ~ tags_all               = {
+          ~ "Environment" = "production" -> "lab"
+            # (2 unchanged elements hidden)
+        }
+        # (8 unchanged attributes hidden)
+    }
 
---- [1] Obteniendo token IMDSv2 ---
-Token IMDSv2 obtenido correctamente.
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
 
---- [2] Nombre del rol IAM en el Instance Profile ---
-Rol activo: lab12-ec2-role
+> **Nota:** El plan solo muestra el drift del tag. La regla de ingreso del puerto 22 **no aparece** porque `aws_security_group` únicamente reconcilia los atributos declarados en el código: al no haber ningún bloque `ingress {}` definido, Terraform no gestiona las reglas de ingreso y las ignora por completo. Este comportamiento es intencional: Terraform solo es responsable de lo que tú le dices que gestione.
 
---- [3] Credenciales temporales (STS) ---
-{
-  "Code": "Success",
-  "Type": "AWS-HMAC",
-  "AccessKeyId": "ASIA...",
-  "SecretAccessKey": "...",
-  "Token": "...",
-  "Expiration": "2025-XX-XXTXX:XX:XXZ",
-  "LastUpdated": "..."
+---
+
+## Fase 2 — Reconciliación
+
+Ante un drift, tienes dos estrategias posibles. La elección depende de si el cambio manual fue un error o una decisión válida que hay que incorporar al código.
+
+### Estrategia A: "Terraform gana" — Revertir al estado deseado
+
+Úsala cuando el cambio manual fue un **error** o no autorizado.
+
+```bash
+terraform apply
+```
+
+Terraform revertirá el tag `Environment` a `"lab"`. La regla de ingreso del puerto 22 **no será eliminada**: como no hay bloques `ingress` en el código, Terraform no la gestiona y la ignora.
+
+Para eliminar la regla fuera de Terraform, usa AWS CLI:
+
+```bash
+aws ec2 revoke-security-group-ingress \
+  --group-id $SG_ID \
+  --protocol tcp \
+  --port 22 \
+  --cidr 0.0.0.0/0
+```
+
+Tras la revocación, la infraestructura coincide exactamente con el código.
+
+### Estrategia B: "La realidad gana" — Actualizar el código
+
+Úsala cuando el cambio manual fue **válido** y hay que mantenerlo.
+
+**Paso 1**: Actualiza el estado de Terraform para que refleje la realidad sin tocar infraestructura:
+
+```bash
+terraform apply -refresh-only
+```
+
+Terraform mostrará los cambios detectados y pedirá confirmación para actualizar *solo el estado*:
+
+```
+~ aws_security_group.app
+  ~ tags
+    ~ Environment = "lab" -> "production"
+  + ingress { ... puerto 22 ... }
+
+Would you like to update the Terraform state to reflect these detected changes?
+  Terraform will write these changes to the state without modifying your infrastructure.
+  As a result, your Terraform plan may differ from this plan.
+
+  Only 'yes' will be accepted to confirm.
+```
+
+**Paso 2**: Ahora el código y el estado no coinciden. Actualiza `main.tf` para incorporar el cambio que quieres conservar:
+
+```hcl
+# En main.tf, actualiza el tag del grupo de seguridad:
+tags = {
+  Name        = "app-lab12"
+  Environment = "production"   # ← incorporamos el cambio válido
+  ManagedBy   = "terraform"
 }
-
---- [4] aws sts get-caller-identity ---
-{
-  "UserId": "AROA...:i-0abc...",
-  "Account": "123456789012",
-  "Arn": "arn:aws:sts::123456789012:assumed-role/lab12-ec2-role/i-0abc..."
-}
-
---- [5] aws ec2 describe-instances (lectura) ---
-Número de reservaciones visibles: 1
 ```
 
-Observaciones clave:
-- El `Arn` confirma que la instancia opera con el rol `lab12-ec2-role`.
-- El `UserId` tiene formato `AROA...:i-0...` (rol asumido + ID de sesión).
-- Las credenciales incluyen un `Token` de sesión — son temporales.
-
-### 5. Verificar la Trust Policy del rol
+**Paso 3**: Aplica. Como el tag ya coincide entre código y realidad, Terraform no hará ningún cambio:
 
 ```bash
-aws iam get-role --role-name lab12-ec2-role \
-  --query 'Role.AssumeRolePolicyDocument' --output json
+terraform apply
+# No changes. Your infrastructure matches the configuration.
 ```
 
-Confirma que `Principal.Service = "ec2.amazonaws.com"`.
-
-### 6. Verificar membresía del grupo desde tu terminal local
+La regla de ingreso del puerto 22 **sigue en AWS** y también está registrada en el estado (desde el paso 1). Como el código no declara bloques `ingress`, Terraform no la considera un drift a resolver. Para eliminarla usa CLI:
 
 ```bash
-aws iam list-groups-for-user --user-name lab12-dev-01 \
-  --query 'Groups[].GroupName'
+aws ec2 revoke-security-group-ingress \
+  --group-id $SG_ID \
+  --protocol tcp \
+  --port 22 \
+  --cidr 0.0.0.0/0
 ```
+
+> **Lección clave:** Terraform solo gestiona lo que declaras en el código. `apply -refresh-only` actualiza el estado para reflejar la realidad, pero no amplía el alcance de gestión de Terraform: si un atributo no está declarado en el código, seguirá fuera del control de Terraform incluso después del `refresh-only`.
+
+---
+
+## Fase 3 — Disaster Recovery: Restaurar Estado desde S3
+
+Simularás la corrupción o pérdida del archivo de estado y lo recuperarás usando el versionado de S3.
+
+### Listar versiones del archivo de estado
+
+Antes de corromper nada, lista las versiones disponibles:
+
+```bash
+aws s3api list-object-versions \
+  --bucket $BUCKET \
+  --prefix lab12/terraform.tfstate \
+  --query 'Versions[*].[VersionId,LastModified,IsLatest]' \
+  --output table
+```
+
+Deberías ver al menos una versión (la creada por el `apply` inicial). Guarda el `VersionId` de la versión sana:
+
+```bash
+GOOD_VERSION=$(aws s3api list-object-versions \
+  --bucket $BUCKET \
+  --prefix lab12/terraform.tfstate \
+  --query 'Versions[?IsLatest==`true`].VersionId' \
+  --output text)
+echo "Versión sana: $GOOD_VERSION"
+```
+
+### Simular la corrupción del estado
+
+```bash
+# Sobreescribir el estado con contenido inválido (no es JSON parseable)
+echo 'CORRUPTED' | \
+  aws s3 cp - s3://$BUCKET/lab12/terraform.tfstate
+```
+
+> **Por qué `CORRUPTED` y no, por ejemplo,  `{"version":4,"corrupted":true}`:** este último es JSON válido con la versión actual del schema, así que Terraform lo aceptaría como un state vacío y respondería con un plan que recrearía toda la infraestructura — más peligroso que un error claro. Un payload no-JSON garantiza un fallo inmediato en la carga del estado.
+
+Verifica que Terraform ya no puede leer el estado:
+
+```bash
+terraform plan
+# ╷
+# │ Error: Unsupported state file format
+# │
+# │ The state file could not be parsed as JSON: syntax error at byte offset 1.
+# ╵
+# ╷
+# │ Error: Unsupported state file format
+# │
+# │ The state file does not have a "version" attribute, which is required to identify the format version.
+# ╵
+```
+
+### Restaurar el estado sano desde S3
+
+Usa `s3api copy-object` para restaurar la versión anterior sin descargar el archivo:
+
+```bash
+aws s3api copy-object \
+  --bucket $BUCKET \
+  --copy-source "$BUCKET/lab12/terraform.tfstate?versionId=$GOOD_VERSION" \
+  --key lab12/terraform.tfstate
+```
+
+### Verificar la restauración
+
+```bash
+terraform plan
+# No changes. Your infrastructure matches the configuration.
+```
+
+El estado está restaurado. Terraform puede operar con normalidad.
+
+> **La estrategia 3-2-1 en la práctica:**
+> - **3 copias**: estado local (si existe), S3 (versión actual), S3 (versiones anteriores)
+> - **2 medios**: disco local + almacenamiento en la nube (S3)
+> - **1 offsite**: S3 está en AWS, físicamente separado de tu máquina local
+
+---
 
 ## Retos
 
-### Reto 1 — Política inline en el rol EC2
+### Reto 1 — Drift Selectivo con `apply -refresh-only`
 
-Añade al rol EC2 una **política inline** (`aws_iam_role_policy`) que permita
-únicamente `s3:ListAllMyBuckets` con `Resource = "*"`. Las políticas inline son
-específicas del rol y no pueden compartirse con otros roles.
+Ahora que conoces las dos estrategias de reconciliación, enfrenta un escenario más realista:
 
-**Recurso a añadir en `main.tf`:**
+**Situación**: Tu equipo introduce dos cambios manuales simultáneos en el security group:
+1. Cambian el tag `Environment` de `"lab"` a `"staging"` — cambio **válido**, acordado en reunión
+2. Añaden el tag `Owner = "equipo-de-ops"` — cambio **accidental**, no debe quedar en el código
 
-```hcl
-resource "aws_iam_role_policy" "ec2_s3_list" {
-  # completar...
-}
-```
+**Tu objetivo**: Reconciliar la infraestructura de forma que:
+- El tag `Environment = "staging"` quede **en el código** y en la infraestructura
+- El tag `Owner = "equipo-de-ops"` sea **eliminado** de la infraestructura
+- Al finalizar, `terraform plan` muestre `No changes`
 
-#### Prueba
+**Restricciones**:
+- No puedes hacer `terraform destroy` y volver a aplicar
+- Debes usar `terraform apply -refresh-only` en algún punto del proceso
 
-Tras ejecutar `terraform apply`, abre una sesión SSM en la instancia y verifica:
+**Pistas**:
+- ¿En qué orden debes ejecutar `refresh-only` y editar el código?
+- ¿Qué muestra `terraform plan` antes y después del `refresh-only`?
+- ¿Cómo sabes que has terminado correctamente?
 
-```bash
-# 1. Confirmar que la política inline existe en el rol
-aws iam list-role-policies --role-name lab12-ec2-role \
-  --query 'PolicyNames'
-# Esperado: ["lab12-ec2-s3-list"]
-
-# 2. Listar buckets S3 desde la instancia (usa las credenciales temporales del rol)
-aws s3 ls
-# Esperado: listado de buckets sin error de autorización
-
-# 3. Confirmar que la acción está explícitamente permitida
-aws iam simulate-principal-policy \
-  --policy-source-arn $(aws iam get-role --role-name lab12-ec2-role --query 'Role.Arn' --output text) \
-  --action-names s3:ListAllMyBuckets \
-  --query 'EvaluationResults[].EvalDecision'
-# Esperado: ["allowed"]
-```
-
-### Reto 2 — Permissions Boundary sobre el rol EC2
-
-Los **Permission Boundaries** limitan el máximo de permisos que un rol puede
-tener, independientemente de las políticas adjuntas. Son el mecanismo para
-evitar escalada de privilegios en entornos con múltiples equipos.
-
-Crea una política gestionada que permita únicamente `s3:*`, `ec2:Describe*` y
-las acciones necesarias para SSM, y asígnala como `permissions_boundary` del
-rol EC2.
-
-```hcl
-resource "aws_iam_policy" "boundary" {
-  name = "${var.project}-ec2-boundary"
-  # ...
-}
-
-resource "aws_iam_role" "ec2" {
-  # ... (añadir)
-  permissions_boundary = aws_iam_policy.boundary.arn
-}
-```
-
-> El Permissions Boundary no concede permisos: solo establece el techo.
-> El permiso efectivo es la intersección entre las políticas adjuntas y el boundary.
-
-#### Prueba
-
-Tras ejecutar `terraform apply`, verifica desde tu terminal local y desde la instancia:
-
-```bash
-# 1. Confirmar que el boundary está asignado al rol
-aws iam get-role --role-name lab12-ec2-role \
-  --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' --output text
-# Esperado: arn:aws:iam::<ACCOUNT_ID>:policy/lab12-ec2-boundary
-
-# 2. Comprobar que sts:GetCallerIdentity sigue funcionando (dentro del boundary)
-# Ejecutar desde la sesión SSM en la instancia:
-aws sts get-caller-identity
-# Esperado: JSON con UserId, Account y Arn del rol asumido
-
-# 3. Simular el efecto del boundary sobre una acción permitida
-aws iam simulate-principal-policy \
-  --policy-source-arn $(aws iam get-role --role-name lab12-ec2-role --query 'Role.Arn' --output text) \
-  --action-names ec2:DescribeInstances \
-  --query 'EvaluationResults[].EvalDecision'
-# Esperado: ["allowed"]  (acción dentro del boundary Y de las políticas adjuntas)
-
-# 4. Simular el efecto del boundary sobre una acción fuera de él
-aws iam simulate-principal-policy \
-  --policy-source-arn $(aws iam get-role --role-name lab12-ec2-role --query 'Role.Arn' --output text) \
-  --action-names iam:CreateUser \
-  --query 'EvaluationResults[].EvalDecision'
-# Esperado: ["implicitDeny"]  (bloqueada por el boundary aunque hubiera política que la concediera)
-```
+---
 
 ## Soluciones
 
 <details>
-<summary><strong>Solución al Reto 1 — Política inline S3 ListAllMyBuckets</strong></summary>
+<summary><strong>Solución al Reto 1 — Drift Selectivo con `apply -refresh-only`</strong></summary>
 
-### Solución al Reto 1 — Política inline S3 ListAllMyBuckets
+### Solución al Reto 1 — Drift Selectivo con `apply -refresh-only`
 
-```hcl
-resource "aws_iam_role_policy" "ec2_s3_list" {
-  name = "${var.project}-ec2-s3-list"
-  role = aws_iam_role.ec2.id
+#### Paso 1: Introducir los dos drifts
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid      = "S3ListBuckets"
-      Effect   = "Allow"
-      Action   = "s3:ListAllMyBuckets"
-      Resource = "*"
-    }]
-  })
-}
+```bash
+SG_ID=$(terraform output -raw security_group_id)
+
+# Drift 1: tag válido
+aws ec2 create-tags \
+  --resources $SG_ID \
+  --tags Key=Environment,Value=staging
+
+# Drift 2: tag accidental
+aws ec2 create-tags \
+  --resources $SG_ID \
+  --tags Key=Owner,Value=equipo-de-ops
 ```
 
-</details>
+#### Paso 2: Verificar el drift
 
-<details>
-<summary><strong>Solución al Reto 2 — Permissions Boundary</strong></summary>
+```bash
+terraform plan
+```
 
-### Solución al Reto 2 — Permissions Boundary
+El plan muestra ambos cambios de tags en `aws_security_group.app`:
 
-```hcl
-resource "aws_iam_policy" "boundary" {
-  name        = "${var.project}-ec2-boundary"
-  description = "Techo de permisos para el rol EC2 del lab12"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid      = "AllowS3"
-        Effect   = "Allow"
-        Action   = "s3:*"
-        Resource = "*"
-      },
-      {
-        Sid      = "AllowEC2Describe"
-        Effect   = "Allow"
-        Action   = ["ec2:Describe*", "ec2:Get*"]
-        Resource = "*"
-      },
-      {
-        Sid      = "AllowSTS"
-        Effect   = "Allow"
-        Action   = "sts:GetCallerIdentity"
-        Resource = "*"
-      },
-      {
-        Sid    = "AllowSSM"
-        Effect = "Allow"
-        Action = [
-          "ssm:UpdateInstanceInformation",
-          "ssmmessages:*",
-          "ec2messages:*"
-        ]
-        Resource = "*"
+```
+~ resource "aws_security_group" "app" {
+    ~ tags = {
+        ~ "Environment" = "staging" -> "lab"
+        + "Owner"       = "equipo-de-ops" -> null
       }
-    ]
-  })
-}
+  }
 
-resource "aws_iam_role" "ec2" {
-  name               = "${var.project}-ec2-role"
-  path               = "/"
-  assume_role_policy = data.aws_iam_policy_document.ec2_trust.json
-  description        = "Rol para instancias EC2 del Lab12"
-  permissions_boundary = aws_iam_policy.boundary.arn   # <-- añadido
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
 
-  tags = merge(local.tags, { Name = "${var.project}-ec2-role" })
+Terraform quiere revertir `Environment` a `"lab"` y eliminar `Owner` (porque ninguno de los dos está en el código).
+
+#### Paso 3: Capturar el estado real con refresh-only
+
+```bash
+terraform apply -refresh-only
+```
+
+Confirma con `yes`. Ahora el estado refleja la realidad: `Environment = "staging"` y `Owner = "equipo-de-ops"`.
+
+#### Paso 4: Actualizar el código para el cambio válido
+
+Edita `aws/main.tf`, añade `Environment = "staging"` pero **no** añadas `Owner`:
+
+```hcl
+tags = {
+  Name        = "app-lab12"
+  Environment = "staging"    # ← incorporamos el cambio válido
+  ManagedBy   = "terraform"
 }
 ```
 
+#### Paso 5: Aplicar para revertir solo el cambio accidental
+
+```bash
+terraform plan
+```
+
+Ahora el plan muestra *únicamente* la eliminación del tag `Owner` (el tag `Environment` ya coincide entre código y realidad):
+
+```
+~ resource "aws_security_group" "app" {
+    ~ tags = {
+        - "Owner" = "equipo-de-ops" -> null
+          # (3 unchanged elements hidden)
+      }
+  }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+```bash
+terraform apply
+```
+
+#### Paso 6: Verificar el resultado final
+
+```bash
+terraform plan
+# No changes. Your infrastructure matches the configuration.
+```
+
+El tag `Environment = "staging"` está en el código y en la infraestructura. El tag `Owner` fue eliminado.
+
 </details>
+
+---
 
 ## Limpieza
 
 ```bash
-cd labs/lab-12/aws
-terraform destroy
+terraform destroy 
 ```
 
-> Terraform eliminará primero las políticas y membresías antes de intentar
-> borrar el usuario (gracias a `force_destroy = true`).
+> **Nota:** No destruyas el bucket S3, ya que es un recurso compartido entre laboratorios (lab02).
+
+---
+
+## LocalStack
+
+Para ejecutar este laboratorio sin cuenta de AWS, consulta [localstack/README.md](localstack/README.md).
+
+El flujo es idéntico, sustituyendo `aws` por `awslocal` en todos los comandos de AWS CLI.
+
+---
 
 ## Buenas prácticas aplicadas
 
-| Práctica | Implementación |
-|----------|----------------|
-| Sin credenciales estáticas | Rol IAM + Instance Profile en lugar de Access Keys |
-| Principio de mínimo privilegio | El grupo solo tiene lectura; el rol solo lo que necesita |
-| IMDSv2 obligatorio | `http_tokens = "required"` bloquea ataques SSRF |
-| Sin acceso SSH | SSM Session Manager — sin puertos abiertos ni claves |
-| No crear Access Keys en Terraform | El usuario se crea sin credenciales adjuntas |
-| Trust Policy explícita | `data "aws_iam_policy_document"` valida la sintaxis |
+- **`-refresh-only` para decisión controlada**: aplicar un refresh-only muestra exactamente qué ha cambiado en la nube sin modificar la infraestructura real. Permite decidir si aceptar el drift (actualizar el estado) o revertirlo (aplicar el plan completo).
+- **Versionado del state en S3**: el versionado del bucket de estado permite restaurar el estado anterior si se corrompe o se aplica un plan incorrecto, implementando la regla "1 copia en un soporte diferente" del principio 3-2-1.
+- **Nunca editar el state manualmente**: editar `terraform.tfstate` a mano puede corromper el estado. Usar `terraform state mv`, `terraform state rm` y el bloque `import {}` son las operaciones seguras de manipulación de estado.
+- **`terraform plan -refresh-only` en pipelines**: ejecutar un plan refresh-only periódicamente (por ejemplo, en un scheduled pipeline diario) detecta drift antes de que cause problemas en el siguiente despliegue.
+- **`ignore_changes` para drift esperado**: si ciertos atributos son modificados por procesos externos de forma intencional (por ejemplo, tags de Cost Explorer), usar `lifecycle { ignore_changes = [tags] }` evita falsos positivos de drift.
+- **State locking con DynamoDB**: el locking evita que dos operaciones de Terraform concurrentes corrompan el estado. Siempre habilitarlo en entornos de equipo.
+
+---
 
 ## Recursos
 
-- [IAM Roles — AWS Docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html)
-- [Instance Profiles — AWS Docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-ec2_instance-profiles.html)
-- [IMDSv2 — AWS Docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
-- [SSM Session Manager — AWS Docs](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
-- [Permissions Boundaries — AWS Docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html)
-- [aws_iam_role — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role)
-- [aws_iam_instance_profile — Terraform Registry](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile)
+- [Terraform: When to use `refresh-only`](https://developer.hashicorp.com/terraform/tutorials/state/refresh)
+- [S3 Object Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
+- [Managing Drift in Terraform](https://developer.hashicorp.com/terraform/tutorials/state/resource-drift)

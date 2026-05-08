@@ -1,9 +1,9 @@
-# Laboratorio 18 — LocalStack: Seguridad y Control de Trafico en VPC
+# Laboratorio 18 — LocalStack: Optimización de Salida a Internet y "NAT Tax"
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guia adapta el lab18 para ejecutarse integramente en LocalStack. Las diferencias principales son que **ELBv2 (ALB) no esta disponible** en LocalStack Community (requiere licencia de pago) y que **no hay trafico de red real**, por lo que no se puede verificar el bloqueo efectivo de la NACL ni consultar Flow Logs con datos reales. El objetivo es validar la estructura de Terraform (Security Groups, NACLs, Flow Logs).
+Esta guía adapta el lab18 para ejecutarse íntegramente en LocalStack. Los conceptos son idénticos a la versión AWS; la diferencia principal es que **la Instancia NAT no está disponible** (requiere AMIs reales de EC2), por lo que solo se despliega la variante con NAT Gateway.
 
 ## Requisitos previos
 
@@ -32,71 +32,86 @@ Revisa los outputs:
 
 ```bash
 terraform output
-# alb_sg_id       = "sg-xxxxxxxxx"
-# app_sg_id       = "sg-xxxxxxxxx"
-# public_nacl_id  = "acl-xxxxxxxxx"
-# flow_log_group  = "/vpc/lab18/flow-logs"
+# vpc_id                  = "vpc-xxxxxxxxx"
+# internet_gateway_id     = "igw-xxxxxxxxx"
+# nat_gateway_ids         = { "public-1" = "nat-xxxxxxxxx", ... }
+# nat_public_ips          = { "public-1" = "x.x.x.x", ... }
+# s3_endpoint_id          = "vpce-xxxxxxxxx"
+# private_subnet_ids      = { "private-1" = "subnet-xxx", ... }
+# private_route_table_ids = { "private-1" = "rtb-xxx", ... }
 ```
 
-## Verificacion
+## Verificación
 
-### Security Group del ALB (dynamic ingress)
-
-```bash
-ALB_SG=$(terraform output -raw alb_sg_id)
-
-awslocal ec2 describe-security-groups \
-  --group-ids $ALB_SG \
-  --query 'SecurityGroups[].IpPermissions[].{Port: FromPort, CIDR: IpRanges[].CidrIp}' \
-  --output json
-```
-
-Deberias ver una regla por cada puerto en `var.alb_ingress_ports` (80 y 443 por defecto).
-
-### Security Group de las EC2 (referencia por SG)
+### Internet Gateway
 
 ```bash
-APP_SG=$(terraform output -raw app_sg_id)
-
-awslocal ec2 describe-security-groups \
-  --group-ids $APP_SG \
-  --query 'SecurityGroups[].IpPermissions[].{Port: FromPort, SourceSG: UserIdGroupPairs[].GroupId}' \
-  --output json
-```
-
-El unico origen permitido debe ser el SG del ALB (no un CIDR).
-
-### NACL publica (regla deny)
-
-```bash
-awslocal ec2 describe-network-acls \
+awslocal ec2 describe-internet-gateways \
   --filters Name=tag:Project,Values=lab18 \
-  --query 'NetworkAcls[].Entries[?RuleAction==`deny` && !Egress].{RuleNum: RuleNumber, CIDR: CidrBlock, Action: RuleAction}' \
+  --query 'InternetGateways[].{ID: InternetGatewayId, VPC: Attachments[0].VpcId}' \
   --output table
 ```
 
-Deberias ver la regla 50 con `deny` para la IP bloqueada (`203.0.113.0/32`).
-
-### VPC Flow Logs
+### NAT Gateway
 
 ```bash
-awslocal logs describe-log-groups \
-  --log-group-name-prefix "/vpc/lab18" \
-  --query 'logGroups[].{Name: logGroupName, Retention: retentionInDays}' \
+awslocal ec2 describe-nat-gateways \
+  --filter Name=tag:Project,Values=lab18 \
+  --query 'NatGateways[].{ID: NatGatewayId, State: State, SubnetId: SubnetId}' \
+  --output table
+```
+
+### Tablas de rutas
+
+```bash
+# Tabla pública: 0.0.0.0/0 → IGW
+awslocal ec2 describe-route-tables \
+  --filters Name=tag:Name,Values=lab18-public-rt \
+  --query 'RouteTables[].Routes[].{Dest: DestinationCidrBlock, GatewayId: GatewayId, NatGatewayId: NatGatewayId}' \
+  --output table
+
+# Tablas privadas (una por AZ): 0.0.0.0/0 → NAT GW + prefijo S3 → VPC Endpoint
+awslocal ec2 describe-route-tables \
+  --filters "Name=tag:Name,Values=lab18-private-rt-*" \
+  --query 'RouteTables[].{Name: Tags[?Key==`Name`].Value|[0], Routes: Routes[].{Dest: DestinationCidrBlock, Prefix: DestinationPrefixListId, GatewayId: GatewayId, NatGatewayId: NatGatewayId}}' \
+  --output json
+```
+
+### VPC Endpoint para S3
+
+```bash
+awslocal ec2 describe-vpc-endpoints \
+  --filters Name=tag:Project,Values=lab18 \
+  --query 'VpcEndpoints[].{ID: VpcEndpointId, Service: ServiceName, State: State, RouteTables: RouteTableIds}' \
+  --output table
+```
+
+## Instancia de test
+
+Igual que en la versión aws/, este lab despliega una `aws_instance.test` en
+`private-1` con un Security Group que solo permite tráfico saliente (`ingress = []`
+explícito). En LocalStack esta instancia no ejecuta tráfico real — su único
+propósito es validar la estructura Terraform: que el SG, las dependencias del
+NAT Gateway y la asociación de subred privada se declaren correctamente.
+
+```bash
+awslocal ec2 describe-instances \
+  --filters Name=tag:Project,Values=lab18 \
+  --query 'Reservations[].Instances[].{ID: InstanceId, AZ: Placement.AvailabilityZone, SubnetId: SubnetId}' \
   --output table
 ```
 
 ## Limitaciones en LocalStack
 
-| Caracteristica | AWS Real | LocalStack Community |
+| Característica | AWS Real | LocalStack |
 |---|---|---|
-| Security Groups | Filtran trafico real | Emulados, sin filtrado |
-| NACLs | Bloquean/permiten trafico real | Emuladas, sin filtrado |
-| ALB (ELBv2) | Distribuye trafico HTTP/HTTPS | **No disponible** (requiere licencia) |
-| VPC Flow Logs | Capturan trafico REJECT real | Emulados, sin datos de trafico |
-| Instancias EC2 | Ejecutan user_data, sirven HTTP | Emuladas, sin proceso real |
+| NAT Gateway | Funcional, procesa tráfico | Emulado, sin tráfico real |
+| NAT Instance | AL2023 ARM + iptables user_data | No disponible (requiere AMI real) |
+| Instancia de test | Conectividad real verificable por SSM | Emulada, sin SSM ni tráfico |
+| VPC Endpoint S3 | Ruta real al servicio S3 | Emulado |
+| Cargos NAT | $0.045/GB procesado | Sin cargos |
 
-Para probar el ALB, el bloqueo efectivo de la NACL y consultar Flow Logs con datos reales, usa la version `aws/`.
+Para probar la Instancia NAT, usa la versión `aws/` con `-var="use_nat_instance=true"`.
 
 ## Limpieza
 

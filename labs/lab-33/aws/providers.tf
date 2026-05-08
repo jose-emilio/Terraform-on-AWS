@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
   }
 
   # Configuracion parcial del backend. Todos los parametros estan en
@@ -14,6 +18,7 @@ terraform {
   backend "s3" {}
 }
 
+# El provider lee las credenciales del perfil "default" de ~/.aws/credentials
 provider "aws" {
   region = var.region
 }

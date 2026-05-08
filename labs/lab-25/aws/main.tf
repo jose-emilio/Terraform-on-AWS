@@ -1,19 +1,16 @@
 # ===========================================================================
-# Lab25 — Framework de Pruebas: Plan, Apply e Idempotencia
+# Lab24 — El "Wrapper" Corporativo: RDS + VPC
 # ===========================================================================
-# Root Module que invoca tagged-bucket. Sirve tanto para despliegue normal
-# como para ser testeado con `terraform test`.
+# Invoca el módulo corporate-rds que internamente orquesta:
+#   - Módulo público VPC (terraform-aws-modules/vpc/aws)
+#   - Módulo público RDS (terraform-aws-modules/rds/aws)
+#   - Security group restrictivo
+# Con parámetros de seguridad hardcoded que el equipo no puede desactivar.
 # ===========================================================================
-
-# --- Data Sources ---
-
-data "aws_caller_identity" "current" {}
 
 # --- Locals ---
 
 locals {
-  account_id = data.aws_caller_identity.current.account_id
-
   common_tags = {
     Environment = var.environment
     ManagedBy   = "terraform"
@@ -22,14 +19,24 @@ locals {
 }
 
 # ===========================================================================
-# Módulo tagged-bucket — El módulo bajo test
+# Módulo Wrapper — corporate-rds
 # ===========================================================================
 
-module "bucket" {
-  source = "./modules/tagged-bucket"
+module "corporate_rds" {
+  source = "./modules/corporate-rds"
 
-  bucket_name  = "${var.project_name}-${var.bucket_suffix}-${local.account_id}"
   project_name = var.project_name
   environment  = var.environment
-  tags         = local.common_tags
+
+  # Red
+  vpc_cidr = "10.20.0.0/16"
+
+  # Base de datos (solo parámetros que el equipo puede elegir)
+  db_engine         = "mysql"
+  db_engine_version = "8.0"
+  db_instance_class = "db.t4g.micro"
+  db_name           = "appdb"
+  db_username       = "admin"
+
+  tags = local.common_tags
 }

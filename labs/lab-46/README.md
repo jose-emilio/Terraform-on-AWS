@@ -19,7 +19,7 @@ log group cifrado, desde donde un metric filter convierte las líneas `[ERROR]` 
 numérica. Sobre esa métrica y las métricas nativas de EC2 se construyen cuatro alarmas y un
 dashboard con cinco widgets, todo definido como código Terraform.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Configurar un log group con cifrado KMS y retención limitada
 - Enviar logs estructurados desde EC2 mediante el CloudWatch Agent
@@ -190,7 +190,7 @@ Sin este statement, Terraform crea el log group pero las escrituras fallan con
 La condición `ArnLike` restringe el acceso a los log groups de esta cuenta
 específica, evitando que otras cuentas usen la misma CMK.
 
-## Estructura
+## Estructura del proyecto
 
 ```
 lab-46/

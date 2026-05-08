@@ -1,23 +1,30 @@
 variable "region" {
-  type        = string
-  description = "Región de AWS donde se despliega la infraestructura"
-  default     = "us-east-1"
+  type    = string
+  default = "us-east-1"
 }
 
-variable "vpc_cidr" {
+variable "project" {
   type        = string
-  description = "CIDR block de la VPC (debe ser un rango RFC 1918)"
-  default     = "10.12.0.0/16"
-}
-
-variable "project_name" {
-  type        = string
-  description = "Nombre del proyecto, usado en tags y nombres de recursos"
+  description = "Prefijo que identifica todos los recursos del laboratorio"
   default     = "lab16"
 }
 
-variable "environment" {
+variable "github_org" {
   type        = string
-  description = "Entorno de despliegue (lab, dev, staging, production)"
-  default     = "lab"
+  description = "Nombre de la organización o usuario de GitHub propietario del repositorio"
+}
+
+variable "github_repo" {
+  type        = string
+  description = "Nombre del repositorio de GitHub (sin la parte de organización)"
+}
+
+variable "allowed_ref" {
+  type        = string
+  description = <<-EOT
+    Rama o patrón de refs que puede asumir el rol vía OIDC.
+    Usa '*' para permitir cualquier rama/tag o especifica 'ref:refs/heads/main'
+    para restringir solo a la rama main.
+  EOT
+  default     = "*"
 }

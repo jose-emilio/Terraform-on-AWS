@@ -75,11 +75,11 @@ resource "aws_s3_bucket_policy" "config_delivery" {
       {
         # Config verifica que tiene acceso al bucket antes de escribir.
         # Sin este statement, la entrega falla antes de intentar escribir.
-        Sid    = "AWSConfigBucketPermissionsCheck"
-        Effect = "Allow"
+        Sid       = "AWSConfigBucketPermissionsCheck"
+        Effect    = "Allow"
         Principal = { Service = "config.amazonaws.com" }
-        Action   = "s3:GetBucketAcl"
-        Resource = aws_s3_bucket.config_delivery.arn
+        Action    = "s3:GetBucketAcl"
+        Resource  = aws_s3_bucket.config_delivery.arn
         Condition = {
           StringEquals = {
             "aws:SourceAccount" = data.aws_caller_identity.current.account_id
@@ -91,14 +91,14 @@ resource "aws_s3_bucket_policy" "config_delivery" {
         # La condición bucket-owner-full-control garantiza que el propietario del
         # bucket (tu cuenta) conserva el control total sobre los objetos escritos
         # por Config (que actúa como un principal externo de servicio).
-        Sid    = "AWSConfigBucketDelivery"
-        Effect = "Allow"
+        Sid       = "AWSConfigBucketDelivery"
+        Effect    = "Allow"
         Principal = { Service = "config.amazonaws.com" }
-        Action   = "s3:PutObject"
-        Resource = "${aws_s3_bucket.config_delivery.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/Config/*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.config_delivery.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/Config/*"
         Condition = {
           StringEquals = {
-            "s3:x-amz-acl"     = "bucket-owner-full-control"
+            "s3:x-amz-acl"      = "bucket-owner-full-control"
             "aws:SourceAccount" = data.aws_caller_identity.current.account_id
           }
         }

@@ -28,7 +28,7 @@ Este módulo profundiza en las capacidades avanzadas de Terraform: provisioners,
 | 2 | [Expresiones Avanzadas](./02_expresiones_avanzadas.md) | `templatefile`, `setproduct`, `transpose`, funciones avanzadas |
 | 3 | [Providers Múltiples y Alias](./03_providers_avanzados.md) | Multi-cuenta, multi-región, provider inheritance |
 | 4 | [Drift y Reconciliación](./04_drift_reconciliacion.md) | Detección de drift, `terraform refresh`, `import` declarativo |
-| 5 | [Refactoring con Terraform](./05_refactoring.md) | Bloques `moved`, `removed`, migración de resources a módulos |
+| 5 | [Migraciones Complejas de State](./05_migraciones_state.md) | Cross-state moves, fusión de states, `force-unlock`, `replace-provider`, state surgery, migración de backend cero-downtime |
 | 6 | [Rendimiento y Escala](./06_rendimiento_escala.md) | `-parallelism`, `target`, `-refresh=false`, partial plans |
 
 ---
@@ -37,10 +37,9 @@ Este módulo profundiza en las capacidades avanzadas de Terraform: provisioners,
 
 | Lab | Título |
 |-----|--------|
-| [Lab 37](../../labs/lab-37/README.md) | Orquestación Imperativa con terraform_data |
-| [Lab 38](../../labs/lab-38/README.md) | Ingeniería de Datos y Resiliencia con Lifecycle |
-| [Lab 39](../../labs/lab-39/README.md) | Despliegue Global y Adopción de Infraestructura Existente |
-| [Lab 40](../../labs/lab-40/README.md) | Refactorización y Optimización del Rendimiento |
+| [Lab 38](../../labs/lab-38/README.md) | Orquestación Imperativa con terraform_data |
+| [Lab 39](../../labs/lab-39/README.md) | Ingeniería de Datos y Resiliencia con Lifecycle |
+| [Lab 40](../../labs/lab-40/README.md) | Despliegue Global Multi-Región con `configuration_aliases` y KMS Multi-Region |
 
 ---
 

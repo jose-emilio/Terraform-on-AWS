@@ -8,18 +8,27 @@ variable "vpc_cidr" {
   default = "10.0.0.0/16"
 }
 
-variable "desired_count" {
+variable "instance_type" {
+  type    = string
+  default = "t4g.small"
+}
+
+variable "min_size" {
   type    = number
   default = 2
 }
 
-variable "container_image" {
-  type    = string
-  default = "nginx:alpine"
+variable "max_size" {
+  type    = number
+  default = 4
 }
 
-variable "api_key" {
-  type      = string
-  sensitive = true
-  default   = "mi-clave-de-api-secreta-lab29"
+variable "desired_capacity" {
+  type    = number
+  default = 2
+}
+
+variable "app_version" {
+  type    = string
+  default = "v1"
 }

@@ -1,9 +1,9 @@
-# Laboratorio 23 — LocalStack: Diseño de Interfaz Robusta y "Fail-Safe"
+# Laboratorio 23 — LocalStack: Refactorización Avanzada de S3
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guía adapta el lab23 para ejecutarse íntegramente en LocalStack. Los tres módulos (`safe-network`, `validated-bucket`, `db-config`) funcionan igual que en AWS real. Las validaciones, precondiciones y postcondiciones son evaluadas por el motor de Terraform, no por el proveedor, por lo que funcionan idénticamente. La diferencia principal es que `db-config` usa SSM SecureString en lugar de Secrets Manager.
+Esta guia adapta el lab23 para ejecutarse integramente en LocalStack. S3 esta completamente soportado en LocalStack Community, por lo que la funcionalidad es practicamente identica. Las diferencias principales son: sin `prevent_destroy` (para facilitar limpieza) y sin bloqueo de acceso publico (emulacion parcial).
 
 ## Requisitos previos
 
@@ -25,72 +25,62 @@ cd labs/lab-23/localstack
 
 terraform init -backend-config=localstack.s3.tfbackend
 
-terraform apply \
-  -var="bucket_name=empresa-lab23-data-000000000000" \
-  -var='db_password=MiPassword123Seguro'
+terraform apply
 ```
 
 Revisa los outputs:
 
 ```bash
 terraform output
-# vpc_id            = "vpc-..."
-# vpc_cidr          = "10.19.0.0/16"
-# bucket_id         = "empresa-lab23-data-000000000000"
-# db_config_summary = { engine = "mysql", ... }
-# ssm_prefix        = "/lab23/db/"
+# logs_bucket_id  = "lab23-logs-000000000000"
+# data_bucket_id  = "lab23-data-000000000000"
 ```
 
-## Verificación
+## Verificacion
 
-### Probar validaciones (funcionan igual que en AWS)
+### Listar buckets
 
 ```bash
-# Nombre sin prefijo → debe fallar
-terraform plan -var="bucket_name=mi-bucket" -var='db_password=MiPassword123Seguro'
-# Error: El nombre del bucket debe comenzar con 'empresa-'...
-
-# Contraseña débil → debe fallar
-terraform plan -var="bucket_name=empresa-test-bucket" -var='db_password=corta'
-# Error: La contraseña debe tener al menos 12 caracteres.
-
-# Motor inválido → debe fallar
-terraform plan \
-  -var="bucket_name=empresa-test-bucket" \
-  -var='db_password=MiPassword123Seguro' \
-  -var='db_config={"engine":"oracle","engine_version":"19c","instance_class":"db.m5.large","allocated_storage":50}'
-# Error: El motor de base de datos debe ser uno de: mysql, postgres, mariadb.
+awslocal s3 ls | grep lab23
+# lab23-logs-000000000000
+# lab23-data-000000000000
 ```
 
-### Verificar recursos creados
+### Verificar etiquetas
 
 ```bash
-# Bucket
-awslocal s3 ls | grep empresa
+LOGS_BUCKET=$(terraform output -raw logs_bucket_id)
+DATA_BUCKET=$(terraform output -raw data_bucket_id)
 
-# Parámetros SSM
-awslocal ssm get-parameters-by-path \
-  --path "/lab23/db/" \
-  --query 'Parameters[].{Name: Name, Value: Value}' \
-  --output table
+awslocal s3api get-bucket-tagging --bucket $LOGS_BUCKET \
+  --query 'TagSet[].{Key: Key, Value: Value}' --output table
+
+awslocal s3api get-bucket-tagging --bucket $DATA_BUCKET \
+  --query 'TagSet[].{Key: Key, Value: Value}' --output table
+```
+
+### Verificar versionado
+
+```bash
+awslocal s3api get-bucket-versioning --bucket $LOGS_BUCKET
+# { "Status": "Suspended" }
+
+awslocal s3api get-bucket-versioning --bucket $DATA_BUCKET
+# { "Status": "Enabled" }
 ```
 
 ## Limitaciones en LocalStack
 
-| Característica | AWS Real | LocalStack Community |
+| Caracteristica | AWS Real | LocalStack Community |
 |---|---|---|
-| `validation` en variables | Funciona | Funciona (evaluado por Terraform) |
-| `postcondition` en recursos | Funciona | Funciona (evaluado por Terraform) |
-| `precondition` en recursos | Funciona | Funciona (evaluado por Terraform) |
-| `sensitive = true` | Oculta en plan/apply | Oculta en plan/apply |
-| Secrets Manager | Completo | Emulación parcial |
-| SSM SecureString | Cifrado con KMS | Sin cifrado real |
-| VPC | Completa | Emulada |
+| S3 Bucket | Completo | Completo |
+| Versionado | Completo | Completo |
+| Bloqueo acceso publico | Completo | Parcial |
+| `prevent_destroy` | Funciona | Desactivado en esta version |
+| SSE-KMS (Reto 2) | Completo | Parcial (sin cifrado real) |
 
 ## Limpieza
 
 ```bash
-terraform destroy \
-  -var="bucket_name=empresa-lab23-data-000000000000" \
-  -var='db_password=MiPassword123Seguro'
+terraform destroy
 ```

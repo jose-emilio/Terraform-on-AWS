@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.10"  # bloque import + generate-config-out: 1.5 | use_lockfile (backend S3): 1.10
+  required_version = ">= 1.10"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -7,28 +7,25 @@ terraform {
     }
   }
 
-  # Configuracion parcial del backend. Todos los parametros estan en
-  # aws.s3.tfbackend. Usalo asi:
+  # Configuracion parcial del backend. Usalo asi:
   #   terraform init -backend-config=aws.s3.tfbackend -backend-config="bucket=terraform-state-labs-<ACCOUNT_ID>"
   backend "s3" {}
 }
 
-# ── Proveedor primario — us-east-1 ────────────────────────────────────────────
-# El alias permite distinguir este proveedor del secundario cuando ambos
-# usan el mismo provider "aws". Los recursos que no declaren 'provider'
-# explicito usaran el proveedor sin alias (aqui no existe: TODOS deben
-# declarar provider = aws.primary o provider = aws.secondary para evitar
-# ambiguedades).
 provider "aws" {
-  alias  = "primary"
-  region = var.primary_region
-}
+  region = var.region
 
-# ── Proveedor secundario — eu-west-3 ─────────────────────────────────────────
-# Mismo bloque provider "aws" con un alias diferente. Terraform distingue
-# los dos bloques por el alias, no por el tipo. Los recursos que declaren
-# provider = aws.secondary enviaran sus llamadas API a eu-west-3.
-provider "aws" {
-  alias  = "secondary"
-  region = var.secondary_region
+  # merge() — Caso de uso 1: etiquetas globales del proveedor.
+  # Todos los recursos heredan estas etiquetas via tags_all automaticamente,
+  # sin necesidad de declararlas en cada resource. Las etiquetas especificas
+  # de cada recurso se fusionan con estas en runtime.
+  default_tags {
+    tags = {
+      ManagedBy   = "terraform"
+      Project     = var.project
+      Environment = var.environment
+      CostCenter  = var.company_tags.cost_center
+      Owner       = var.company_tags.owner
+    }
+  }
 }

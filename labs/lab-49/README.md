@@ -37,7 +37,7 @@ La arquitectura tiene cuatro pilares:
    **AWS Foundational Security Best Practices (FSBP)**, que audita decenas de recursos
    automáticamente con puntuación de cumplimiento normalizada.
 
-## Objetivos
+## Objetivos de aprendizaje
 
 - Entender la diferencia entre controles preventivos, detectivos y correctivos en AWS
 - Habilitar el AWS Config Recorder con canal de entrega a S3
@@ -556,7 +556,7 @@ en el panel de Security Hub. Tus propias reglas de Config (como `lab49-ebs-encry
 también generan hallazgos que fluyen a Security Hub, pero aparecen bajo la categoría de
 hallazgos personalizados.
 
-## Estructura
+## Estructura del proyecto
 
 ```
 lab-49/
@@ -1380,7 +1380,7 @@ Salida esperada (una fila por cada función `test_` del archivo):
 └─────────┴───────────────────────────────────┴───────────┴─────────┘
 ```
 
-5 filas = 5 tests definidos en [alb_https_only_test.rego](../policies/alb_https_only_test.rego).
+5 filas = 5 tests definidos en [alb_https_only_test.rego](./policies/alb_https_only_test.rego).
 
 ### Integración en un pipeline CI/CD
 
@@ -3126,3 +3126,15 @@ terraform import aws_config_configuration_recorder_status.main "$EXISTING_RECORD
 
 Después de importar, ajusta `variables.tf` si el nombre del recorder existente no
 coincide con `"lab49-recorder"`.
+
+## Recursos
+
+- [AWS Config — Conceptos clave (recorder, channel, rules)](https://docs.aws.amazon.com/config/latest/developerguide/WhatIsConfig.html)
+- [Config Managed Rules — Catálogo completo](https://docs.aws.amazon.com/config/latest/developerguide/managed-rules-by-aws-config.html)
+- [Conformance Packs — Frameworks (CIS, PCI-DSS, NIST)](https://docs.aws.amazon.com/config/latest/developerguide/conformance-packs.html)
+- [Config Remediation — SSM Automation Documents](https://docs.aws.amazon.com/config/latest/developerguide/remediation.html)
+- [Security Hub — Estándares y findings agregados](https://docs.aws.amazon.com/securityhub/latest/userguide/what-is-securityhub.html)
+- [SSM Automation — Sintaxis de runbooks](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-documents.html)
+- [Open Policy Agent — Lenguaje Rego](https://www.openpolicyagent.org/docs/latest/policy-language/)
+- [Conftest — Aplicación de políticas Rego sobre IaC](https://www.conftest.dev/)
+- [Compliance as Code — AWS Well-Architected (Security Pillar)](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html)

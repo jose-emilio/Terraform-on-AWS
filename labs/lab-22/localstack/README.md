@@ -1,9 +1,9 @@
-# Laboratorio 22 — LocalStack: Refactorización Avanzada de S3
+# Laboratorio 22 — LocalStack: Zonas Hospedadas Privadas y Resolución DNS
 
 ![Terraform on AWS](../../../images/lab-banner.svg)
 
 
-Esta guia adapta el lab22 para ejecutarse integramente en LocalStack. S3 esta completamente soportado en LocalStack Community, por lo que la funcionalidad es practicamente identica. Las diferencias principales son: sin `prevent_destroy` (para facilitar limpieza) y sin bloqueo de acceso publico (emulacion parcial).
+Esta guía adapta el lab22 para ejecutarse íntegramente en LocalStack. LocalStack emula Route 53 a nivel de API pero **no ejecuta resolución DNS real** desde las instancias EC2 emuladas. Además, **ELBv2 (ALB / NLB) sigue siendo una funcionalidad de pago** en LocalStack — está incluida en los planes Base y Ultimate, pero no en Community Edition ni en el nuevo plan gratuito Hobby (vigente desde marzo 2026). Por eso este lab sustituye el registro Alias del ALB por un registro A con la IP privada de la instancia web. El objetivo es validar la estructura de Terraform; para verificar la resolución DNS real con `nslookup` / `dig` usa la versión `aws/`.
 
 ## Requisitos previos
 
@@ -32,52 +32,44 @@ Revisa los outputs:
 
 ```bash
 terraform output
-# logs_bucket_id  = "lab22-logs-000000000000"
-# data_bucket_id  = "lab22-data-000000000000"
+# zone_id         = "Z0123456789ABCDEF"
+# internal_domain = "app.internal"
+# web_fqdn        = "web.app.internal"
+# db_fqdn         = "db.app.internal"
 ```
 
 ## Verificacion
 
-### Listar buckets
+### Zona Hospedada Privada
 
 ```bash
-awslocal s3 ls | grep lab22
-# lab22-logs-000000000000
-# lab22-data-000000000000
+ZONE_ID=$(terraform output -raw zone_id)
+
+awslocal route53 get-hosted-zone \
+  --id $ZONE_ID \
+  --query '{Name: HostedZone.Name, Private: HostedZone.Config.PrivateZone}' \
+  --output json
 ```
 
-### Verificar etiquetas
+### Registros DNS
 
 ```bash
-LOGS_BUCKET=$(terraform output -raw logs_bucket_id)
-DATA_BUCKET=$(terraform output -raw data_bucket_id)
-
-awslocal s3api get-bucket-tagging --bucket $LOGS_BUCKET \
-  --query 'TagSet[].{Key: Key, Value: Value}' --output table
-
-awslocal s3api get-bucket-tagging --bucket $DATA_BUCKET \
-  --query 'TagSet[].{Key: Key, Value: Value}' --output table
-```
-
-### Verificar versionado
-
-```bash
-awslocal s3api get-bucket-versioning --bucket $LOGS_BUCKET
-# { "Status": "Suspended" }
-
-awslocal s3api get-bucket-versioning --bucket $DATA_BUCKET
-# { "Status": "Enabled" }
+awslocal route53 list-resource-record-sets \
+  --hosted-zone-id $ZONE_ID \
+  --query 'ResourceRecordSets[].{Name: Name, Type: Type, Records: ResourceRecords[].Value}' \
+  --output table
 ```
 
 ## Limitaciones en LocalStack
 
 | Caracteristica | AWS Real | LocalStack Community |
 |---|---|---|
-| S3 Bucket | Completo | Completo |
-| Versionado | Completo | Completo |
-| Bloqueo acceso publico | Completo | Parcial |
-| `prevent_destroy` | Funciona | Desactivado en esta version |
-| SSE-KMS (Reto 2) | Completo | Parcial (sin cifrado real) |
+| Route 53 PHZ | Resolución DNS real dentro de la VPC | Emulada, sin resolución |
+| Registro Alias | Apunta a ALB/CloudFront | **No disponible** (sin ELBv2) |
+| Registro A | Resuelve a IP | Emulado |
+| nslookup/dig | Funciona dentro de la VPC | No verificable sin DNS real |
+
+Para verificar la resolución DNS real con `nslookup`/`dig`, usa la versión `aws/`.
 
 ## Limpieza
 

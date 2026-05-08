@@ -10,68 +10,20 @@ variable "project" {
   default     = "lab35"
 }
 
-variable "db_name" {
+variable "instance_type" {
   type        = string
-  description = "Nombre de la base de datos inicial"
-  default     = "appdb"
+  description = "Tipo de instancia EC2"
+  default     = "t3.micro"
 }
 
-variable "db_username" {
-  type        = string
-  description = "Usuario maestro de la base de datos"
-  default     = "dbadmin"
-}
-
-variable "db_instance_class" {
-  type        = string
-  description = "Tipo de instancia RDS"
-  default     = "db.t4g.small"
-}
-
-variable "db_engine_version" {
-  type        = string
-  description = "Version del motor PostgreSQL"
-  default     = "15.17"
-}
-
-variable "db_allocated_storage" {
+variable "app_uid" {
   type        = number
-  description = "Almacenamiento inicial en GB"
-  default     = 20
+  description = "POSIX UID del usuario de la aplicacion en el EFS Access Point"
+  default     = 1001
 }
 
-variable "db_max_allocated_storage" {
+variable "app_gid" {
   type        = number
-  description = "Almacenamiento maximo para autoscaling en GB. 0 deshabilita el autoscaling."
-  default     = 100
-}
-
-variable "rotation_lambda_arn" {
-  type        = string
-  description = "ARN de la funcion Lambda de rotacion de Secrets Manager. Dejar vacio para omitir la rotacion automatica. Ver README seccion 'Gestion de Secretos' para desplegarla."
-  default     = ""
-}
-
-variable "app_instance_type" {
-  type        = string
-  description = "Tipo de instancia EC2 para la aplicacion web"
-  default     = "t4g.small"
-}
-
-variable "asg_min_size" {
-  type        = number
-  description = "Numero minimo de instancias en el Auto Scaling Group"
-  default     = 1
-}
-
-variable "asg_desired_capacity" {
-  type        = number
-  description = "Numero deseado de instancias en el Auto Scaling Group"
-  default     = 2
-}
-
-variable "asg_max_size" {
-  type        = number
-  description = "Numero maximo de instancias en el Auto Scaling Group"
-  default     = 4
+  description = "POSIX GID del grupo de la aplicacion en el EFS Access Point"
+  default     = 1001
 }
