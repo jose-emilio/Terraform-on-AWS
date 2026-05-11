@@ -666,9 +666,11 @@ output "extra_bucket_ids" {
 
 ```hcl
 # extra_buckets.auto.tfvars
+# Sustituir ${ACCOUNT_ID} por el ID de la cuenta de AWS
+
 extra_buckets = {
-  "empresa-logs-123456789012"    = { purpose = "logs" }
-  "empresa-backups-123456789012" = { purpose = "backups" }
+  "empresa-logs-${ACCOUNT_ID}"    = { purpose = "logs" }
+  "empresa-backups-${ACCOUNT_ID}" = { purpose = "backups" }
 }
 ```
 
